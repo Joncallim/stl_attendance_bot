@@ -27,6 +27,7 @@ This bot records attendance through Telegram and writes each response into a sha
 
 - `data/users.json`: Telegram user state and conversation state.
 - `data/appointment-registry.json`: secret codes, bindings, and custom admin appointments.
+- `data/settings.json`: persisted attendance option ordering and overrides.
 - `data/sheet-cache.json`: local attendance snapshot cache used for conservative recovery if a month sheet is wiped.
 
 ## User Commands
@@ -54,6 +55,7 @@ This bot records attendance through Telegram and writes each response into a sha
 - `/admins`: list active admin appointments.
 - `/addadmin <appointment>`: grant custom admin access to a currently bound appointment.
 - `/removeadmin <appointment>`: remove custom admin access.
+- Admin Menu also includes attendance-option editing and usage-based sorting.
 
 ## Reminders
 
@@ -62,6 +64,7 @@ This bot records attendance through Telegram and writes each response into a sha
 - Reminders are skipped on Singapore public holidays.
 - The second reminder only goes to users whose attendance is still blank.
 - Reminder times can be changed with `FIRST_REMINDER_TIME` and `SECOND_REMINDER_TIME`.
+- Attendance options can be sorted from most-used to least-used by scanning all month sheets at startup and once nightly.
 
 ## Setup
 
@@ -103,7 +106,6 @@ Important variables:
 - `SECOND_REMINDER_TIME`
 - `ONBOARDING_SHEET_TITLE`
 - `SHEET_SYNC_MIN_INTERVAL_MS`
-- `ONBOARDING_CODE_PROMPT`
 - `ROSTER_STOP_MARKERS`
 - `DEFAULT_ADMIN_APPOINTMENTS`
 - `ATTENDANCE_OPTIONS`
@@ -145,6 +147,30 @@ Notes:
 - Use `--env-file .env` so secrets stay outside the image.
 - Mount `./data` to `/app/data` so bindings, codes, and sheet cache survive container restarts.
 - The bot uses Telegram long polling, so there is no HTTP port to publish.
+
+## Docker Compose
+
+A Portainer-friendly compose file is included at `docker-compose.yml`.
+
+Before deploying it:
+
+1. Replace `yourdockerhubuser/attendance-bot:latest` with your real Docker Hub image.
+2. Replace the placeholder values in the `environment:` block with your real bot credentials.
+3. Keep `GOOGLE_PRIVATE_KEY` as a single quoted value with `\n` escapes.
+
+Run with:
+
+```bash
+docker compose up -d
+```
+
+In Portainer:
+
+1. Go to `Stacks`
+2. Create a new stack
+3. Paste the contents of `docker-compose.yml`
+4. Replace the placeholder values
+5. Deploy the stack
 
 ## Notes
 

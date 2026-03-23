@@ -7,6 +7,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DATA_DIR = path.resolve(__dirname, "../data");
 const SHEET_CACHE_FILE = path.join(DATA_DIR, "sheet-cache.json");
+const SINGAPORE_PUBLIC_HOLIDAY_COLLECTION_ID = "691";
+const publicHolidayCache = {
+  years: new Map(),
+  loadingPromise: null
+};
 
 function normalizeAppointmentLabel(value) {
   return String(value ?? "").trim();
@@ -145,6 +150,24 @@ function dayOfMonth(date, timezone) {
   );
 }
 
+function getWeekdayIndex(date, timezone) {
+  const weekday = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    weekday: "short"
+  }).format(date);
+  const weekdayOrder = {
+    Mon: 0,
+    Tue: 1,
+    Wed: 2,
+    Thu: 3,
+    Fri: 4,
+    Sat: 5,
+    Sun: 6
+  };
+
+  return weekdayOrder[weekday] ?? 0;
+}
+
 function buildMonthHeader(date, timezone) {
   const { month } = getMonthParts(date, timezone);
   const header = ["Appointment"];
@@ -219,6 +242,69 @@ async function addSheet(sheets, spreadsheetId, title) {
   });
 
   return response.data.replies?.[0]?.addSheet ?? null;
+}
+
+async function fetchJson(url) {
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Request failed: ${response.status} ${response.statusText}`);
+  }
+
+  return response.json();
+}
+
+async function loadSingaporePublicHolidayCache() {
+  if (publicHolidayCache.loadingPromise) {
+    await publicHolidayCache.loadingPromise;
+    return;
+  }
+
+  publicHolidayCache.loadingPromise = (async () => {
+    const metadata = await fetchJson(
+      `https://api-production.data.gov.sg/v2/public/api/collections/${SINGAPORE_PUBLIC_HOLIDAY_COLLECTION_ID}/metadata`
+    );
+    const datasetIds = metadata?.data?.collectionMetadata?.childDatasets ?? [];
+
+    for (const datasetId of datasetIds) {
+      try {
+        const payload = await fetchJson(
+          `https://data.gov.sg/api/action/datastore_search?resource_id=${datasetId}`
+        );
+        const records = payload?.result?.records ?? [];
+
+        for (const record of records) {
+          const rawDate = String(record.date ?? "").trim();
+
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+            continue;
+          }
+
+          const year = Number(rawDate.slice(0, 4));
+
+          if (!publicHolidayCache.years.has(year)) {
+            publicHolidayCache.years.set(year, new Set());
+          }
+
+          publicHolidayCache.years.get(year).add(rawDate);
+        }
+      } catch (error) {
+        console.error(`Failed to load public holiday dataset ${datasetId}:`, error.message);
+      }
+    }
+  })().finally(() => {
+    publicHolidayCache.loadingPromise = null;
+  });
+
+  await publicHolidayCache.loadingPromise;
+}
+
+async function getSingaporePublicHolidaySet(year) {
+  if (!publicHolidayCache.years.has(year)) {
+    await loadSingaporePublicHolidayCache();
+  }
+
+  return publicHolidayCache.years.get(year) ?? new Set();
 }
 
 async function ensureSheet(sheets, spreadsheetId, title) {
@@ -342,6 +428,27 @@ async function writeHeaderRow(sheets, spreadsheetId, title, header) {
   });
 }
 
+function buildHeaderUpdateRequest(header) {
+  return {
+    updateCells: {
+      start: {
+        rowIndex: 0,
+        columnIndex: 0
+      },
+      rows: [
+        {
+          values: header.map((value) => ({
+            userEnteredValue: {
+              stringValue: String(value ?? "")
+            }
+          }))
+        }
+      ],
+      fields: "userEnteredValue"
+    }
+  };
+}
+
 async function writeOnboardingRows(sheets, spreadsheetId, title, rows) {
   await sheets.spreadsheets.values.clear({
     spreadsheetId,
@@ -364,30 +471,89 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows) {
   });
 }
 
-async function applyAttendanceValidation(sheets, spreadsheetId, sheetId, headerLength, options) {
+function buildAttendanceValidationRequest(sheetId, headerLength, options) {
+  return {
+    setDataValidation: {
+      range: {
+        sheetId,
+        startRowIndex: 1,
+        startColumnIndex: 1,
+        endRowIndex: 1000,
+        endColumnIndex: headerLength
+      },
+      rule: {
+        condition: {
+          type: "ONE_OF_LIST",
+          values: options.map((value) => ({ userEnteredValue: value }))
+        },
+        strict: true,
+        showCustomUi: true
+      }
+    }
+  };
+}
+
+async function buildDisabledDayFormattingRequests(sheetId, date, timezone) {
+  const requests = [];
+  const holidaySet = await getSingaporePublicHolidaySet(
+    Number(
+      new Intl.DateTimeFormat("en-US", { timeZone: timezone, year: "numeric" }).format(date)
+    )
+  );
+
+  for (let day = 1; day <= daysInMonth(date, timezone); day += 1) {
+    const dayDate = new Date(Date.UTC(
+      getMonthParts(date, timezone).numericYear,
+      getMonthParts(date, timezone).numericMonth,
+      day,
+      12
+    ));
+    const isoDate = new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).format(dayDate);
+    const isWeekend = getWeekdayIndex(dayDate, timezone) >= 5;
+    const isPublicHoliday = holidaySet.has(isoDate);
+
+    if (!isWeekend && !isPublicHoliday) {
+      continue;
+    }
+
+    requests.push({
+      repeatCell: {
+        range: {
+          sheetId,
+          startRowIndex: 0,
+          endRowIndex: 1000,
+          startColumnIndex: day,
+          endColumnIndex: day + 1
+        },
+        cell: {
+          userEnteredFormat: {
+            backgroundColor: { red: 0.85, green: 0.85, blue: 0.85 }
+          }
+        },
+        fields: "userEnteredFormat.backgroundColor"
+      }
+    });
+  }
+
+  return requests;
+}
+
+async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, header, options, timezone) {
+  const requests = [
+    buildHeaderUpdateRequest(header),
+    buildAttendanceValidationRequest(sheetId, header.length, options),
+    ...(await buildDisabledDayFormattingRequests(sheetId, date, timezone))
+  ];
+
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId,
     requestBody: {
-      requests: [
-        {
-          setDataValidation: {
-            range: {
-              sheetId,
-              startRowIndex: 1,
-              startColumnIndex: 1,
-              endColumnIndex: headerLength
-            },
-            rule: {
-              condition: {
-                type: "ONE_OF_LIST",
-                values: options.map((value) => ({ userEnteredValue: value }))
-              },
-              strict: true,
-              showCustomUi: true
-            }
-          }
-        }
-      ]
+      requests
     }
   });
 }
@@ -408,13 +574,14 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
   const sheet = await ensureSheet(sheets, config.spreadsheetId, title);
   const header = buildMonthHeader(date, config.timezone);
 
-  await writeHeaderRow(sheets, config.spreadsheetId, title, header);
-  await applyAttendanceValidation(
+  await applyMonthlySheetLayout(
     sheets,
     config.spreadsheetId,
     sheet.properties.sheetId,
-    header.length,
-    config.attendanceOptions
+    date,
+    header,
+    config.attendanceOptions,
+    config.timezone
   );
 
   const existingAppointments = await readAppointmentColumn(
@@ -1007,12 +1174,16 @@ export async function writeAttendanceStatus(sheets, config, entry) {
   const columnNumber = dayOfMonth(date, config.timezone) + 1;
   const cell = `${columnNumberToLabel(columnNumber)}${rowNumber}`;
 
-  await sheets.spreadsheets.values.update({
+  await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: config.spreadsheetId,
-    range: `'${title}'!${cell}`,
-    valueInputOption: "USER_ENTERED",
     requestBody: {
-      values: [[entry.status]]
+      valueInputOption: "USER_ENTERED",
+      data: [
+        {
+          range: `'${title}'!${cell}`,
+          values: [[entry.status]]
+        }
+      ]
     }
   });
 
@@ -1202,4 +1373,52 @@ export async function summarizeStatuses(sheets, config, options = {}) {
     (_, index) => String(values[index] ?? "").trim()
   );
   return buildSummaryPayload(date, title, rosterValues);
+}
+
+export async function summarizeAttendanceOptionUsage(sheets, config) {
+  const spreadsheet = await getSpreadsheet(sheets, config.spreadsheetId);
+  const monthTitles = (spreadsheet.sheets ?? [])
+    .map((entry) => entry.properties?.title)
+    .filter(Boolean)
+    .map(parseMonthSheetTitle)
+    .filter(Boolean)
+    .map((entry) => entry.title);
+  const counts = new Map(config.attendanceOptions.map((option) => [option, 0]));
+
+  for (const title of monthTitles) {
+    const values = await readSheetValues(sheets, config.spreadsheetId, title);
+    const rows = values.slice(1);
+
+    for (const row of rows) {
+      const appointment = normalizeAppointmentLabel(row?.[0]);
+
+      if (!appointment || isStopMarker(appointment, config.rosterStopMarkers)) {
+        if (isStopMarker(appointment, config.rosterStopMarkers)) {
+          break;
+        }
+
+        continue;
+      }
+
+      for (const cellValue of row.slice(1)) {
+        const normalizedValue = String(cellValue ?? "").trim();
+
+        if (!counts.has(normalizedValue)) {
+          continue;
+        }
+
+        counts.set(normalizedValue, (counts.get(normalizedValue) ?? 0) + 1);
+      }
+    }
+  }
+
+  return Object.fromEntries(
+    [...counts.entries()].sort((left, right) => {
+      if (right[1] !== left[1]) {
+        return right[1] - left[1];
+      }
+
+      return left[0].localeCompare(right[0]);
+    })
+  );
 }

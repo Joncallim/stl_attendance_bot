@@ -4,6 +4,7 @@ import {
   createGoogleSheetsClient,
   ensureNextMonthSheetExists,
   preloadAttendanceSnapshots,
+  summarizeAttendanceOptionUsage,
   syncOnboardingCodeColumn,
   syncOnboardingRoster,
   summarizeStatuses,
@@ -11,21 +12,28 @@ import {
   writeAttendanceStatus,
   writeAttendanceStatuses
 } from "./googleSheets.js";
+import { defaultAttendanceOptions } from "./config.js";
 import {
   addAdminAppointment,
   bindAppointmentCode,
   deregisterAppointmentBinding,
   deregisterRequestorByChatId,
   getAppointmentRegistry,
+  getSettings,
   getUserByChatId,
   getOnboardingInvite,
   listAdminAppointments,
   listUsers,
+  resetAttendanceOptions,
   removeAdminAppointment,
+  setAttendanceOptionUsage,
+  setAttendanceOptions,
   syncAppointmentRegistry,
   updateUserByChatId,
   upsertUser
 } from "./storage.js";
+
+const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SINGAPORE_PUBLIC_HOLIDAY_COLLECTION_ID = "691";
@@ -394,6 +402,7 @@ const USER_MANUAL_SECTIONS = {
     title: "🛠️ Admin Features",
     lines: [
       "Admins can manage the roster, send invitations, manage admin access, send prompts, and deregister users.",
+      "Admins can also edit the allowed attendance codes and sort them by usage directly from the Admin Menu.",
       "The ONBOARDING sheet is the source of truth for appointment names and ordering.",
       "Default admin appointments only take effect when they are currently onboarded."
     ]
@@ -427,7 +436,10 @@ function buildAdminMenu() {
       Markup.button.callback("📣 Prompt All", "admin:promptall")
     ],
     [
-      Markup.button.callback("🧾 Deregister Person", "admin:menu:deregister:0"),
+      Markup.button.callback("🧩 Attendance Options", "admin:menu:options"),
+      Markup.button.callback("🧾 Deregister Person", "admin:menu:deregister:0")
+    ],
+    [
       Markup.button.callback("🔙 Back", "home:main")
     ],
     [
@@ -534,6 +546,23 @@ function buildAdminManageMenu() {
     [
       Markup.button.callback("➕ Add Admin", "admin:menu:addadmin:0"),
       Markup.button.callback("➖ Remove Admin", "admin:menu:removeadmin:0")
+    ],
+    [
+      Markup.button.callback("🔙 Back", "admin:main"),
+      Markup.button.callback("❌", "admin:close")
+    ]
+  ]);
+}
+
+function buildAttendanceOptionsMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("➕ Add Option", "admin:options:add"),
+      Markup.button.callback("➖ Remove Option", "admin:options:remove:0")
+    ],
+    [
+      Markup.button.callback("📊 Sort by Usage", "admin:options:sort"),
+      Markup.button.callback("🔄 Reset Defaults", "admin:options:reset")
     ],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
@@ -997,9 +1026,30 @@ function buildAdminMenuDescription() {
     "✉️ Send Invitation: Generate and forward an invitation for personnel who have not onboarded.",
     "👮 Manage Admins: Review current admins and add or remove admin appointments.",
     "📣 Prompt All: Send the attendance prompt to all currently bound users.",
+    "🧩 Attendance Options: View, add, remove, or reset the allowed attendance codes.",
     "🧾 Deregister Person: Remove another person’s Telegram binding and rotate their code.",
     "🔙 Back: Return to the main home menu."
   ].join("\n");
+}
+
+function buildAttendanceOptionsDescription(attendanceOptions) {
+  const lines = [
+    "Attendance Options",
+    "",
+    "These codes appear in Telegram and in the Google Sheets dropdown validation.",
+    ""
+  ];
+
+  if (attendanceOptions.length === 0) {
+    lines.push("No attendance options are currently configured.");
+  } else {
+    lines.push(`Current options (${attendanceOptions.length}):`);
+    lines.push(...attendanceOptions.map((option) => `• ${option}`));
+  }
+
+  lines.push("");
+  lines.push("Use the buttons below to add, remove, sort, or reset the list.");
+  return lines.join("\n");
 }
 
 function buildManageAdminsDescription(admins) {
@@ -1341,6 +1391,7 @@ async function finalizeWeeklyAttendanceFlow(ctx, sheets, config, appointment) {
 async function resetConversationState(ctx) {
   ctx.session.awaitingAttendance = false;
   ctx.session.awaitingSecretCode = false;
+  ctx.session.awaitingAttendanceOptionAdd = false;
   await clearWeeklyAttendanceState(ctx);
   await updateUserByChatId(ctx.chat.id, {
     awaitingAttendance: false,
@@ -1354,7 +1405,7 @@ async function askForSecretCode(ctx, config) {
   await updateUserByChatId(ctx.chat.id, {
     awaitingSecretCode: true
   });
-  await ctx.reply(config.onboardingCodePrompt, Markup.removeKeyboard());
+  await ctx.reply(ONBOARDING_CODE_PROMPT, Markup.removeKeyboard());
 }
 
 async function askAttendance(ctx, config, user = null, cache = null) {
@@ -1600,6 +1651,12 @@ async function preloadSheetSnapshots(sheets, config, cache, options = {}) {
 }
 
 async function refreshAdminCache(cache, config) {
+  const settings = await getSettings();
+
+  if (Array.isArray(settings.attendanceOptions) && settings.attendanceOptions.length > 0) {
+    config.attendanceOptions = settings.attendanceOptions;
+  }
+
   const [registry, admins] = await Promise.all([
     getAppointmentRegistry(),
     listAdminAppointments(config.defaultAdminAppointments)
@@ -1659,6 +1716,42 @@ async function ensureSheetReadiness(sheets, config, cache, options = {}) {
   }
 
   await cache.syncPromise;
+}
+
+async function applyAttendanceOptionChange(sheets, config, cache, nextOptions) {
+  config.attendanceOptions = nextOptions;
+  await setAttendanceOptions(nextOptions);
+  await syncRosterState(sheets, config);
+  await ensureNextMonthSheetExists(sheets, config);
+  cache.lastSheetSyncAt = Date.now();
+  await refreshAdminCache(cache, config);
+}
+
+function sortAttendanceOptionsByUsage(attendanceOptions, usageMap = {}) {
+  return [...attendanceOptions].sort((left, right) => {
+    const leftUsage = Number(usageMap[left] ?? 0);
+    const rightUsage = Number(usageMap[right] ?? 0);
+
+    if (rightUsage !== leftUsage) {
+      return rightUsage - leftUsage;
+    }
+
+    return left.localeCompare(right);
+  });
+}
+
+async function refreshAttendanceOptionUsage(sheets, config, cache) {
+  const usageMap = await summarizeAttendanceOptionUsage(sheets, config);
+  const sortedOptions = sortAttendanceOptionsByUsage(config.attendanceOptions, usageMap);
+
+  await setAttendanceOptionUsage(usageMap);
+
+  if (JSON.stringify(sortedOptions) !== JSON.stringify(config.attendanceOptions)) {
+    await applyAttendanceOptionChange(sheets, config, cache, sortedOptions);
+    return sortedOptions;
+  }
+
+  return config.attendanceOptions;
 }
 
 async function renderCodesSubmenu(ctx, cache) {
@@ -1842,6 +1935,35 @@ async function renderDeregisterSubmenu(ctx, cache, page = 0) {
   );
 }
 
+async function renderAttendanceOptionsMenu(ctx, config) {
+  await sendOrUpdateAdminMessage(
+    ctx,
+    buildAttendanceOptionsDescription(config.attendanceOptions),
+    buildAttendanceOptionsMenu()
+  );
+}
+
+async function renderAttendanceOptionRemovalMenu(ctx, config, page = 0) {
+  const items = config.attendanceOptions.map((option) => ({ label: option, option }));
+
+  if (items.length === 0) {
+    await renderAttendanceOptionsMenu(ctx, config);
+    return;
+  }
+
+  await sendOrUpdateAdminMessage(
+    ctx,
+    "Select an attendance option to remove.",
+    buildPagedSelectionMenu(
+      items,
+      page,
+      "admin:pick:optionremove",
+      "admin:options:remove",
+      "admin:menu:options"
+    )
+  );
+}
+
 async function runAdminAction(action, ctx, bot, sheets, config, cache) {
   if (!(await requireAdmin(ctx, config))) {
     return;
@@ -2003,15 +2125,23 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
 
 async function sendPromptToChat(bot, config, chatId, cache = null) {
   const user = await getUserByChatId(chatId);
+  const today = new Date();
+  const dateLabel = formatAttendanceDateLabel(today, config.timezone);
+  const currentStatus = user?.appointment && cache
+    ? getCachedAttendanceStatus(cache, config, user.appointment, today)
+    : "";
   const message = buildTodayAttendancePromptMessage(
     config,
-    new Date(),
+    today,
     user?.appointment ?? null,
     cache
   );
+  const promptMessage = currentStatus
+    ? `Your attendance for ${dateLabel} is currently ${currentStatus}. Update it if needed.`
+    : `You have not updated your attendance for ${dateLabel}. ${message}`;
   await bot.telegram.sendMessage(
     chatId,
-    message,
+    promptMessage,
     buildInlineAttendanceMenu(
       config.attendanceOptions,
       0,
@@ -2310,6 +2440,54 @@ export function createAttendanceBot(config) {
       ctx.session.awaitingAttendance || storedUser?.awaitingAttendance === true;
     const awaitingWeeklyAttendance =
       ctx.session.awaitingWeeklyAttendance || storedUser?.awaitingWeeklyAttendance === true;
+    const awaitingAttendanceOptionAdd = ctx.session.awaitingAttendanceOptionAdd === true;
+
+    if (awaitingAttendanceOptionAdd) {
+      if (!(await requireAdmin(ctx, config))) {
+        ctx.session.awaitingAttendanceOptionAdd = false;
+        return;
+      }
+
+      const normalizedOption = String(message ?? "").trim().toUpperCase();
+
+      if (!normalizedOption) {
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "Attendance option cannot be empty. Send the new code to add it.",
+          Markup.inlineKeyboard([
+            [
+              Markup.button.callback("🔙 Back", "admin:menu:options"),
+              Markup.button.callback("❌", "admin:close")
+            ]
+          ])
+        );
+        return;
+      }
+
+      if (config.attendanceOptions.includes(normalizedOption)) {
+        ctx.session.awaitingAttendanceOptionAdd = false;
+        await sendOrUpdateAdminMessage(
+          ctx,
+          `${normalizedOption} is already in the attendance option list.`,
+          buildAttendanceOptionsMenu()
+        );
+        return;
+      }
+
+      ctx.session.awaitingAttendanceOptionAdd = false;
+      await applyAttendanceOptionChange(
+        sheets,
+        config,
+        adminCache,
+        [...config.attendanceOptions, normalizedOption]
+      );
+      await sendOrUpdateAdminMessage(
+        ctx,
+        `${normalizedOption} has been added to the attendance options.`,
+        buildAttendanceOptionsMenu()
+      );
+      return;
+    }
 
     if (awaitingSecretCode) {
       await ensureSheetReadiness(sheets, config, adminCache);
@@ -2857,6 +3035,16 @@ export function createAttendanceBot(config) {
       return;
     }
 
+    if (action === "menu:options") {
+      await renderAttendanceOptionsMenu(ctx, config);
+      return;
+    }
+
+    if (action === "menu:options") {
+      await renderAttendanceOptionsMenu(ctx, config);
+      return;
+    }
+
     if (action.startsWith("menu:invite:")) {
       await ensureSheetReadiness(sheets, config, adminCache);
       await renderInviteSubmenu(ctx, adminCache, Number(action.split(":")[2]));
@@ -2893,6 +3081,51 @@ export function createAttendanceBot(config) {
     if (action.startsWith("menu:removeadmin:")) {
       await ensureSheetReadiness(sheets, config, adminCache);
       await renderRemoveAdminSubmenu(ctx, adminCache, Number(action.split(":")[2]));
+      return;
+    }
+
+    if (action === "options:add") {
+      ctx.session.awaitingAttendanceOptionAdd = true;
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "Send the new attendance option code exactly as you want it to appear.",
+        Markup.inlineKeyboard([
+          [
+            Markup.button.callback("🔙 Back", "admin:menu:options"),
+            Markup.button.callback("❌", "admin:close")
+          ]
+        ])
+      );
+      return;
+    }
+
+    if (action.startsWith("options:remove:")) {
+      await renderAttendanceOptionRemovalMenu(ctx, config, Number(action.split(":")[2]));
+      return;
+    }
+
+    if (action === "options:reset") {
+      await resetAttendanceOptions();
+      config.attendanceOptions = [...defaultAttendanceOptions];
+      await syncRosterState(sheets, config);
+      await ensureNextMonthSheetExists(sheets, config);
+      adminCache.lastSheetSyncAt = Date.now();
+      await refreshAdminCache(adminCache, config);
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "Attendance options have been reset to the default list.",
+        buildAttendanceOptionsMenu()
+      );
+      return;
+    }
+
+    if (action === "options:sort") {
+      await refreshAttendanceOptionUsage(sheets, config, adminCache);
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "Attendance options have been sorted from most-used to least-used.",
+        buildAttendanceOptionsMenu()
+      );
       return;
     }
 
@@ -3018,11 +3251,46 @@ export function createAttendanceBot(config) {
       return;
     }
 
+    if (action.startsWith("pick:optionremove:")) {
+      const option = config.attendanceOptions[Number(action.split(":")[2])];
+
+      if (!option) {
+        await renderAttendanceOptionRemovalMenu(ctx, config, 0);
+        return;
+      }
+
+      if (config.attendanceOptions.length === 1) {
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "At least one attendance option must remain configured.",
+          buildAttendanceOptionsMenu()
+        );
+        return;
+      }
+
+      await applyAttendanceOptionChange(
+        sheets,
+        config,
+        adminCache,
+        config.attendanceOptions.filter((entry) => entry !== option)
+      );
+      await sendOrUpdateAdminMessage(
+        ctx,
+        `${option} has been removed from the attendance options.`,
+        buildAttendanceOptionsMenu()
+      );
+      return;
+    }
+
     await runAdminAction(action, ctx, bot, sheets, config, adminCache);
   });
 
   ensureSheetReadiness(sheets, config, adminCache, { force: true }).catch((error) => {
     console.error("Initial roster sync failed:", error);
+  });
+
+  refreshAttendanceOptionUsage(sheets, config, adminCache).catch((error) => {
+    console.error("Initial attendance option sort failed:", error);
   });
 
   setInterval(async () => {
@@ -3032,6 +3300,19 @@ export function createAttendanceBot(config) {
       console.error("Background sheet preload failed:", error);
     }
   }, 60 * 1000);
+
+  cron.schedule(
+    "5 0 * * *",
+    async () => {
+      try {
+        await ensureSheetReadiness(sheets, config, adminCache, { force: true });
+        await refreshAttendanceOptionUsage(sheets, config, adminCache);
+      } catch (error) {
+        console.error("Nightly attendance option sort failed:", error);
+      }
+    },
+    { timezone: config.timezone }
+  );
 
   const scheduledReminderTimes = [
     config.firstReminderTime,
@@ -3060,9 +3341,17 @@ export function createAttendanceBot(config) {
           return;
         }
 
-        const users = (await listUsers()).filter(
-          (user) => user.appointment && hasUnfilledAttendance(adminCache, config, user.appointment, now)
-        );
+        const users = (await listUsers()).filter((user) => {
+          if (!user.appointment) {
+            return false;
+          }
+
+          if (reminderTime === config.firstReminderTime) {
+            return true;
+          }
+
+          return hasUnfilledAttendance(adminCache, config, user.appointment, now);
+        });
 
         for (const user of users) {
           try {

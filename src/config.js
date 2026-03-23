@@ -1,4 +1,5 @@
 import dotenv from "dotenv";
+import { getSettings } from "./storage.js";
 
 dotenv.config();
 
@@ -19,22 +20,37 @@ function parseList(value) {
     .filter(Boolean);
 }
 
-const defaultAttendanceOptions = [
+export const defaultAttendanceOptions = [
   "PRESENT",
-  "OFF",
-  "OS",
-  "D1",
-  "D2",
-  "D3",
   "DUTY",
-  "U/S",
+  "PH",
+  "OSD",
+  "OE",
+  "WFH",
+  "FISHING",
+  "OIL",
+  "EMBARK OFF",
+  "OFF",
+  "DISEMBARK OFF",
+  "RR",
+  "SR",
+  "OS",
+  "TNB",
+  "YARD",
+  "ORCA",
   "RSO",
   "MC",
+  "OML",
+  "MA",
+  "HL",
+  "RSI",
   "LL",
-  "OL",
   "CCL",
   "PCL",
-  "OML",
+  "CSL",
+  "COMPASSIONATE",
+  "PTL",
+  "OL",
   "AO",
   "68",
   "69",
@@ -42,48 +58,15 @@ const defaultAttendanceOptions = [
   "71",
   "73",
   "OC",
-  "TNB",
-  "MA",
-  "WFH",
-  "FISHING",
-  "SR",
-  "RR",
-  "DISEMBARK OFF",
-  "AM LEAVE",
-  "PM LEAVE",
-  "OFF (AM)",
-  "OFF (PM)",
-  "CSL",
-  "COMPASSIONATE",
   "ORD",
   "POST OUT",
   "IPPT",
-  "OIL",
-  "HL",
-  "PH",
-  "SHRO",
-  "ORCA",
-  "EMBARK OFF",
-  "YARD",
-  "CCL (AM)",
-  "CCL (PM)",
-  "RSI",
-  "YARD (AM)",
-  "YARD (PM)",
-  "CNB (AM)",
-  "CNB (PM)",
-  "PCL (AM)",
-  "PCL (PM)",
-  "CSL (AM)",
-  "CSL (PM)",
   "FMSS",
-  "OE",
-  "PTL",
   "CNB",
-  "OSD",
-  "POOD (DAY)",
-  "OOD"
+  "CST",
+  "DCTC"
 ];
+const ATTENDANCE_OPTION_SCHEMA_VERSION = 2;
 
 const privateKey = requireEnv("GOOGLE_PRIVATE_KEY").replace(/\\n/g, "\n");
 const attendanceOptions =
@@ -104,14 +87,25 @@ export const config = {
     process.env.ONBOARDING_SYNC_INTERVAL_MINUTES || 5
   ),
   sheetSyncMinIntervalMs: Number(process.env.SHEET_SYNC_MIN_INTERVAL_MS || 60000),
-  attendanceQuestion:
-    process.env.ATTENDANCE_QUESTION || "Will you be attending today?",
   attendanceOptions,
-  onboardingCodePrompt:
-    process.env.ONBOARDING_CODE_PROMPT ||
-    "Send the secret code assigned to your appointment.",
   rosterStopMarkers: parseList(process.env.ROSTER_STOP_MARKERS || "Remarks"),
   defaultAdminAppointments: parseList(
     process.env.DEFAULT_ADMIN_APPOINTMENTS || "SCSE,Coxn,CO,XO,OPS 1"
   )
 };
+
+export async function applyStoredConfigOverrides() {
+  const settings = await getSettings();
+
+  if (
+    settings.attendanceOptionsVersion === ATTENDANCE_OPTION_SCHEMA_VERSION &&
+    Array.isArray(settings.attendanceOptions) &&
+    settings.attendanceOptions.length > 0
+  ) {
+    config.attendanceOptions = settings.attendanceOptions;
+  } else {
+    config.attendanceOptions = [...defaultAttendanceOptions];
+  }
+
+  return config;
+}

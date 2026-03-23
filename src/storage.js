@@ -8,6 +8,7 @@ const __dirname = path.dirname(__filename);
 const DATA_DIR = path.resolve(__dirname, "../data");
 const USERS_FILE = path.join(DATA_DIR, "users.json");
 const APPOINTMENT_REGISTRY_FILE = path.join(DATA_DIR, "appointment-registry.json");
+const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
 
 async function ensureDataDir() {
   await mkdir(DATA_DIR, { recursive: true });
@@ -85,6 +86,26 @@ async function readAppointmentRegistry() {
 async function writeAppointmentRegistry(registry) {
   await writeJsonFile(APPOINTMENT_REGISTRY_FILE, registry);
 }
+
+async function readSettings() {
+  return readJsonFile(SETTINGS_FILE, {
+    updatedAt: null,
+    attendanceOptions: null,
+    attendanceOptionsVersion: null,
+    attendanceOptionUsage: null,
+    attendanceOptionUsageUpdatedAt: null
+  });
+}
+
+async function writeSettings(settings) {
+  await writeJsonFile(SETTINGS_FILE, settings);
+}
+
+function normalizeAttendanceOption(value) {
+  return String(value ?? "").trim();
+}
+
+const ATTENDANCE_OPTION_SCHEMA_VERSION = 2;
 
 export async function upsertUser(user) {
   const users = await readUsers();
@@ -191,6 +212,41 @@ export async function listPendingAppointments() {
 
 export async function getAppointmentRegistry() {
   return readAppointmentRegistry();
+}
+
+export async function getSettings() {
+  return readSettings();
+}
+
+export async function setAttendanceOptions(attendanceOptions) {
+  const settings = await readSettings();
+  settings.updatedAt = new Date().toISOString();
+  settings.attendanceOptionsVersion = ATTENDANCE_OPTION_SCHEMA_VERSION;
+  settings.attendanceOptions = [...new Set(
+    attendanceOptions
+      .map(normalizeAttendanceOption)
+      .filter(Boolean)
+  )];
+  await writeSettings(settings);
+  return settings.attendanceOptions;
+}
+
+export async function resetAttendanceOptions() {
+  const settings = await readSettings();
+  settings.updatedAt = new Date().toISOString();
+  settings.attendanceOptionsVersion = ATTENDANCE_OPTION_SCHEMA_VERSION;
+  settings.attendanceOptions = null;
+  await writeSettings(settings);
+  return settings;
+}
+
+export async function setAttendanceOptionUsage(attendanceOptionUsage) {
+  const settings = await readSettings();
+  settings.updatedAt = new Date().toISOString();
+  settings.attendanceOptionUsageUpdatedAt = settings.updatedAt;
+  settings.attendanceOptionUsage = attendanceOptionUsage;
+  await writeSettings(settings);
+  return settings;
 }
 
 export async function listAdminAppointments(defaultAdminAppointments) {

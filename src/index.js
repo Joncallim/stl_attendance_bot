@@ -1,10 +1,19 @@
-import { config } from "./config.js";
+import { applyStoredConfigOverrides, config } from "./config.js";
 import { createAttendanceBot } from "./bot.js";
 
 async function main() {
+  await applyStoredConfigOverrides();
   const bot = createAttendanceBot(config);
 
   await bot.launch();
+  await bot.telegram.setMyCommands([
+    { command: "start", description: "Open the main menu" },
+    { command: "help", description: "Open the user manual" },
+    { command: "attendance", description: "Submit today's attendance" },
+    { command: "week", description: "Submit weekly attendance" },
+    { command: "summary", description: "View attendance summary" },
+    { command: "deregister", description: "Deregister this Telegram account" }
+  ]);
   console.log("Attendance bot is running.");
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
