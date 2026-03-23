@@ -1,20 +1,30 @@
 import cron from "node-cron";
 import { Markup, Telegraf, session } from "telegraf";
 import {
+  applyAttendanceEntriesToSnapshotBundle,
+  addAppointmentToSheets,
   createGoogleSheetsClient,
   ensureNextMonthSheetExists,
   preloadAttendanceSnapshots,
+  removeAppointmentFromSheets,
   summarizeAttendanceOptionUsage,
   syncOnboardingCodeColumn,
   syncOnboardingRoster,
   summarizeStatuses,
   summarizeStatusesFromSnapshot,
-  writeAttendanceStatus,
   writeAttendanceStatuses
 } from "./googleSheets.js";
+import {
+  enqueueAttendanceEvent,
+  enqueueAttendanceEvents,
+  listPendingAttendanceEvents,
+  flushAttendanceQueue
+} from "./attendanceQueue.js";
 import { defaultAttendanceOptions } from "./config.js";
+import { getSingaporePublicHolidaySet } from "./holidays.js";
 import {
   addAdminAppointment,
+  addAppointmentToRegistry,
   bindAppointmentCode,
   deregisterAppointmentBinding,
   deregisterRequestorByChatId,
@@ -24,6 +34,7 @@ import {
   getOnboardingInvite,
   listAdminAppointments,
   listUsers,
+  removeAppointmentFromRegistry,
   resetAttendanceOptions,
   removeAdminAppointment,
   setAttendanceOptionUsage,
@@ -32,15 +43,19 @@ import {
   updateUserByChatId,
   upsertUser
 } from "./storage.js";
+import { createSyncManager } from "./syncManager.js";
+import { runSerialized } from "./fileStore.js";
+import {
+  applyWeeklyAttendanceSelection,
+  createWeeklyFlowState,
+  getStagedAttendanceStatus,
+  upsertWeeklyAttendanceEntry
+} from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
 
 const WEEK_SKIP_LABEL = "Skip Day";
-const SINGAPORE_PUBLIC_HOLIDAY_COLLECTION_ID = "691";
-const publicHolidayCache = {
-  years: new Map(),
-  loadingPromise: null
-};
+const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
 const INSPIRATIONAL_QUOTES = [
   "The secret of getting ahead is getting started. — Mark Twain",
   "Well begun is half done. — Aristotle",
@@ -451,6 +466,10 @@ function buildAdminMenu() {
 function buildAdminRosterMenu() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("🕓 Pending", "admin:pending")],
+    [
+      Markup.button.callback("➕ Add Appointment", "admin:appointments:add"),
+      Markup.button.callback("➖ Remove Appointment", "admin:menu:appointments:remove:0")
+    ],
     [Markup.button.callback("🔄 Sync Roster", "admin:syncroster")],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
@@ -566,6 +585,15 @@ function buildAttendanceOptionsMenu() {
     ],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
+      Markup.button.callback("❌", "admin:close")
+    ]
+  ]);
+}
+
+function buildAppointmentManagementBackMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("🔙 Back", "admin:menu:roster"),
       Markup.button.callback("❌", "admin:close")
     ]
   ]);
@@ -995,18 +1023,6 @@ function getCachedAttendanceStatus(cache, config, appointment, date) {
   return String(snapshot.statusesByDay.get(day)?.[appointmentIndex] ?? "").trim();
 }
 
-function getStagedAttendanceStatus(entries, date, timezone) {
-  const isoDate = typeof date === "string" ? date : toIsoDateString(date, timezone);
-  const entry = [...entries].reverse().find((value) => value.date === isoDate);
-  return entry?.status ?? "";
-}
-
-function upsertWeeklyAttendanceEntry(entries, date, status, timezone) {
-  const isoDate = typeof date === "string" ? date : toIsoDateString(date, timezone);
-  const nextEntries = entries.filter((entry) => entry.date !== isoDate);
-  nextEntries.push({ date: isoDate, status });
-  return nextEntries;
-}
 
 function formatSyncStatusTimestamp(timestamp, timezone) {
   if (!timestamp) {
@@ -1076,12 +1092,32 @@ function buildRosterDescription() {
     "",
     "Use this section to manage the onboarding roster.",
     "🕓 Pending shows active personnel who have not onboarded yet.",
+    "➕ Add Appointment inserts a new appointment into the managed roster and generates a fresh onboarding code.",
+    "➖ Remove Appointment removes a managed appointment from the active roster and clears any existing binding.",
     "🔄 Sync Roster refreshes the ONBOARDING sheet, secret codes, and monthly attendance sheets."
   ].join("\n");
 }
 
 function getCachedSummarySnapshot(cache, config, date) {
-  return summarizeStatusesFromSnapshot(cache.sheetSnapshots, config, { date }) ?? null;
+  const snapshotVersion = cache.sheetSnapshots?.synchronizedAt ?? "none";
+  const memoKey = `${snapshotVersion}:${toIsoDateString(date, config.timezone)}`;
+
+  if (cache.summaryMemoVersion !== snapshotVersion) {
+    cache.summaryMemo.clear();
+    cache.summaryMemoVersion = snapshotVersion;
+  }
+
+  if (cache.summaryMemo.has(memoKey)) {
+    return cache.summaryMemo.get(memoKey);
+  }
+
+  const summary = summarizeStatusesFromSnapshot(cache.sheetSnapshots, config, { date }) ?? null;
+
+  if (summary) {
+    cache.summaryMemo.set(memoKey, summary);
+  }
+
+  return summary;
 }
 
 function getUnaccountedAppointments(cache, config, date) {
@@ -1188,19 +1224,23 @@ function formatSummaryMessage(summary, config) {
 
 function createAdminCache() {
   return {
-    lastSheetSyncAt: 0,
-    syncPromise: null,
-    lastSnapshotSyncAt: 0,
-    snapshotPromise: null,
+    syncManager: null,
     sheetSnapshots: null,
+    summaryMemo: new Map(),
+    summaryMemoVersion: null,
     pending: [],
     activeCodes: [],
     admins: [],
     inviteCandidates: [],
     deregisterCandidates: [],
+    removeAppointmentCandidates: [],
     addAdminCandidates: [],
     removeAdminCandidates: []
   };
+}
+
+function withSheetOperation(operation) {
+  return runSerialized(SHEET_OPERATION_MUTEX_KEY, operation);
 }
 
 function getTimezoneDateParts(date, timezone) {
@@ -1267,68 +1307,6 @@ function toIsoDateString(date, timezone) {
   return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url);
-
-  if (!response.ok) {
-    throw new Error(`Request failed: ${response.status} ${response.statusText}`);
-  }
-
-  return response.json();
-}
-
-async function loadSingaporePublicHolidayCache() {
-  if (publicHolidayCache.loadingPromise) {
-    await publicHolidayCache.loadingPromise;
-    return;
-  }
-
-  publicHolidayCache.loadingPromise = (async () => {
-    const metadata = await fetchJson(
-      `https://api-production.data.gov.sg/v2/public/api/collections/${SINGAPORE_PUBLIC_HOLIDAY_COLLECTION_ID}/metadata`
-    );
-    const datasetIds = metadata?.data?.collectionMetadata?.childDatasets ?? [];
-
-    for (const datasetId of datasetIds) {
-      try {
-        const payload = await fetchJson(
-          `https://data.gov.sg/api/action/datastore_search?resource_id=${datasetId}`
-        );
-        const records = payload?.result?.records ?? [];
-
-        for (const record of records) {
-          const rawDate = String(record.date ?? "").trim();
-
-          if (!/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
-            continue;
-          }
-
-          const year = Number(rawDate.slice(0, 4));
-
-          if (!publicHolidayCache.years.has(year)) {
-            publicHolidayCache.years.set(year, new Set());
-          }
-
-          publicHolidayCache.years.get(year).add(rawDate);
-        }
-      } catch (error) {
-        console.error(`Failed to load public holiday dataset ${datasetId}:`, error.message);
-      }
-    }
-  })().finally(() => {
-    publicHolidayCache.loadingPromise = null;
-  });
-
-  await publicHolidayCache.loadingPromise;
-}
-
-async function getSingaporePublicHolidaySet(year) {
-  if (!publicHolidayCache.years.has(year)) {
-    await loadSingaporePublicHolidayCache();
-  }
-
-  return publicHolidayCache.years.get(year) ?? new Set();
-}
 
 async function isReminderWorkingDay(date, timezone) {
   if (getWeekdayIndex(timezone, date) >= 5) {
@@ -1355,7 +1333,7 @@ async function clearWeeklyAttendanceState(ctx) {
   });
 }
 
-async function finalizeWeeklyAttendanceFlow(ctx, sheets, config, appointment) {
+async function finalizeWeeklyAttendanceFlow(ctx, config, appointment, cache) {
   const results = Array.isArray(ctx.session.weeklyAttendanceResults)
     ? ctx.session.weeklyAttendanceResults
     : [];
@@ -1364,21 +1342,32 @@ async function finalizeWeeklyAttendanceFlow(ctx, sheets, config, appointment) {
     : [];
 
   if (entries.length > 0) {
-    await writeAttendanceStatuses(
-      sheets,
+    const queuedEntries = entries.map((entry) => ({
+      appointment,
+      status: entry.status,
+      date: new Date(entry.date),
+      source: "weekly"
+    }));
+    await enqueueAttendanceEvents(
       config,
-      entries.map((entry) => ({
-        appointment,
-        status: entry.status,
-        date: new Date(entry.date)
-      }))
+      queuedEntries
     );
+
+    if (cache.sheetSnapshots) {
+      cache.sheetSnapshots = applyAttendanceEntriesToSnapshotBundle(
+        cache.sheetSnapshots,
+        config,
+        queuedEntries
+      );
+      cache.summaryMemo.clear();
+      cache.summaryMemoVersion = cache.sheetSnapshots?.synchronizedAt ?? null;
+    }
   }
 
   await clearWeeklyAttendanceState(ctx);
   await sendOrUpdateAdminMessage(
     ctx,
-    ["Weekly attendance updated:", "", ...results].join("\n"),
+    ["Weekly attendance updated and queued for Google Sheets sync:", "", ...results].join("\n"),
     Markup.inlineKeyboard([
       [
         Markup.button.callback("🔙 Back", "home:main"),
@@ -1392,6 +1381,7 @@ async function resetConversationState(ctx) {
   ctx.session.awaitingAttendance = false;
   ctx.session.awaitingSecretCode = false;
   ctx.session.awaitingAttendanceOptionAdd = false;
+  ctx.session.awaitingAppointmentAdd = false;
   await clearWeeklyAttendanceState(ctx);
   await updateUserByChatId(ctx.chat.id, {
     awaitingAttendance: false,
@@ -1456,7 +1446,7 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
   const stagedStatus = getStagedAttendanceStatus(
     ctx.session.weeklyAttendanceEntries ?? [],
     date,
-    config.timezone
+    (value) => toIsoDateString(value, config.timezone)
   );
   const existingStatus = stagedStatus || (user?.appointment
     ? getCachedAttendanceStatus(cache, config, user.appointment, date)
@@ -1502,7 +1492,7 @@ async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
     }
 
     if (
-      !getStagedAttendanceStatus(weeklyEntries, isoDate, config.timezone) &&
+      !getStagedAttendanceStatus(weeklyEntries, isoDate, (value) => toIsoDateString(value, config.timezone)) &&
       !getCachedAttendanceStatus(cache, config, user.appointment, date)
     ) {
       weeklyEntries.push({ date: isoDate, status: "PH" });
@@ -1518,20 +1508,18 @@ async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
 }
 
 async function startWeeklyAttendanceFlow(ctx, config, sheets, user, cache, weekOffset = 0) {
+  const weeklyState = createWeeklyFlowState(getWorkweekDates(config.timezone, weekOffset));
+
   ctx.session.awaitingAttendance = false;
-  ctx.session.awaitingWeeklyAttendance = true;
-  ctx.session.weeklyAttendanceDates = getWorkweekDates(config.timezone, weekOffset);
-  ctx.session.weeklyAttendanceIndex = 0;
-  ctx.session.weeklyAttendanceResults = [];
-  ctx.session.weeklyAttendanceEntries = [];
+  ctx.session.awaitingWeeklyAttendance = weeklyState.awaitingWeeklyAttendance;
+  ctx.session.weeklyAttendanceDates = weeklyState.weeklyAttendanceDates;
+  ctx.session.weeklyAttendanceIndex = weeklyState.weeklyAttendanceIndex;
+  ctx.session.weeklyAttendanceResults = weeklyState.weeklyAttendanceResults;
+  ctx.session.weeklyAttendanceEntries = weeklyState.weeklyAttendanceEntries;
 
   await updateUserByChatId(ctx.chat.id, {
     awaitingAttendance: false,
-    awaitingWeeklyAttendance: true,
-    weeklyAttendanceDates: ctx.session.weeklyAttendanceDates,
-    weeklyAttendanceIndex: 0,
-    weeklyAttendanceResults: [],
-    weeklyAttendanceEntries: []
+    ...weeklyState
   });
 
   await autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache);
@@ -1628,26 +1616,21 @@ async function syncRosterState(sheets, config) {
 }
 
 async function preloadSheetSnapshots(sheets, config, cache, options = {}) {
-  const force = options.force === true;
-  const now = Date.now();
+  const snapshotBundle = await preloadAttendanceSnapshots(sheets, config, options);
+  const pendingEvents = await listPendingAttendanceEvents();
+  const pendingEntries = pendingEvents.map((event) => ({
+    appointment: event.appointment,
+    status: event.status,
+    date: new Date(`${event.date}T12:00:00.000Z`)
+  }));
 
-  if (!force && cache.sheetSnapshots && now - cache.lastSnapshotSyncAt < 60_000) {
-    return cache.sheetSnapshots;
-  }
+  cache.sheetSnapshots = pendingEntries.length > 0
+    ? applyAttendanceEntriesToSnapshotBundle(snapshotBundle, config, pendingEntries)
+    : snapshotBundle;
+  cache.summaryMemo.clear();
+  cache.summaryMemoVersion = cache.sheetSnapshots?.synchronizedAt ?? null;
 
-  if (!cache.snapshotPromise) {
-    cache.snapshotPromise = preloadAttendanceSnapshots(sheets, config)
-      .then((snapshotBundle) => {
-        cache.sheetSnapshots = snapshotBundle;
-        cache.lastSnapshotSyncAt = Date.now();
-        return snapshotBundle;
-      })
-      .finally(() => {
-        cache.snapshotPromise = null;
-      });
-  }
-
-  return cache.snapshotPromise;
+  return cache.sheetSnapshots;
 }
 
 async function refreshAdminCache(cache, config) {
@@ -1675,6 +1658,10 @@ async function refreshAdminCache(cache, config) {
   cache.deregisterCandidates = activeCodes
     .filter((entry) => entry.boundChatId)
     .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
+  cache.removeAppointmentCandidates = activeCodes.map((entry) => ({
+    label: entry.appointment,
+    appointment: entry.appointment
+  }));
   cache.addAdminCandidates = activeCodes
     .filter((entry) => !adminSet.has(entry.appointment.toUpperCase()))
     .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
@@ -1683,48 +1670,96 @@ async function refreshAdminCache(cache, config) {
     .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
 
   cache.inviteCandidates = sortAppointmentsForAdmin(cache.inviteCandidates);
+  cache.removeAppointmentCandidates = sortAppointmentsForAdmin(cache.removeAppointmentCandidates);
   cache.addAdminCandidates = sortAppointmentsForAdmin(cache.addAdminCandidates);
   cache.removeAdminCandidates = sortAppointmentsForAdmin(cache.removeAdminCandidates);
 }
 
 async function ensureSheetReadiness(sheets, config, cache, options = {}) {
   const force = options.force === true;
-  const now = Date.now();
   const hasWarmCache =
     cache.activeCodes.length > 0 || cache.admins.length > 0 || cache.sheetSnapshots !== null;
+  const syncStatus = cache.syncManager?.getStatus() ?? {
+    lastRosterSyncAt: 0,
+    lastSnapshotSyncAt: 0,
+    cycleInProgress: false
+  };
+  const lastMeaningfulSyncAt = Math.max(
+    syncStatus.lastRosterSyncAt ?? 0,
+    syncStatus.lastSnapshotSyncAt ?? 0
+  );
+  const isFresh = Date.now() - lastMeaningfulSyncAt < 60_000;
 
-  if (!force && now - cache.lastSheetSyncAt < config.sheetSyncMinIntervalMs) {
-    if (cache.activeCodes.length === 0 && cache.admins.length === 0) {
-      await refreshAdminCache(cache, config);
-    }
+  if (!force && hasWarmCache && isFresh) {
     return;
   }
 
-  if (!cache.syncPromise) {
-    cache.syncPromise = (async () => {
-      await syncRosterState(sheets, config);
-      cache.lastSheetSyncAt = Date.now();
-      await refreshAdminCache(cache, config);
-      await preloadSheetSnapshots(sheets, config, cache, { force: true });
-    })().finally(() => {
-      cache.syncPromise = null;
+  if (!cache.syncManager) {
+    await syncRosterState(sheets, config);
+    await refreshAdminCache(cache, config);
+    await preloadSheetSnapshots(sheets, config, cache, { force: true });
+    return;
+  }
+
+  if (!force && hasWarmCache && !syncStatus.cycleInProgress) {
+    cache.syncManager.runCycle({ force: false }).catch((error) => {
+      console.error("Background sync refresh failed:", error);
     });
-  }
-
-  if (!force && hasWarmCache) {
     return;
   }
 
-  await cache.syncPromise;
+  await cache.syncManager.runCycle({ force });
 }
 
 async function applyAttendanceOptionChange(sheets, config, cache, nextOptions) {
-  config.attendanceOptions = nextOptions;
-  await setAttendanceOptions(nextOptions);
-  await syncRosterState(sheets, config);
-  await ensureNextMonthSheetExists(sheets, config);
-  cache.lastSheetSyncAt = Date.now();
-  await refreshAdminCache(cache, config);
+  await withSheetOperation(async () => {
+    config.attendanceOptions = nextOptions;
+    await setAttendanceOptions(nextOptions);
+    await syncRosterState(sheets, config);
+    await ensureNextMonthSheetExists(sheets, config);
+    await refreshAdminCache(cache, config);
+    await preloadSheetSnapshots(sheets, config, cache, { force: true });
+  });
+}
+
+async function addManagedAppointment(sheets, config, cache, appointment) {
+  return withSheetOperation(async () => {
+    const registryResult = await addAppointmentToRegistry(appointment);
+
+    if (!registryResult.ok) {
+      return registryResult;
+    }
+
+    await addAppointmentToSheets(sheets, config, registryResult.appointment);
+    await syncOnboardingCodeColumn(
+      sheets,
+      config,
+      (await getAppointmentRegistry()).appointments.filter((entry) => entry.active)
+    );
+    await refreshAdminCache(cache, config);
+    await preloadSheetSnapshots(sheets, config, cache, { force: true });
+    return registryResult;
+  });
+}
+
+async function removeManagedAppointment(sheets, config, cache, appointment) {
+  return withSheetOperation(async () => {
+    const registryResult = await removeAppointmentFromRegistry(appointment);
+
+    if (!registryResult.ok) {
+      return registryResult;
+    }
+
+    await removeAppointmentFromSheets(sheets, config, registryResult.appointment);
+    await syncOnboardingCodeColumn(
+      sheets,
+      config,
+      (await getAppointmentRegistry()).appointments.filter((entry) => entry.active)
+    );
+    await refreshAdminCache(cache, config);
+    await preloadSheetSnapshots(sheets, config, cache, { force: true });
+    return registryResult;
+  });
 }
 
 function sortAttendanceOptionsByUsage(attendanceOptions, usageMap = {}) {
@@ -1935,6 +1970,31 @@ async function renderDeregisterSubmenu(ctx, cache, page = 0) {
   );
 }
 
+async function renderRemoveAppointmentSubmenu(ctx, cache, page = 0) {
+  const candidates = cache.removeAppointmentCandidates;
+
+  if (candidates.length === 0) {
+    await sendOrUpdateAdminMessage(
+      ctx,
+      "There are no active appointments to remove.",
+      buildAppointmentManagementBackMenu()
+    );
+    return;
+  }
+
+  await sendOrUpdateAdminMessage(
+    ctx,
+    "Select an appointment to remove from the active roster.",
+    buildPagedSelectionMenu(
+      candidates,
+      page,
+      "admin:pick:appointmentremove",
+      "admin:menu:appointments:remove",
+      "admin:menu:roster"
+    )
+  );
+}
+
 async function renderAttendanceOptionsMenu(ctx, config) {
   await sendOrUpdateAdminMessage(
     ctx,
@@ -2000,8 +2060,8 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
   if (action === "syncroster") {
     const roster = await syncRosterState(sheets, config);
     await ensureNextMonthSheetExists(sheets, config);
-    cache.lastSheetSyncAt = Date.now();
     await refreshAdminCache(cache, config);
+    await preloadSheetSnapshots(sheets, config, cache, { force: true });
     await sendOrUpdateAdminMessage(
       ctx,
       `Roster synced from ${config.onboardingSheetTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.`
@@ -2179,12 +2239,28 @@ export function createAttendanceBot(config) {
   const bot = new Telegraf(config.telegramBotToken);
   const sheets = createGoogleSheetsClient(config);
   const adminCache = createAdminCache();
+  adminCache.syncManager = createSyncManager({
+    flushQueue: async () =>
+      withSheetOperation(async () =>
+        flushAttendanceQueue((entries) => writeAttendanceStatuses(sheets, config, entries))
+      ),
+    syncRoster: async () => withSheetOperation(async () => {
+      await syncRosterState(sheets, config);
+    }),
+    refreshAdminCache: async () => {
+      await refreshAdminCache(adminCache, config);
+    },
+    preloadSnapshots: async (options = {}) => withSheetOperation(async () => {
+      await preloadSheetSnapshots(sheets, config, adminCache, options);
+    })
+  });
 
   bot.use(
     session({
       defaultSession: () => ({
         awaitingAttendance: false,
         awaitingSecretCode: false,
+        awaitingAppointmentAdd: false,
         awaitingWeeklyAttendance: false,
         weeklyAttendanceDates: [],
         weeklyAttendanceIndex: 0,
@@ -2279,15 +2355,22 @@ export function createAttendanceBot(config) {
   });
 
   bot.command("lastupdate", async (ctx) => {
-    const preloadStatus = adminCache.syncPromise || adminCache.snapshotPromise
+    const syncStatus = adminCache.syncManager?.getStatus() ?? {
+      cycleInProgress: false,
+      lastQueueFlushAt: 0,
+      lastRosterSyncAt: 0,
+      lastSnapshotSyncAt: 0
+    };
+    const preloadStatus = syncStatus.cycleInProgress
       ? "Background synchronisation is in progress."
       : "Background synchronisation is idle.";
 
     await ctx.reply(
       [
         "Google Sheets synchronisation status:",
-        `Roster sync: ${formatSyncStatusTimestamp(adminCache.lastSheetSyncAt, config.timezone)}`,
-        `Snapshot sync: ${formatSyncStatusTimestamp(adminCache.lastSnapshotSyncAt, config.timezone)}`,
+        `Queue flush: ${formatSyncStatusTimestamp(syncStatus.lastQueueFlushAt, config.timezone)}`,
+        `Roster sync: ${formatSyncStatusTimestamp(syncStatus.lastRosterSyncAt, config.timezone)}`,
+        `Snapshot sync: ${formatSyncStatusTimestamp(syncStatus.lastSnapshotSyncAt, config.timezone)}`,
         preloadStatus
       ].join("\n")
     );
@@ -2431,6 +2514,54 @@ export function createAttendanceBot(config) {
     await refreshAdminCache(adminCache, config);
   });
 
+  bot.command("addappointment", async (ctx) => {
+    if (!(await requireAdmin(ctx, config))) {
+      return;
+    }
+
+    const appointment = getCommandArgument(ctx.message.text, "addappointment");
+
+    if (!appointment) {
+      ctx.session.awaitingAppointmentAdd = true;
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "Send the appointment name exactly as it should appear in the roster.",
+        buildAppointmentManagementBackMenu()
+      );
+      return;
+    }
+
+    const result = await addManagedAppointment(sheets, config, adminCache, appointment);
+    await ctx.reply(
+      result.ok
+        ? `${result.appointment} has been added to the active roster. Secret code: ${result.secretCode}`
+        : result.reason === "appointment_exists"
+          ? `${result.appointment} is already in the active roster.`
+          : "Unable to add that appointment."
+    );
+  });
+
+  bot.command("removeappointment", async (ctx) => {
+    if (!(await requireAdmin(ctx, config))) {
+      return;
+    }
+
+    await ensureSheetReadiness(sheets, config, adminCache);
+    const appointment = getCommandArgument(ctx.message.text, "removeappointment");
+
+    if (!appointment) {
+      await renderRemoveAppointmentSubmenu(ctx, adminCache, 0);
+      return;
+    }
+
+    const result = await removeManagedAppointment(sheets, config, adminCache, appointment);
+    await ctx.reply(
+      result.ok
+        ? `${result.appointment} has been removed from the active roster.`
+        : "Appointment not found in the active roster."
+    );
+  });
+
   bot.on("text", async (ctx) => {
     const message = ctx.message.text.trim();
     const storedUser = await getUserByChatId(ctx.chat.id);
@@ -2441,6 +2572,43 @@ export function createAttendanceBot(config) {
     const awaitingWeeklyAttendance =
       ctx.session.awaitingWeeklyAttendance || storedUser?.awaitingWeeklyAttendance === true;
     const awaitingAttendanceOptionAdd = ctx.session.awaitingAttendanceOptionAdd === true;
+    const awaitingAppointmentAdd = ctx.session.awaitingAppointmentAdd === true;
+
+    if (awaitingAppointmentAdd) {
+      if (!(await requireAdmin(ctx, config))) {
+        ctx.session.awaitingAppointmentAdd = false;
+        return;
+      }
+
+      const normalizedAppointment = String(message ?? "").trim();
+
+      if (!normalizedAppointment) {
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "Appointment name cannot be empty. Send the appointment name to add it.",
+          buildAppointmentManagementBackMenu()
+        );
+        return;
+      }
+
+      ctx.session.awaitingAppointmentAdd = false;
+      const result = await addManagedAppointment(
+        sheets,
+        config,
+        adminCache,
+        normalizedAppointment
+      );
+      await sendOrUpdateAdminMessage(
+        ctx,
+        result.ok
+          ? `${result.appointment} has been added to the active roster.\nSecret code: ${result.secretCode}`
+          : result.reason === "appointment_exists"
+            ? `${result.appointment} is already in the active roster.`
+            : "Unable to add that appointment.",
+        buildAppointmentManagementBackMenu()
+      );
+      return;
+    }
 
     if (awaitingAttendanceOptionAdd) {
       if (!(await requireAdmin(ctx, config))) {
@@ -2693,14 +2861,27 @@ export function createAttendanceBot(config) {
         return;
       }
 
-      await writeAttendanceStatus(sheets, config, {
+      const queuedEntry = {
         appointment: user.appointment,
         status: picked,
-        date: new Date()
-      });
+        date: new Date(),
+        source: "daily"
+      };
+      await enqueueAttendanceEvent(config, queuedEntry);
+
+      if (adminCache.sheetSnapshots) {
+        adminCache.sheetSnapshots = applyAttendanceEntriesToSnapshotBundle(
+          adminCache.sheetSnapshots,
+          config,
+          [queuedEntry]
+        );
+        adminCache.summaryMemo.clear();
+        adminCache.summaryMemoVersion = adminCache.sheetSnapshots?.synchronizedAt ?? null;
+      }
       const recordedAt = new Date();
       const confirmationLines = [
         `Attendance recorded as "${picked}" for ${user.appointment} for ${formatAttendanceDateLabel(recordedAt, config.timezone)} at ${formatMilitaryTime(recordedAt, config.timezone)} hrs.`,
+        "Queued for Google Sheets sync.",
         "",
         `"${pickQuoteOrJoke()}"`
       ];
@@ -2797,13 +2978,16 @@ export function createAttendanceBot(config) {
       }
 
       const date = new Date(dateValue);
-      const label = formatWeekDateLabel(date, config.timezone);
       const isoDate = toIsoDateString(date, config.timezone);
       const currentStatus =
-        getStagedAttendanceStatus(weeklyEntries, isoDate, config.timezone) ||
+        getStagedAttendanceStatus(
+          weeklyEntries,
+          isoDate,
+          (value) => toIsoDateString(value, config.timezone)
+        ) ||
         getCachedAttendanceStatus(adminCache, config, user.appointment, date);
-      let resultLine = `${label}: skipped`;
       let nextEntries = weeklyEntries;
+      let pickedPayload = null;
 
       if (action !== "pick:week:skip") {
         const picked = config.attendanceOptions[Number(action.split(":")[2])];
@@ -2818,34 +3002,50 @@ export function createAttendanceBot(config) {
           weeklyEntries,
           isoDate,
           picked,
-          config.timezone
+          (value) => toIsoDateString(value, config.timezone)
         );
-        resultLine = `${label}: ${picked}`;
+        pickedPayload = {
+          status: picked,
+          entries: nextEntries
+        };
         await ctx.answerCbQuery(`Saved: ${picked}`);
       } else if (currentStatus) {
-        resultLine = `${label}: ${currentStatus}`;
         await ctx.answerCbQuery("Kept current status");
       } else {
         await ctx.answerCbQuery("Skipped");
       }
 
-      const nextResults = [...weeklyResults, resultLine];
-      const nextIndex = weeklyIndex + 1;
+      const nextState = applyWeeklyAttendanceSelection(
+        {
+          awaitingWeeklyAttendance: true,
+          weeklyAttendanceDates: weeklyDates,
+          weeklyAttendanceIndex: weeklyIndex,
+          weeklyAttendanceResults: weeklyResults,
+          weeklyAttendanceEntries: weeklyEntries
+        },
+        {
+          action: action === "pick:week:skip" ? "skip" : "pick",
+          dateValue,
+          currentStatus,
+          pickedStatus: pickedPayload,
+          formatWeekDateLabel: (value) => formatWeekDateLabel(value, config.timezone)
+        }
+      );
 
-      ctx.session.weeklyAttendanceResults = nextResults;
-      ctx.session.weeklyAttendanceIndex = nextIndex;
-      ctx.session.weeklyAttendanceEntries = nextEntries;
+      ctx.session.weeklyAttendanceResults = nextState.weeklyAttendanceResults;
+      ctx.session.weeklyAttendanceIndex = nextState.weeklyAttendanceIndex;
+      ctx.session.weeklyAttendanceEntries = nextState.weeklyAttendanceEntries;
 
       await updateUserByChatId(ctx.chat.id, {
-        awaitingWeeklyAttendance: nextIndex < weeklyDates.length,
-        weeklyAttendanceResults: nextResults,
-        weeklyAttendanceIndex: nextIndex,
-        weeklyAttendanceEntries: nextEntries,
+        awaitingWeeklyAttendance: nextState.awaitingWeeklyAttendance,
+        weeklyAttendanceResults: nextState.weeklyAttendanceResults,
+        weeklyAttendanceIndex: nextState.weeklyAttendanceIndex,
+        weeklyAttendanceEntries: nextState.weeklyAttendanceEntries,
         lastSubmittedAt: new Date().toISOString()
       });
 
-      if (nextIndex >= weeklyDates.length) {
-        await finalizeWeeklyAttendanceFlow(ctx, sheets, config, user.appointment);
+      if (!nextState.awaitingWeeklyAttendance) {
+        await finalizeWeeklyAttendanceFlow(ctx, config, user.appointment, adminCache);
         return;
       }
 
@@ -3057,6 +3257,22 @@ export function createAttendanceBot(config) {
       return;
     }
 
+    if (action === "appointments:add") {
+      ctx.session.awaitingAppointmentAdd = true;
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "Send the appointment name exactly as it should appear in the roster.",
+        buildAppointmentManagementBackMenu()
+      );
+      return;
+    }
+
+    if (action.startsWith("menu:appointments:remove:")) {
+      await ensureSheetReadiness(sheets, config, adminCache);
+      await renderRemoveAppointmentSubmenu(ctx, adminCache, Number(action.split(":")[3]));
+      return;
+    }
+
     if (action === "menu:admins") {
       await sendOrUpdateAdminMessage(
         ctx,
@@ -3109,8 +3325,8 @@ export function createAttendanceBot(config) {
       config.attendanceOptions = [...defaultAttendanceOptions];
       await syncRosterState(sheets, config);
       await ensureNextMonthSheetExists(sheets, config);
-      adminCache.lastSheetSyncAt = Date.now();
       await refreshAdminCache(adminCache, config);
+      await preloadSheetSnapshots(sheets, config, adminCache, { force: true });
       await sendOrUpdateAdminMessage(
         ctx,
         "Attendance options have been reset to the default list.",
@@ -3222,6 +3438,31 @@ export function createAttendanceBot(config) {
       return;
     }
 
+    if (action.startsWith("pick:appointmentremove:")) {
+      const candidates = adminCache.removeAppointmentCandidates;
+      const picked = candidates[Number(action.split(":")[2])];
+
+      if (!picked) {
+        await renderRemoveAppointmentSubmenu(ctx, adminCache, 0);
+        return;
+      }
+
+      const result = await removeManagedAppointment(
+        sheets,
+        config,
+        adminCache,
+        picked.appointment
+      );
+      await sendOrUpdateAdminMessage(
+        ctx,
+        result.ok
+          ? `${result.appointment} has been removed from the active roster.`
+          : "Appointment not found in the active roster.",
+        buildAppointmentManagementBackMenu()
+      );
+      return;
+    }
+
     if (action.startsWith("pick:removeadmin:")) {
       const candidates = adminCache.removeAdminCandidates;
       const picked = candidates[Number(action.split(":")[2])];
@@ -3285,7 +3526,7 @@ export function createAttendanceBot(config) {
     await runAdminAction(action, ctx, bot, sheets, config, adminCache);
   });
 
-  ensureSheetReadiness(sheets, config, adminCache, { force: true }).catch((error) => {
+  adminCache.syncManager.runCycle({ force: true }).catch((error) => {
     console.error("Initial roster sync failed:", error);
   });
 
@@ -3295,7 +3536,7 @@ export function createAttendanceBot(config) {
 
   setInterval(async () => {
     try {
-      await ensureSheetReadiness(sheets, config, adminCache, { force: true });
+      await adminCache.syncManager.runCycle({ force: true });
     } catch (error) {
       console.error("Background sheet preload failed:", error);
     }
@@ -3305,7 +3546,7 @@ export function createAttendanceBot(config) {
     "5 0 * * *",
     async () => {
       try {
-        await ensureSheetReadiness(sheets, config, adminCache, { force: true });
+        await adminCache.syncManager.runCycle({ force: true });
         await refreshAttendanceOptionUsage(sheets, config, adminCache);
       } catch (error) {
         console.error("Nightly attendance option sort failed:", error);
@@ -3335,7 +3576,7 @@ export function createAttendanceBot(config) {
         try {
           // Scheduled reminders should act on the latest cached sheet state so the
           // second reminder only reaches people who are still blank at that moment.
-          await ensureSheetReadiness(sheets, config, adminCache, { force: true });
+          await adminCache.syncManager.runCycle({ force: true });
         } catch (error) {
           console.error(`Unable to refresh sheet state before ${reminderTime} reminder:`, error);
           return;

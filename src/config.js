@@ -83,10 +83,6 @@ export const config = {
   firstReminderTime: process.env.FIRST_REMINDER_TIME || "07:00",
   secondReminderTime: process.env.SECOND_REMINDER_TIME || "08:00",
   onboardingSheetTitle: process.env.ONBOARDING_SHEET_TITLE || "ONBOARDING",
-  onboardingSyncIntervalMinutes: Number(
-    process.env.ONBOARDING_SYNC_INTERVAL_MINUTES || 5
-  ),
-  sheetSyncMinIntervalMs: Number(process.env.SHEET_SYNC_MIN_INTERVAL_MS || 60000),
   attendanceOptions,
   rosterStopMarkers: parseList(process.env.ROSTER_STOP_MARKERS || "Remarks"),
   defaultAdminAppointments: parseList(

@@ -1,44 +1,23 @@
 import { google } from "googleapis";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { getDataFile } from "./dataDir.js";
+import {
+  readJsonFile as readJsonFileFromStore,
+  writeJsonFile as writeJsonFileToStore
+} from "./fileStore.js";
+import { getSingaporePublicHolidaySet } from "./holidays.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const DATA_DIR = path.resolve(__dirname, "../data");
-const SHEET_CACHE_FILE = path.join(DATA_DIR, "sheet-cache.json");
-const SINGAPORE_PUBLIC_HOLIDAY_COLLECTION_ID = "691";
-const publicHolidayCache = {
-  years: new Map(),
-  loadingPromise: null
-};
+const SHEET_CACHE_FILE = () => getDataFile("sheet-cache.json");
 
 function normalizeAppointmentLabel(value) {
   return String(value ?? "").trim();
 }
 
-async function ensureDataDir() {
-  await mkdir(DATA_DIR, { recursive: true });
-}
-
 async function readJsonFile(filePath, fallbackValue) {
-  await ensureDataDir();
-
-  try {
-    const content = await readFile(filePath, "utf8");
-    return JSON.parse(content);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return fallbackValue;
-    }
-
-    throw error;
-  }
+  return readJsonFileFromStore(filePath, fallbackValue);
 }
 
 async function writeJsonFile(filePath, value) {
-  await ensureDataDir();
-  await writeFile(filePath, JSON.stringify(value, null, 2));
+  await writeJsonFileToStore(filePath, value);
 }
 
 function isStopMarker(value, stopMarkers) {
@@ -179,6 +158,37 @@ function buildMonthHeader(date, timezone) {
   return header;
 }
 
+function getExpectedDateHeaderLabel(date, timezone) {
+  const { month } = getMonthParts(date, timezone);
+  return `${dayOfMonth(date, timezone)} ${month}`;
+}
+
+function buildDateColumnMap(headerRow, date, timezone) {
+  const monthLength = daysInMonth(date, timezone);
+  const map = new Map();
+
+  for (let day = 1; day <= monthLength; day += 1) {
+    const dayDate = new Date(Date.UTC(
+      getMonthParts(date, timezone).numericYear,
+      getMonthParts(date, timezone).numericMonth,
+      day,
+      12
+    ));
+    const label = getExpectedDateHeaderLabel(dayDate, timezone);
+    const columnIndex = headerRow.findIndex((value) => String(value ?? "").trim() === label);
+
+    if (columnIndex !== -1) {
+      map.set(day, columnIndex);
+    }
+  }
+
+  return map;
+}
+
+function getDefaultHeaderRow(date, timezone) {
+  return buildMonthHeader(date, timezone);
+}
+
 function parseMonthSheetTitle(title) {
   const match = title.match(/^([A-Z][a-z]{2}) (\d{2})$/);
 
@@ -244,77 +254,20 @@ async function addSheet(sheets, spreadsheetId, title) {
   return response.data.replies?.[0]?.addSheet ?? null;
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url);
-
-  if (!response.ok) {
-    throw new Error(`Request failed: ${response.status} ${response.statusText}`);
-  }
-
-  return response.json();
-}
-
-async function loadSingaporePublicHolidayCache() {
-  if (publicHolidayCache.loadingPromise) {
-    await publicHolidayCache.loadingPromise;
-    return;
-  }
-
-  publicHolidayCache.loadingPromise = (async () => {
-    const metadata = await fetchJson(
-      `https://api-production.data.gov.sg/v2/public/api/collections/${SINGAPORE_PUBLIC_HOLIDAY_COLLECTION_ID}/metadata`
-    );
-    const datasetIds = metadata?.data?.collectionMetadata?.childDatasets ?? [];
-
-    for (const datasetId of datasetIds) {
-      try {
-        const payload = await fetchJson(
-          `https://data.gov.sg/api/action/datastore_search?resource_id=${datasetId}`
-        );
-        const records = payload?.result?.records ?? [];
-
-        for (const record of records) {
-          const rawDate = String(record.date ?? "").trim();
-
-          if (!/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
-            continue;
-          }
-
-          const year = Number(rawDate.slice(0, 4));
-
-          if (!publicHolidayCache.years.has(year)) {
-            publicHolidayCache.years.set(year, new Set());
-          }
-
-          publicHolidayCache.years.get(year).add(rawDate);
-        }
-      } catch (error) {
-        console.error(`Failed to load public holiday dataset ${datasetId}:`, error.message);
-      }
-    }
-  })().finally(() => {
-    publicHolidayCache.loadingPromise = null;
-  });
-
-  await publicHolidayCache.loadingPromise;
-}
-
-async function getSingaporePublicHolidaySet(year) {
-  if (!publicHolidayCache.years.has(year)) {
-    await loadSingaporePublicHolidayCache();
-  }
-
-  return publicHolidayCache.years.get(year) ?? new Set();
-}
-
 async function ensureSheet(sheets, spreadsheetId, title) {
   const existing = await getSheetByTitle(sheets, spreadsheetId, title);
 
   if (existing) {
-    return existing;
+    return {
+      sheet: existing,
+      created: false
+    };
   }
 
-  return addSheet(sheets, spreadsheetId, title);
+  return {
+    sheet: await addSheet(sheets, spreadsheetId, title),
+    created: true
+  };
 }
 
 async function readAppointmentColumn(sheets, spreadsheetId, title, stopMarkers = []) {
@@ -327,6 +280,34 @@ async function readAppointmentColumn(sheets, spreadsheetId, title, stopMarkers =
   return sanitizeAppointments(rawValues, stopMarkers);
 }
 
+async function readHeaderRow(sheets, spreadsheetId, title, fallbackHeader = []) {
+  const values = await readSheetValues(sheets, spreadsheetId, title, "A1:ZZ1");
+  const headerRow = (values[0] ?? []).map((value) => String(value ?? "").trim());
+  const hasHeader = headerRow.some(Boolean);
+  return hasHeader ? headerRow : fallbackHeader;
+}
+
+async function getStopAwareWriteBoundary(
+  sheets,
+  spreadsheetId,
+  title,
+  stopMarkers = [],
+  maxRow = 1000
+) {
+  const response = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: `'${title}'!A2:A${maxRow}`
+  });
+  const rawValues = (response.data.values ?? []).map(([value]) => normalizeAppointmentLabel(value));
+  const stopIndex = rawValues.findIndex((value) => isStopMarker(value, stopMarkers));
+  const stopRowNumber = stopIndex === -1 ? null : stopIndex + 2;
+
+  return {
+    stopRowNumber,
+    managedRangeEndRow: stopRowNumber ? stopRowNumber - 1 : maxRow
+  };
+}
+
 async function writeAppointmentColumn(
   sheets,
   spreadsheetId,
@@ -334,7 +315,17 @@ async function writeAppointmentColumn(
   appointments,
   options = {}
 ) {
-  const clearRange = options.clearFullRows ? "A2:ZZ1000" : "A2:A1000";
+  const boundary = await getStopAwareWriteBoundary(
+    sheets,
+    spreadsheetId,
+    title,
+    options.stopMarkers ?? [],
+    1000
+  );
+  const clearEndRow = Math.max(boundary.managedRangeEndRow, appointments.length + 1, 2);
+  const clearRange = options.clearFullRows
+    ? `A2:ZZ${clearEndRow}`
+    : `A2:A${clearEndRow}`;
   const values = appointments.map((appointment) => [appointment]);
   const endRow = Math.max(appointments.length + 1, 2);
 
@@ -358,10 +349,13 @@ async function writeAppointmentColumn(
 
   if (options.trimTrailingRows) {
     const startRow = appointments.length + 2;
-    await sheets.spreadsheets.values.clear({
-      spreadsheetId,
-      range: `'${title}'!A${startRow}:ZZ1000`
-    });
+
+    if (startRow <= boundary.managedRangeEndRow) {
+      await sheets.spreadsheets.values.clear({
+        spreadsheetId,
+        range: `'${title}'!A${startRow}:ZZ${boundary.managedRangeEndRow}`
+      });
+    }
   }
 }
 
@@ -392,29 +386,88 @@ async function readMonthlySheetRows(sheets, spreadsheetId, title, headerLength, 
   return rows;
 }
 
-async function writeMonthlySheetRows(sheets, spreadsheetId, title, headerLength, rows) {
+async function writeMonthlySheetRows(
+  sheets,
+  spreadsheetId,
+  sheetId,
+  title,
+  headerLength,
+  existingRows,
+  rows,
+  stopMarkers = []
+) {
   const lastColumn = columnNumberToLabel(headerLength);
+  const existingAppointments = existingRows.map((row) => normalizeAppointmentLabel(row[0]));
+  const nextAppointments = rows.map((row) => normalizeAppointmentLabel(row[0]));
+  const { operations } = planManagedRowStructureChanges(
+    existingAppointments,
+    nextAppointments
+  );
 
-  await sheets.spreadsheets.values.clear({
-    spreadsheetId,
-    range: `'${title}'!A2:${lastColumn}1000`
-  });
+  if (operations.length > 0) {
+    const requests = operations.map((operation) => {
+      const rowIndex = operation.index + 1;
 
-  if (rows.length > 0) {
-    await sheets.spreadsheets.values.update({
+      return operation.type === "insert"
+        ? {
+          insertDimension: {
+            range: {
+              sheetId,
+              dimension: "ROWS",
+              startIndex: rowIndex,
+              endIndex: rowIndex + 1
+            },
+            inheritFromBefore: rowIndex > 1
+          }
+        }
+        : {
+          deleteDimension: {
+            range: {
+              sheetId,
+              dimension: "ROWS",
+              startIndex: rowIndex,
+              endIndex: rowIndex + 1
+            }
+          }
+        };
+    });
+
+    await sheets.spreadsheets.batchUpdate({
       spreadsheetId,
-      range: `'${title}'!A2:${lastColumn}${rows.length + 1}`,
-      valueInputOption: "USER_ENTERED",
       requestBody: {
-        values: rows
+        requests
       }
     });
   }
 
-  await sheets.spreadsheets.values.clear({
-    spreadsheetId,
-    range: `'${title}'!A${rows.length + 2}:ZZ1000`
-  });
+  const rowByAppointment = new Map(
+    existingRows.map((row) => [normalizeAppointmentLabel(row[0]), row])
+  );
+  const changedData = [];
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const nextRow = rows[index];
+    const appointment = normalizeAppointmentLabel(nextRow[0]);
+    const existingRow = rowByAppointment.get(appointment);
+    const rowChanged = !existingRow || !rowsEqual(existingRow, nextRow);
+
+    if (rowChanged) {
+      changedData.push({
+        range: `'${title}'!A${index + 2}:${lastColumn}${index + 2}`,
+        values: [nextRow]
+      });
+    }
+  }
+
+  if (changedData.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        valueInputOption: "USER_ENTERED",
+        data: changedData
+      }
+    });
+  }
 }
 
 async function writeHeaderRow(sheets, spreadsheetId, title, header) {
@@ -449,10 +502,19 @@ function buildHeaderUpdateRequest(header) {
   };
 }
 
-async function writeOnboardingRows(sheets, spreadsheetId, title, rows) {
+async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarkers = []) {
+  const boundary = await getStopAwareWriteBoundary(
+    sheets,
+    spreadsheetId,
+    title,
+    stopMarkers,
+    1000
+  );
+  const clearEndRow = Math.max(boundary.managedRangeEndRow, rows.length + 1, 2);
+
   await sheets.spreadsheets.values.clear({
     spreadsheetId,
-    range: `'${title}'!A2:B1000`
+    range: `'${title}'!A2:B${clearEndRow}`
   });
 
   if (rows.length === 0) {
@@ -469,6 +531,13 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows) {
       values: rows
     }
   });
+
+  if (endRow + 1 <= boundary.managedRangeEndRow) {
+    await sheets.spreadsheets.values.clear({
+      spreadsheetId,
+      range: `'${title}'!A${endRow + 1}:B${boundary.managedRangeEndRow}`
+    });
+  }
 }
 
 function buildAttendanceValidationRequest(sheetId, headerLength, options) {
@@ -558,6 +627,16 @@ async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, hea
   });
 }
 
+async function ensureHeaderRowIfBlank(sheets, spreadsheetId, title, header) {
+  const values = await readSheetValues(sheets, spreadsheetId, title, "A1:ZZ1");
+  const existingHeaderRow = values[0] ?? [];
+  const hasAnyHeaderValue = existingHeaderRow.some((value) => String(value ?? "").trim());
+
+  if (!hasAnyHeaderValue) {
+    await writeHeaderRow(sheets, spreadsheetId, title, header);
+  }
+}
+
 async function readCanonicalOnboardingAppointments(sheets, config) {
   const onboarding = await readAppointmentColumn(
     sheets,
@@ -569,19 +648,72 @@ async function readCanonicalOnboardingAppointments(sheets, config) {
   return onboarding.appointments;
 }
 
+function buildManagedMonthlyRows({
+  preferredAppointments,
+  requestedAppointments,
+  existingAppointments,
+  existingRows,
+  headerLength,
+  mode
+}) {
+  const rowByAppointment = new Map(
+    existingRows.map((row) => [normalizeAppointmentLabel(row[0]), row])
+  );
+  const nextAppointments =
+    mode === "replace"
+      ? preferredAppointments
+      : [
+          ...preferredAppointments,
+          ...requestedAppointments.filter((value) => !preferredAppointments.includes(value)),
+          ...existingAppointments.filter(
+            (value) => !preferredAppointments.includes(value) && !requestedAppointments.includes(value)
+          )
+        ];
+
+  const nextRows = nextAppointments.map((appointment) => {
+    const existingRow = rowByAppointment.get(normalizeAppointmentLabel(appointment));
+
+    if (existingRow) {
+      const nextRow = [...existingRow];
+      nextRow[0] = appointment;
+      return nextRow;
+    }
+
+    const blankRow = Array.from({ length: headerLength }, () => "");
+    blankRow[0] = appointment;
+    return blankRow;
+  });
+
+  return {
+    nextAppointments,
+    nextRows
+  };
+}
+
 async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, mode) {
   const { title } = getMonthParts(date, config.timezone);
-  const sheet = await ensureSheet(sheets, config.spreadsheetId, title);
-  const header = buildMonthHeader(date, config.timezone);
+  const ensuredSheet = await ensureSheet(sheets, config.spreadsheetId, title);
+  const sheet = ensuredSheet.sheet;
+  const defaultHeader = getDefaultHeaderRow(date, config.timezone);
 
-  await applyMonthlySheetLayout(
+  if (ensuredSheet.created) {
+    await applyMonthlySheetLayout(
+      sheets,
+      config.spreadsheetId,
+      sheet.properties.sheetId,
+      date,
+      defaultHeader,
+      config.attendanceOptions,
+      config.timezone
+    );
+  } else {
+    await ensureHeaderRowIfBlank(sheets, config.spreadsheetId, title, defaultHeader);
+  }
+  const header = await readHeaderRow(
     sheets,
     config.spreadsheetId,
-    sheet.properties.sheetId,
-    date,
-    header,
-    config.attendanceOptions,
-    config.timezone
+    title,
+    defaultHeader
   );
 
   const existingAppointments = await readAppointmentColumn(
@@ -597,47 +729,30 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     header.length,
     config.rosterStopMarkers
   );
-  const rowByAppointment = new Map(
-    existingRows.map((row) => [normalizeAppointmentLabel(row[0]), row])
-  );
   const onboardingAppointments = await readCanonicalOnboardingAppointments(sheets, config);
   // ONBOARDING is the canonical row order for monthly sheets. Interactive writes may
   // only mention one appointment, but we still rebuild against the full roster order.
   const preferredAppointments = onboardingAppointments.length > 0
     ? onboardingAppointments
     : appointments;
-
-  const nextAppointments =
-    mode === "replace"
-      ? preferredAppointments
-      : [
-          ...preferredAppointments,
-          ...appointments.filter((value) => !preferredAppointments.includes(value)),
-          ...existingAppointments.appointments.filter(
-            (value) => !preferredAppointments.includes(value) && !appointments.includes(value)
-          )
-        ];
-
-  const nextRows = nextAppointments.map((appointment) => {
-    const existingRow = rowByAppointment.get(normalizeAppointmentLabel(appointment));
-
-    if (existingRow) {
-      const nextRow = [...existingRow];
-      nextRow[0] = appointment;
-      return nextRow;
-    }
-
-    const blankRow = Array.from({ length: header.length }, () => "");
-    blankRow[0] = appointment;
-    return blankRow;
+  const { nextAppointments, nextRows } = buildManagedMonthlyRows({
+    preferredAppointments,
+    requestedAppointments: appointments,
+    existingAppointments: existingAppointments.appointments,
+    existingRows,
+    headerLength: header.length,
+    mode
   });
 
   await writeMonthlySheetRows(
     sheets,
     config.spreadsheetId,
+    sheet.properties.sheetId,
     title,
     header.length,
-    nextRows
+    existingRows,
+    nextRows,
+    config.rosterStopMarkers
   );
 
   return {
@@ -728,6 +843,68 @@ function normalizeRowValues(row, rowLength) {
   return Array.from({ length: rowLength }, (_, index) => String(row?.[index] ?? "").trim());
 }
 
+function rowsEqual(left, right) {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((value, index) => value === right[index]);
+}
+
+function planManagedRowStructureChanges(existingAppointments, nextAppointments) {
+  const nextSet = new Set(nextAppointments);
+  const workingAppointments = [...existingAppointments];
+  const operations = [];
+  let index = 0;
+
+  while (index < nextAppointments.length) {
+    const desiredAppointment = nextAppointments[index];
+    const currentAppointment = workingAppointments[index];
+
+    if (currentAppointment === desiredAppointment) {
+      index += 1;
+      continue;
+    }
+
+    if (currentAppointment && !nextSet.has(currentAppointment)) {
+      operations.push({
+        type: "delete",
+        index,
+        appointment: currentAppointment
+      });
+      workingAppointments.splice(index, 1);
+      continue;
+    }
+
+    if (!workingAppointments.includes(desiredAppointment)) {
+      operations.push({
+        type: "insert",
+        index,
+        appointment: desiredAppointment
+      });
+      workingAppointments.splice(index, 0, desiredAppointment);
+      index += 1;
+      continue;
+    }
+
+    index += 1;
+  }
+
+  while (workingAppointments.length > nextAppointments.length) {
+    operations.push({
+      type: "delete",
+      index: workingAppointments.length - 1,
+      appointment: workingAppointments[workingAppointments.length - 1]
+    });
+    workingAppointments.pop();
+  }
+
+  return {
+    operations,
+    finalAppointments: workingAppointments
+  };
+}
+
 function createEmptyMonthlySnapshot(date, timezone, appointments = []) {
   const monthLength = daysInMonth(date, timezone);
   const statusesByDay = new Map();
@@ -766,10 +943,12 @@ function alignSnapshotToAppointments(snapshot, appointments, date, timezone) {
 }
 
 function createMonthlySnapshotFromValues(date, values, config) {
+  const headerRow = (values[0] ?? []).map((value) => String(value ?? "").trim());
   const rows = values.slice(1);
   const appointments = [];
   const statusesByDay = new Map();
-  const headerLength = buildMonthHeader(date, config.timezone).length;
+  const headerLength = Math.max(headerRow.length, 1);
+  const dateColumnMap = buildDateColumnMap(headerRow, date, config.timezone);
 
   for (const row of rows) {
     const appointment = normalizeAppointmentLabel(row?.[0]);
@@ -790,7 +969,10 @@ function createMonthlySnapshotFromValues(date, values, config) {
         statusesByDay.set(day, []);
       }
 
-      statusesByDay.get(day).push(normalizedRow[day] ?? "");
+      const columnIndex = dateColumnMap.get(day);
+      statusesByDay.get(day).push(
+        columnIndex === undefined ? "" : normalizedRow[columnIndex] ?? ""
+      );
     }
   }
 
@@ -832,14 +1014,14 @@ function deserializeSnapshot(payload) {
 }
 
 async function readLocalSheetCache() {
-  return readJsonFile(SHEET_CACHE_FILE, {
+  return readJsonFile(SHEET_CACHE_FILE(), {
     updatedAt: null,
     snapshots: {}
   });
 }
 
 async function writeLocalSheetCache(cache) {
-  await writeJsonFile(SHEET_CACHE_FILE, cache);
+  await writeJsonFile(SHEET_CACHE_FILE(), cache);
 }
 
 function countFilledAttendanceCells(snapshot) {
@@ -868,8 +1050,9 @@ function shouldRestoreLocalSnapshot(localSnapshot, remoteSnapshot) {
   return localFilled > 0 && remoteFilled === 0;
 }
 
-function buildRowsFromSnapshot(snapshot, date, timezone) {
-  const headerLength = buildMonthHeader(date, timezone).length;
+function buildRowsFromSnapshot(snapshot, date, timezone, headerRow = getDefaultHeaderRow(date, timezone)) {
+  const headerLength = headerRow.length;
+  const dateColumnMap = buildDateColumnMap(headerRow, date, timezone);
 
   return snapshot.appointments.map((appointment, index) => {
     const row = Array.from({ length: headerLength }, () => "");
@@ -877,16 +1060,83 @@ function buildRowsFromSnapshot(snapshot, date, timezone) {
 
     for (let day = 1; day <= daysInMonth(date, timezone); day += 1) {
       const values = snapshot.statusesByDay.get(day) ?? [];
-      row[day] = String(values[index] ?? "").trim();
+      const columnIndex = dateColumnMap.get(day);
+
+      if (columnIndex !== undefined) {
+        row[columnIndex] = String(values[index] ?? "").trim();
+      }
     }
 
     return row;
   });
 }
 
+export function applyAttendanceEntriesToSnapshotBundle(snapshotBundle, config, entries) {
+  if (!snapshotBundle || !entries.length) {
+    return snapshotBundle;
+  }
+
+  const snapshots = new Map(snapshotBundle.snapshots ?? []);
+
+  for (const entry of entries) {
+    const date = entry.date ?? new Date();
+    const { title } = getMonthParts(date, config.timezone);
+    const existingSnapshot = snapshots.get(title)
+      ? alignSnapshotToAppointments(
+        snapshots.get(title),
+        snapshots.get(title).appointments,
+        date,
+        config.timezone
+      )
+      : createEmptyMonthlySnapshot(date, config.timezone, [entry.appointment]);
+
+    if (!existingSnapshot.appointments.includes(entry.appointment)) {
+      existingSnapshot.appointments.push(entry.appointment);
+
+      for (let day = 1; day <= daysInMonth(date, config.timezone); day += 1) {
+        const values = existingSnapshot.statusesByDay.get(day) ?? [];
+
+        while (values.length < existingSnapshot.appointments.length) {
+          values.push("");
+        }
+
+        existingSnapshot.statusesByDay.set(day, values);
+      }
+    }
+
+    const appointmentIndex = existingSnapshot.appointments.findIndex(
+      (value) => value === entry.appointment
+    );
+    const day = dayOfMonth(date, config.timezone);
+    const dayValues = existingSnapshot.statusesByDay.get(day) ?? Array.from(
+      { length: existingSnapshot.appointments.length },
+      () => ""
+    );
+
+    while (dayValues.length < existingSnapshot.appointments.length) {
+      dayValues.push("");
+    }
+
+    dayValues[appointmentIndex] = String(entry.status ?? "").trim();
+    existingSnapshot.statusesByDay.set(day, dayValues);
+    existingSnapshot.synchronizedAt = new Date().toISOString();
+    snapshots.set(title, existingSnapshot);
+  }
+
+  return {
+    synchronizedAt: new Date().toISOString(),
+    snapshots
+  };
+}
+
 async function restoreMonthlySheetFromSnapshot(sheets, config, date, snapshot) {
   const { title } = getMonthParts(date, config.timezone);
-  const header = buildMonthHeader(date, config.timezone);
+  const header = await readHeaderRow(
+    sheets,
+    config.spreadsheetId,
+    title,
+    getDefaultHeaderRow(date, config.timezone)
+  );
   const canonicalAppointments = await readCanonicalOnboardingAppointments(sheets, config);
   const alignedSnapshot = alignSnapshotToAppointments(
     snapshot,
@@ -896,12 +1146,23 @@ async function restoreMonthlySheetFromSnapshot(sheets, config, date, snapshot) {
   );
 
   await ensureMonthlyAttendanceSheet(sheets, config, date, canonicalAppointments, "replace");
-  await writeMonthlySheetRows(
+  const restoredSheet = await getSheetByTitle(sheets, config.spreadsheetId, title);
+  const existingRows = await readMonthlySheetRows(
     sheets,
     config.spreadsheetId,
     title,
     header.length,
-    buildRowsFromSnapshot(alignedSnapshot, date, config.timezone)
+    config.rosterStopMarkers
+  );
+  await writeMonthlySheetRows(
+    sheets,
+    config.spreadsheetId,
+    restoredSheet.properties.sheetId,
+    title,
+    header.length,
+    existingRows,
+    buildRowsFromSnapshot(alignedSnapshot, date, config.timezone, header),
+    config.rosterStopMarkers
   );
 }
 
@@ -1077,10 +1338,14 @@ export function createGoogleSheetsClient(config) {
 
 export async function syncOnboardingRoster(sheets, config) {
   const title = config.onboardingSheetTitle;
-  const existingOnboardingSheet = await getSheetByTitle(sheets, config.spreadsheetId, title);
-  const onboardingSheetWasMissing = !existingOnboardingSheet;
-  await ensureSheet(sheets, config.spreadsheetId, title);
-  await writeHeaderRow(sheets, config.spreadsheetId, title, ["Appointment", "Secret Code"]);
+  const ensuredSheet = await ensureSheet(sheets, config.spreadsheetId, title);
+  const onboardingSheetWasMissing = ensuredSheet.created;
+  await ensureHeaderRowIfBlank(
+    sheets,
+    config.spreadsheetId,
+    title,
+    ["Appointment", "Secret Code"]
+  );
 
   let onboardingAppointments = await readAppointmentColumn(
     sheets,
@@ -1098,7 +1363,7 @@ export async function syncOnboardingRoster(sheets, config) {
       config.spreadsheetId,
       title,
       onboardingAppointments,
-      { trimTrailingRows: true }
+      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers }
     );
   } else if (onboardingAppointments.stopped) {
     await writeAppointmentColumn(
@@ -1106,7 +1371,7 @@ export async function syncOnboardingRoster(sheets, config) {
       config.spreadsheetId,
       title,
       onboardingAppointments.appointments,
-      { trimTrailingRows: true }
+      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers }
     );
     onboardingAppointments = onboardingAppointments.appointments;
   } else if (onboardingAppointments.hadDuplicates) {
@@ -1115,7 +1380,7 @@ export async function syncOnboardingRoster(sheets, config) {
       config.spreadsheetId,
       title,
       onboardingAppointments.appointments,
-      { trimTrailingRows: true }
+      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers }
     );
     onboardingAppointments = onboardingAppointments.appointments;
   } else {
@@ -1147,10 +1412,83 @@ export async function syncOnboardingRoster(sheets, config) {
 export async function syncOnboardingCodeColumn(sheets, config, codeEntries) {
   const title = config.onboardingSheetTitle;
   await ensureSheet(sheets, config.spreadsheetId, title);
-  await writeHeaderRow(sheets, config.spreadsheetId, title, ["Appointment", "Secret Code"]);
+  await ensureHeaderRowIfBlank(
+    sheets,
+    config.spreadsheetId,
+    title,
+    ["Appointment", "Secret Code"]
+  );
 
   const rows = codeEntries.map((entry) => [entry.appointment, entry.secretCode]);
-  await writeOnboardingRows(sheets, config.spreadsheetId, title, rows);
+  await writeOnboardingRows(
+    sheets,
+    config.spreadsheetId,
+    title,
+    rows,
+    config.rosterStopMarkers
+  );
+}
+
+export async function addAppointmentToSheets(sheets, config, appointment) {
+  await ensureSheet(sheets, config.spreadsheetId, config.onboardingSheetTitle);
+  await ensureHeaderRowIfBlank(
+    sheets,
+    config.spreadsheetId,
+    config.onboardingSheetTitle,
+    ["Appointment", "Secret Code"]
+  );
+  const onboarding = await readAppointmentColumn(
+    sheets,
+    config.spreadsheetId,
+    config.onboardingSheetTitle,
+    config.rosterStopMarkers
+  );
+  const nextAppointments = [...onboarding.appointments, appointment];
+  await writeAppointmentColumn(
+    sheets,
+    config.spreadsheetId,
+    config.onboardingSheetTitle,
+    nextAppointments,
+    { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers }
+  );
+
+  await ensureMonthlyAttendanceSheet(sheets, config, new Date(), nextAppointments, "merge");
+  await ensureMonthlyAttendanceSheet(
+    sheets,
+    config,
+    shiftMonth(new Date(), config.timezone, 1),
+    nextAppointments,
+    "replace"
+  );
+}
+
+export async function removeAppointmentFromSheets(sheets, config, appointment) {
+  await ensureSheet(sheets, config.spreadsheetId, config.onboardingSheetTitle);
+  const onboarding = await readAppointmentColumn(
+    sheets,
+    config.spreadsheetId,
+    config.onboardingSheetTitle,
+    config.rosterStopMarkers
+  );
+  const nextAppointments = onboarding.appointments.filter(
+    (entry) => entry.toUpperCase() !== appointment.toUpperCase()
+  );
+  await writeAppointmentColumn(
+    sheets,
+    config.spreadsheetId,
+    config.onboardingSheetTitle,
+    nextAppointments,
+    { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers }
+  );
+
+  await ensureMonthlyAttendanceSheet(sheets, config, new Date(), nextAppointments, "replace");
+  await ensureMonthlyAttendanceSheet(
+    sheets,
+    config,
+    shiftMonth(new Date(), config.timezone, 1),
+    nextAppointments,
+    "replace"
+  );
 }
 
 export async function writeAttendanceStatus(sheets, config, entry) {
@@ -1171,7 +1509,21 @@ export async function writeAttendanceStatus(sheets, config, entry) {
   }
 
   const rowNumber = rowIndex + 2;
-  const columnNumber = dayOfMonth(date, config.timezone) + 1;
+  const headerRow = await readHeaderRow(
+    sheets,
+    config.spreadsheetId,
+    title,
+    getDefaultHeaderRow(date, config.timezone)
+  );
+  const columnIndex = headerRow.findIndex(
+    (value) => value === getExpectedDateHeaderLabel(date, config.timezone)
+  );
+
+  if (columnIndex === -1) {
+    throw new Error(`Date column not found for ${getExpectedDateHeaderLabel(date, config.timezone)}`);
+  }
+
+  const columnNumber = columnIndex + 1;
   const cell = `${columnNumberToLabel(columnNumber)}${rowNumber}`;
 
   await sheets.spreadsheets.values.batchUpdate({
@@ -1232,6 +1584,12 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
     const appointmentRows = new Map(
       sheetAppointments.appointments.map((appointment, index) => [appointment, index + 2])
     );
+    const headerRow = await readHeaderRow(
+      sheets,
+      config.spreadsheetId,
+      sheetTitle,
+      getDefaultHeaderRow(sheetEntries[0].date, config.timezone)
+    );
 
     const data = sheetEntries.map((entry) => {
       const rowNumber = appointmentRows.get(entry.appointment);
@@ -1240,7 +1598,17 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
         throw new Error(`Appointment row not found for ${entry.appointment}`);
       }
 
-      const columnNumber = dayOfMonth(entry.date, config.timezone) + 1;
+      const columnIndex = headerRow.findIndex(
+        (value) => value === getExpectedDateHeaderLabel(entry.date, config.timezone)
+      );
+
+      if (columnIndex === -1) {
+        throw new Error(
+          `Date column not found for ${getExpectedDateHeaderLabel(entry.date, config.timezone)}`
+        );
+      }
+
+      const columnNumber = columnIndex + 1;
       const cell = `${columnNumberToLabel(columnNumber)}${rowNumber}`;
 
       results.push({
@@ -1354,9 +1722,21 @@ export async function summarizeStatuses(sheets, config, options = {}) {
   const { title } = getMonthParts(date, config.timezone);
   await ensureMonthlyAttendanceSheet(sheets, config, date, [], "merge");
 
-  const day = dayOfMonth(date, config.timezone);
-  const columnNumber = day + 1;
-  const columnLabel = columnNumberToLabel(columnNumber);
+  const headerRow = await readHeaderRow(
+    sheets,
+    config.spreadsheetId,
+    title,
+    getDefaultHeaderRow(date, config.timezone)
+  );
+  const columnIndex = headerRow.findIndex(
+    (value) => value === getExpectedDateHeaderLabel(date, config.timezone)
+  );
+
+  if (columnIndex === -1) {
+    throw new Error(`Date column not found for ${getExpectedDateHeaderLabel(date, config.timezone)}`);
+  }
+
+  const columnLabel = columnNumberToLabel(columnIndex + 1);
   const values = await readSheetColumnValues(
     sheets,
     config.spreadsheetId,
@@ -1422,3 +1802,12 @@ export async function summarizeAttendanceOptionUsage(sheets, config) {
     })
   );
 }
+
+export const __testing = {
+  buildManagedMonthlyRows,
+  buildDateColumnMap,
+  ensureHeaderRowIfBlank,
+  getExpectedDateHeaderLabel,
+  writeMonthlySheetRows,
+  writeAppointmentColumn
+};

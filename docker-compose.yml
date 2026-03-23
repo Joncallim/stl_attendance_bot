@@ -3,6 +3,11 @@ services:
     image: yourdockerhubuser/attendance-bot:latest
     container_name: attendance-bot
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     environment:
       TELEGRAM_BOT_TOKEN: "replace-with-your-telegram-bot-token"
       GOOGLE_SHEETS_SPREADSHEET_ID: "replace-with-your-google-sheet-id"
@@ -12,10 +17,9 @@ services:
       FIRST_REMINDER_TIME: "07:00"
       SECOND_REMINDER_TIME: "08:00"
       ONBOARDING_SHEET_TITLE: "ONBOARDING"
-      ONBOARDING_SYNC_INTERVAL_MINUTES: "5"
-      SHEET_SYNC_MIN_INTERVAL_MS: "60000"
       ROSTER_STOP_MARKERS: "Remarks"
       DEFAULT_ADMIN_APPOINTMENTS: "SCSE,Coxn,CO,XO,OPS 1"
       ATTENDANCE_OPTIONS: "PRESENT,DUTY,PH,OSD,OE,WFH,FISHING,OIL,EMBARK OFF,OFF,DISEMBARK OFF,RR,SR,OS,TNB,YARD,ORCA,RSO,MC,OML,MA,HL,RSI,LL,CCL,PCL,CSL,COMPASSIONATE,PTL,OL,AO,68,69,70,71,73,OC,ORD,POST OUT,IPPT,FMSS,CNB,CST,DCTC"
+      LOG_FILE_PATH: "/app/data/logs/attendance-bot.log"
     volumes:
       - ./data:/app/data

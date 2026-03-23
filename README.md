@@ -8,9 +8,10 @@ This bot records attendance through Telegram and writes each response into a sha
 - Returning users send `/start` to open the main inline menu.
 - Daily attendance is written into the current month sheet for the bound appointment and date.
 - Weekly attendance is submitted through an inline Monday-to-Friday flow and written in one batch at the end.
+- Attendance submissions are durably queued first and flushed to Google Sheets on the minute-by-minute sync loop.
 - Singapore public holidays are treated as `PH` during weekly flows.
 - Attendance summaries are available inside Telegram, including an unaccounted view.
-- Admins can manage onboarding, roster sync, admin access, invitations, prompts, and deregistration from Telegram.
+- Admins can manage onboarding, roster sync, appointments, admin access, invitations, prompts, and deregistration from Telegram.
 
 ## Sheets Model
 
@@ -20,6 +21,7 @@ This bot records attendance through Telegram and writes each response into a sha
 - Monthly sheets use column `A` for appointments and columns `B` onward for dates such as `1 Mar`, `2 Mar`, and so on.
 - Monthly sheet row order follows `ONBOARDING`.
 - The row labeled `Remarks` and anything below it are excluded from roster management.
+- Existing sheet layout changes made by humans are preserved; the bot only provisions its default layout when it creates a new sheet.
 - If `ONBOARDING` is missing, the bot creates it from the current month sheet.
 - The bot always ensures next month’s worksheet exists.
 
@@ -29,6 +31,7 @@ This bot records attendance through Telegram and writes each response into a sha
 - `data/appointment-registry.json`: secret codes, bindings, and custom admin appointments.
 - `data/settings.json`: persisted attendance option ordering and overrides.
 - `data/sheet-cache.json`: local attendance snapshot cache used for conservative recovery if a month sheet is wiped.
+- `data/attendance-queue.ndjson`: append-only attendance event log that survives restarts until the next successful sheet flush.
 
 ## User Commands
 
@@ -55,6 +58,8 @@ This bot records attendance through Telegram and writes each response into a sha
 - `/admins`: list active admin appointments.
 - `/addadmin <appointment>`: grant custom admin access to a currently bound appointment.
 - `/removeadmin <appointment>`: remove custom admin access.
+- `/addappointment <appointment>`: add a new appointment to the active roster and generate a fresh onboarding code.
+- `/removeappointment <appointment>`: remove an appointment from the active roster.
 - Admin Menu also includes attendance-option editing and usage-based sorting.
 
 ## Reminders
@@ -105,7 +110,6 @@ Important variables:
 - `FIRST_REMINDER_TIME`
 - `SECOND_REMINDER_TIME`
 - `ONBOARDING_SHEET_TITLE`
-- `SHEET_SYNC_MIN_INTERVAL_MS`
 - `ROSTER_STOP_MARKERS`
 - `DEFAULT_ADMIN_APPOINTMENTS`
 - `ATTENDANCE_OPTIONS`
@@ -171,6 +175,12 @@ In Portainer:
 3. Paste the contents of `docker-compose.yml`
 4. Replace the placeholder values
 5. Deploy the stack
+
+### Human-Readable Logs
+
+- Docker Compose now keeps rotated container logs through the `json-file` logging driver.
+- To also write explicit plain-text application logs, set `LOG_FILE_PATH`, for example `/app/data/logs/attendance-bot.log`.
+- When `LOG_FILE_PATH` is set, the bot mirrors `console.log`, `console.warn`, and `console.error` into that file with ISO timestamps.
 
 ## Notes
 

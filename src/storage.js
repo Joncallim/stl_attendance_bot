@@ -1,37 +1,20 @@
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { getDataFile } from "./dataDir.js";
+import { readJsonFile, runSerialized, writeJsonFile } from "./fileStore.js";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const DATA_DIR = path.resolve(__dirname, "../data");
-const USERS_FILE = path.join(DATA_DIR, "users.json");
-const APPOINTMENT_REGISTRY_FILE = path.join(DATA_DIR, "appointment-registry.json");
-const SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
+const STORAGE_MUTEX_KEY = "storage";
+const ATTENDANCE_OPTION_SCHEMA_VERSION = 2;
 
-async function ensureDataDir() {
-  await mkdir(DATA_DIR, { recursive: true });
+function getUsersFile() {
+  return getDataFile("users.json");
 }
 
-async function readJsonFile(filePath, fallbackValue) {
-  await ensureDataDir();
-
-  try {
-    const content = await readFile(filePath, "utf8");
-    return JSON.parse(content);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return fallbackValue;
-    }
-
-    throw error;
-  }
+function getAppointmentRegistryFile() {
+  return getDataFile("appointment-registry.json");
 }
 
-async function writeJsonFile(filePath, value) {
-  await ensureDataDir();
-  await writeFile(filePath, JSON.stringify(value, null, 2));
+function getSettingsFile() {
+  return getDataFile("settings.json");
 }
 
 function normalizeCode(code) {
@@ -68,15 +51,15 @@ function clearUserBindingFields(user) {
 }
 
 async function readUsers() {
-  return readJsonFile(USERS_FILE, []);
+  return readJsonFile(getUsersFile(), []);
 }
 
 async function writeUsers(users) {
-  await writeJsonFile(USERS_FILE, users);
+  await writeJsonFile(getUsersFile(), users);
 }
 
 async function readAppointmentRegistry() {
-  return readJsonFile(APPOINTMENT_REGISTRY_FILE, {
+  return readJsonFile(getAppointmentRegistryFile(), {
     updatedAt: null,
     appointments: [],
     adminAppointments: []
@@ -84,11 +67,11 @@ async function readAppointmentRegistry() {
 }
 
 async function writeAppointmentRegistry(registry) {
-  await writeJsonFile(APPOINTMENT_REGISTRY_FILE, registry);
+  await writeJsonFile(getAppointmentRegistryFile(), registry);
 }
 
 async function readSettings() {
-  return readJsonFile(SETTINGS_FILE, {
+  return readJsonFile(getSettingsFile(), {
     updatedAt: null,
     attendanceOptions: null,
     attendanceOptionsVersion: null,
@@ -98,26 +81,54 @@ async function readSettings() {
 }
 
 async function writeSettings(settings) {
-  await writeJsonFile(SETTINGS_FILE, settings);
+  await writeJsonFile(getSettingsFile(), settings);
 }
 
 function normalizeAttendanceOption(value) {
   return String(value ?? "").trim();
 }
 
-const ATTENDANCE_OPTION_SCHEMA_VERSION = 2;
+function findAppointmentEntry(registry, appointment) {
+  const normalized = normalizeAppointmentName(appointment);
+  return registry.appointments.find(
+    (entry) => normalizeAppointmentName(entry.appointment) === normalized
+  );
+}
+
+function normalizeAppointmentInput(value) {
+  return String(value ?? "").trim();
+}
+
+function pruneUnboundAdminAppointments(registry) {
+  const boundActiveAppointments = new Set(
+    registry.appointments
+      .filter((entry) => entry.active && entry.boundChatId)
+      .map((entry) => normalizeAppointmentName(entry.appointment))
+  );
+
+  return (registry.adminAppointments ?? []).filter((appointment) =>
+    boundActiveAppointments.has(normalizeAppointmentName(appointment))
+  );
+}
+
+function withStorageMutation(operation) {
+  return runSerialized(STORAGE_MUTEX_KEY, operation);
+}
 
 export async function upsertUser(user) {
-  const users = await readUsers();
-  const index = users.findIndex((entry) => entry.chatId === user.chatId);
+  return withStorageMutation(async () => {
+    const users = await readUsers();
+    const index = users.findIndex((entry) => entry.chatId === user.chatId);
 
-  if (index >= 0) {
-    users[index] = { ...users[index], ...user };
-  } else {
-    users.push(user);
-  }
+    if (index >= 0) {
+      users[index] = { ...users[index], ...user };
+    } else {
+      users.push(user);
+    }
 
-  await writeUsers(users);
+    await writeUsers(users);
+    return index >= 0 ? users[index] : user;
+  });
 }
 
 export async function listUsers() {
@@ -130,74 +141,173 @@ export async function getUserByChatId(chatId) {
 }
 
 export async function updateUserByChatId(chatId, patch) {
-  const users = await readUsers();
-  const index = users.findIndex((entry) => entry.chatId === String(chatId));
+  return withStorageMutation(async () => {
+    const users = await readUsers();
+    const index = users.findIndex((entry) => entry.chatId === String(chatId));
 
-  if (index === -1) {
-    return null;
-  }
+    if (index === -1) {
+      return null;
+    }
 
-  users[index] = { ...users[index], ...patch };
-  await writeUsers(users);
-  return users[index];
+    users[index] = { ...users[index], ...patch };
+    await writeUsers(users);
+    return users[index];
+  });
 }
 
 export async function syncAppointmentRegistry(appointments) {
-  const registry = await readAppointmentRegistry();
-  const uniqueAppointments = [...new Set(appointments.map((value) => value.trim()).filter(Boolean))];
-  const currentSet = new Set(uniqueAppointments);
-  const currentNormalizedSet = new Set(uniqueAppointments.map(normalizeAppointmentName));
-  const existingCodes = new Set(
-    registry.appointments.map((entry) => normalizeCode(entry.secretCode))
-  );
+  return withStorageMutation(async () => {
+    const registry = await readAppointmentRegistry();
+    const uniqueAppointments = [...new Set(
+      appointments.map((value) => value.trim()).filter(Boolean)
+    )];
+    const currentSet = new Set(uniqueAppointments);
+    const currentNormalizedSet = new Set(uniqueAppointments.map(normalizeAppointmentName));
+    const existingCodes = new Set(
+      registry.appointments.map((entry) => normalizeCode(entry.secretCode))
+    );
 
-  const nextAppointments = uniqueAppointments.map((appointment) => {
-    const existing = registry.appointments.find((entry) => entry.appointment === appointment);
+    const nextAppointments = uniqueAppointments.map((appointment) => {
+      const existing = registry.appointments.find((entry) => entry.appointment === appointment);
 
-    if (existing) {
+      if (existing) {
+        return {
+          ...existing,
+          appointment,
+          active: true
+        };
+      }
+
+      const secretCode = generateSecretCode(existingCodes);
+      existingCodes.add(secretCode);
+
       return {
-        ...existing,
         appointment,
-        active: true
+        secretCode,
+        active: true,
+        boundChatId: null,
+        boundUserId: null,
+        boundUsername: null,
+        boundFullName: null,
+        boundAt: null
       };
+    });
+
+    const inactiveAppointments = registry.appointments
+      .filter((entry) => !currentSet.has(entry.appointment))
+      .map((entry) => ({
+        ...entry,
+        active: false
+      }));
+
+    const nextRegistry = {
+      updatedAt: new Date().toISOString(),
+      appointments: [...nextAppointments, ...inactiveAppointments],
+      adminAppointments: pruneUnboundAdminAppointments({
+        ...registry,
+        appointments: [...nextAppointments, ...inactiveAppointments],
+        adminAppointments: (registry.adminAppointments ?? []).filter((appointment) =>
+          currentNormalizedSet.has(normalizeAppointmentName(appointment))
+        )
+      })
+    };
+
+    await writeAppointmentRegistry(nextRegistry);
+    return nextRegistry;
+  });
+}
+
+export async function addAppointmentToRegistry(appointment) {
+  return withStorageMutation(async () => {
+    const normalizedAppointment = normalizeAppointmentInput(appointment);
+
+    if (!normalizedAppointment) {
+      return { ok: false, reason: "invalid_appointment" };
     }
 
+    const registry = await readAppointmentRegistry();
+    const existing = findAppointmentEntry(registry, normalizedAppointment);
+
+    if (existing?.active) {
+      return { ok: false, reason: "appointment_exists", appointment: existing.appointment };
+    }
+
+    const existingCodes = new Set(
+      registry.appointments.map((entry) => normalizeCode(entry.secretCode))
+    );
     const secretCode = generateSecretCode(existingCodes);
-    existingCodes.add(secretCode);
 
-    return {
-      appointment,
-      secretCode,
-      active: true,
-      boundChatId: null,
-      boundUserId: null,
-      boundUsername: null,
-      boundFullName: null,
-      boundAt: null
-    };
+    if (existing) {
+      registry.appointments = registry.appointments.map((entry) =>
+        normalizeAppointmentName(entry.appointment) === normalizeAppointmentName(normalizedAppointment)
+          ? {
+            ...entry,
+            appointment: normalizedAppointment,
+            secretCode,
+            active: true,
+            boundChatId: null,
+            boundUserId: null,
+            boundUsername: null,
+            boundFullName: null,
+            boundAt: null
+          }
+          : entry
+      );
+    } else {
+      registry.appointments.push({
+        appointment: normalizedAppointment,
+        secretCode,
+        active: true,
+        boundChatId: null,
+        boundUserId: null,
+        boundUsername: null,
+        boundFullName: null,
+        boundAt: null
+      });
+    }
+
+    registry.updatedAt = new Date().toISOString();
+    await writeAppointmentRegistry(registry);
+    return { ok: true, appointment: normalizedAppointment, secretCode };
   });
+}
 
-  const inactiveAppointments = registry.appointments
-    .filter((entry) => !currentSet.has(entry.appointment))
-    .map((entry) => ({
-      ...entry,
-      active: false
-    }));
+export async function removeAppointmentFromRegistry(appointment) {
+  return withStorageMutation(async () => {
+    const registry = await readAppointmentRegistry();
+    const target = findAppointmentEntry(registry, appointment);
 
-  const nextRegistry = {
-    updatedAt: new Date().toISOString(),
-    appointments: [...nextAppointments, ...inactiveAppointments],
-    adminAppointments: pruneUnboundAdminAppointments({
-      ...registry,
-      appointments: [...nextAppointments, ...inactiveAppointments],
-      adminAppointments: (registry.adminAppointments ?? []).filter((appointment) =>
-        currentNormalizedSet.has(normalizeAppointmentName(appointment))
-      )
-    })
-  };
+    if (!target || !target.active) {
+      return { ok: false, reason: "appointment_not_found" };
+    }
 
-  await writeAppointmentRegistry(nextRegistry);
-  return nextRegistry;
+    registry.appointments = registry.appointments.map((entry) =>
+      normalizeAppointmentName(entry.appointment) === normalizeAppointmentName(target.appointment)
+        ? {
+          ...entry,
+          active: false,
+          boundChatId: null,
+          boundUserId: null,
+          boundUsername: null,
+          boundFullName: null,
+          boundAt: null
+        }
+        : entry
+    );
+    registry.adminAppointments = pruneUnboundAdminAppointments(registry);
+    registry.updatedAt = new Date().toISOString();
+    await writeAppointmentRegistry(registry);
+
+    const users = await readUsers();
+    const nextUsers = users.map((user) =>
+      normalizeAppointmentName(user.appointment) === normalizeAppointmentName(target.appointment)
+        ? clearUserBindingFields(user)
+        : user
+    );
+    await writeUsers(nextUsers);
+
+    return { ok: true, appointment: target.appointment };
+  });
 }
 
 export async function listActiveAppointmentCodes() {
@@ -219,34 +329,40 @@ export async function getSettings() {
 }
 
 export async function setAttendanceOptions(attendanceOptions) {
-  const settings = await readSettings();
-  settings.updatedAt = new Date().toISOString();
-  settings.attendanceOptionsVersion = ATTENDANCE_OPTION_SCHEMA_VERSION;
-  settings.attendanceOptions = [...new Set(
-    attendanceOptions
-      .map(normalizeAttendanceOption)
-      .filter(Boolean)
-  )];
-  await writeSettings(settings);
-  return settings.attendanceOptions;
+  return withStorageMutation(async () => {
+    const settings = await readSettings();
+    settings.updatedAt = new Date().toISOString();
+    settings.attendanceOptionsVersion = ATTENDANCE_OPTION_SCHEMA_VERSION;
+    settings.attendanceOptions = [...new Set(
+      attendanceOptions
+        .map(normalizeAttendanceOption)
+        .filter(Boolean)
+    )];
+    await writeSettings(settings);
+    return settings.attendanceOptions;
+  });
 }
 
 export async function resetAttendanceOptions() {
-  const settings = await readSettings();
-  settings.updatedAt = new Date().toISOString();
-  settings.attendanceOptionsVersion = ATTENDANCE_OPTION_SCHEMA_VERSION;
-  settings.attendanceOptions = null;
-  await writeSettings(settings);
-  return settings;
+  return withStorageMutation(async () => {
+    const settings = await readSettings();
+    settings.updatedAt = new Date().toISOString();
+    settings.attendanceOptionsVersion = ATTENDANCE_OPTION_SCHEMA_VERSION;
+    settings.attendanceOptions = null;
+    await writeSettings(settings);
+    return settings;
+  });
 }
 
 export async function setAttendanceOptionUsage(attendanceOptionUsage) {
-  const settings = await readSettings();
-  settings.updatedAt = new Date().toISOString();
-  settings.attendanceOptionUsageUpdatedAt = settings.updatedAt;
-  settings.attendanceOptionUsage = attendanceOptionUsage;
-  await writeSettings(settings);
-  return settings;
+  return withStorageMutation(async () => {
+    const settings = await readSettings();
+    settings.updatedAt = new Date().toISOString();
+    settings.attendanceOptionUsageUpdatedAt = settings.updatedAt;
+    settings.attendanceOptionUsage = attendanceOptionUsage;
+    await writeSettings(settings);
+    return settings;
+  });
 }
 
 export async function listAdminAppointments(defaultAdminAppointments) {
@@ -254,9 +370,12 @@ export async function listAdminAppointments(defaultAdminAppointments) {
   const prunedCustomAdmins = pruneUnboundAdminAppointments(registry);
 
   if ((registry.adminAppointments ?? []).length !== prunedCustomAdmins.length) {
-    registry.adminAppointments = prunedCustomAdmins;
-    registry.updatedAt = new Date().toISOString();
-    await writeAppointmentRegistry(registry);
+    await withStorageMutation(async () => {
+      const refreshedRegistry = await readAppointmentRegistry();
+      refreshedRegistry.adminAppointments = pruneUnboundAdminAppointments(refreshedRegistry);
+      refreshedRegistry.updatedAt = new Date().toISOString();
+      await writeAppointmentRegistry(refreshedRegistry);
+    });
   }
 
   const boundActiveAppointments = new Map(
@@ -291,137 +410,124 @@ export async function listAdminAppointments(defaultAdminAppointments) {
   return [...effectiveAdmins.values()];
 }
 
-function findAppointmentEntry(registry, appointment) {
-  const normalized = normalizeAppointmentName(appointment);
-  return registry.appointments.find(
-    (entry) => normalizeAppointmentName(entry.appointment) === normalized
-  );
-}
-
-function pruneUnboundAdminAppointments(registry) {
-  const boundActiveAppointments = new Set(
-    registry.appointments
-      .filter((entry) => entry.active && entry.boundChatId)
-      .map((entry) => normalizeAppointmentName(entry.appointment))
-  );
-
-  return (registry.adminAppointments ?? []).filter((appointment) =>
-    boundActiveAppointments.has(normalizeAppointmentName(appointment))
-  );
-}
-
 export async function addAdminAppointment(appointment) {
-  const registry = await readAppointmentRegistry();
-  const target = findAppointmentEntry(registry, appointment);
+  return withStorageMutation(async () => {
+    const registry = await readAppointmentRegistry();
+    const target = findAppointmentEntry(registry, appointment);
 
-  if (!target || !target.active) {
-    return { ok: false, reason: "appointment_not_found" };
-  }
+    if (!target || !target.active) {
+      return { ok: false, reason: "appointment_not_found" };
+    }
 
-  if (!target.boundChatId) {
-    return { ok: false, reason: "appointment_not_bound" };
-  }
+    if (!target.boundChatId) {
+      return { ok: false, reason: "appointment_not_bound" };
+    }
 
-  const alreadyPresent = (registry.adminAppointments ?? []).some(
-    (entry) =>
-      normalizeAppointmentName(entry) === normalizeAppointmentName(target.appointment)
-  );
+    const alreadyPresent = (registry.adminAppointments ?? []).some(
+      (entry) =>
+        normalizeAppointmentName(entry) === normalizeAppointmentName(target.appointment)
+    );
 
-  if (!alreadyPresent) {
-    registry.adminAppointments = [
-      ...(registry.adminAppointments ?? []),
-      target.appointment
-    ];
-    registry.adminAppointments = pruneUnboundAdminAppointments(registry);
-    registry.updatedAt = new Date().toISOString();
-    await writeAppointmentRegistry(registry);
-  }
+    if (!alreadyPresent) {
+      registry.adminAppointments = [
+        ...(registry.adminAppointments ?? []),
+        target.appointment
+      ];
+      registry.adminAppointments = pruneUnboundAdminAppointments(registry);
+      registry.updatedAt = new Date().toISOString();
+      await writeAppointmentRegistry(registry);
+    }
 
-  return { ok: true, appointment: target.appointment };
+    return { ok: true, appointment: target.appointment };
+  });
 }
 
 export async function removeAdminAppointment(appointment, defaultAdminAppointments) {
-  const registry = await readAppointmentRegistry();
-  const target = findAppointmentEntry(registry, appointment);
-  const normalizedTarget = normalizeAppointmentName(target?.appointment ?? appointment);
+  return withStorageMutation(async () => {
+    const registry = await readAppointmentRegistry();
+    const target = findAppointmentEntry(registry, appointment);
+    const normalizedTarget = normalizeAppointmentName(target?.appointment ?? appointment);
 
-  if (
-    defaultAdminAppointments.some(
-      (entry) => normalizeAppointmentName(entry) === normalizedTarget
-    )
-  ) {
-    return { ok: false, reason: "default_admin" };
-  }
+    if (
+      defaultAdminAppointments.some(
+        (entry) => normalizeAppointmentName(entry) === normalizedTarget
+      )
+    ) {
+      return { ok: false, reason: "default_admin" };
+    }
 
-  const before = registry.adminAppointments ?? [];
-  const after = before.filter(
-    (entry) => normalizeAppointmentName(entry) !== normalizedTarget
-  );
+    const before = registry.adminAppointments ?? [];
+    const after = before.filter(
+      (entry) => normalizeAppointmentName(entry) !== normalizedTarget
+    );
 
-  if (before.length === after.length) {
-    return { ok: false, reason: "admin_not_found" };
-  }
+    if (before.length === after.length) {
+      return { ok: false, reason: "admin_not_found" };
+    }
 
-  registry.adminAppointments = after;
-  registry.adminAppointments = pruneUnboundAdminAppointments(registry);
-  registry.updatedAt = new Date().toISOString();
-  await writeAppointmentRegistry(registry);
-  return { ok: true, appointment: target?.appointment ?? appointment.trim() };
+    registry.adminAppointments = after;
+    registry.adminAppointments = pruneUnboundAdminAppointments(registry);
+    registry.updatedAt = new Date().toISOString();
+    await writeAppointmentRegistry(registry);
+    return { ok: true, appointment: target?.appointment ?? appointment.trim() };
+  });
 }
 
 export async function deregisterAppointmentBinding(appointment) {
-  const registry = await readAppointmentRegistry();
-  const target = findAppointmentEntry(registry, appointment);
+  return withStorageMutation(async () => {
+    const registry = await readAppointmentRegistry();
+    const target = findAppointmentEntry(registry, appointment);
 
-  if (!target || !target.active) {
-    return { ok: false, reason: "appointment_not_found" };
-  }
+    if (!target || !target.active) {
+      return { ok: false, reason: "appointment_not_found" };
+    }
 
-  if (!target.boundChatId) {
-    return { ok: false, reason: "not_bound", appointment: target.appointment };
-  }
+    if (!target.boundChatId) {
+      return { ok: false, reason: "not_bound", appointment: target.appointment };
+    }
 
-  const existingCodes = new Set(
-    registry.appointments
-      .filter((entry) => entry.appointment !== target.appointment)
-      .map((entry) => normalizeCode(entry.secretCode))
-  );
-  const rotatedSecretCode = generateSecretCode(existingCodes);
+    const existingCodes = new Set(
+      registry.appointments
+        .filter((entry) => entry.appointment !== target.appointment)
+        .map((entry) => normalizeCode(entry.secretCode))
+    );
+    const rotatedSecretCode = generateSecretCode(existingCodes);
 
-  const updatedTarget = {
-    ...target,
-    secretCode: rotatedSecretCode,
-    boundChatId: null,
-    boundUserId: null,
-    boundUsername: null,
-    boundFullName: null,
-    boundAt: null
-  };
+    const updatedTarget = {
+      ...target,
+      secretCode: rotatedSecretCode,
+      boundChatId: null,
+      boundUserId: null,
+      boundUsername: null,
+      boundFullName: null,
+      boundAt: null
+    };
 
-  registry.appointments = registry.appointments.map((entry) =>
-    normalizeAppointmentName(entry.appointment) ===
-    normalizeAppointmentName(target.appointment)
-      ? updatedTarget
-      : entry
-  );
-  registry.adminAppointments = pruneUnboundAdminAppointments(registry);
-  registry.updatedAt = new Date().toISOString();
-  await writeAppointmentRegistry(registry);
+    registry.appointments = registry.appointments.map((entry) =>
+      normalizeAppointmentName(entry.appointment) ===
+      normalizeAppointmentName(target.appointment)
+        ? updatedTarget
+        : entry
+    );
+    registry.adminAppointments = pruneUnboundAdminAppointments(registry);
+    registry.updatedAt = new Date().toISOString();
+    await writeAppointmentRegistry(registry);
 
-  const users = await readUsers();
-  const nextUsers = users.map((user) =>
-    user.chatId === target.boundChatId
-      ? clearUserBindingFields(user)
-      : user
-  );
-  await writeUsers(nextUsers);
+    const users = await readUsers();
+    const nextUsers = users.map((user) =>
+      user.chatId === target.boundChatId
+        ? clearUserBindingFields(user)
+        : user
+    );
+    await writeUsers(nextUsers);
 
-  return {
-    ok: true,
-    appointment: target.appointment,
-    previousChatId: target.boundChatId,
-    secretCode: rotatedSecretCode
-  };
+    return {
+      ok: true,
+      appointment: target.appointment,
+      previousChatId: target.boundChatId,
+      secretCode: rotatedSecretCode
+    };
+  });
 }
 
 export async function deregisterRequestorByChatId(chatId) {
@@ -452,63 +558,65 @@ export async function getOnboardingInvite(appointment) {
 }
 
 export async function bindAppointmentCode(secretCode, telegramUser) {
-  const normalizedCode = normalizeCode(secretCode);
-  const registry = await readAppointmentRegistry();
-  const targetIndex = registry.appointments.findIndex(
-    (entry) => normalizeCode(entry.secretCode) === normalizedCode
-  );
+  return withStorageMutation(async () => {
+    const normalizedCode = normalizeCode(secretCode);
+    const registry = await readAppointmentRegistry();
+    const targetIndex = registry.appointments.findIndex(
+      (entry) => normalizeCode(entry.secretCode) === normalizedCode
+    );
 
-  if (targetIndex === -1) {
-    return { ok: false, reason: "invalid_code" };
-  }
-
-  const target = registry.appointments[targetIndex];
-
-  if (!target.active) {
-    return { ok: false, reason: "inactive_code", appointment: target.appointment };
-  }
-
-  if (
-    target.boundChatId &&
-    (target.boundChatId !== telegramUser.chatId || target.boundUserId !== telegramUser.userId)
-  ) {
-    return { ok: false, reason: "code_already_claimed", appointment: target.appointment };
-  }
-
-  registry.appointments = registry.appointments.map((entry) => {
-    if (
-      entry.boundChatId === telegramUser.chatId &&
-      entry.appointment !== target.appointment
-    ) {
-      return {
-        ...entry,
-        boundChatId: null,
-        boundUserId: null,
-        boundUsername: null,
-        boundFullName: null,
-        boundAt: null
-      };
+    if (targetIndex === -1) {
+      return { ok: false, reason: "invalid_code" };
     }
 
-    return entry;
+    const target = registry.appointments[targetIndex];
+
+    if (!target.active) {
+      return { ok: false, reason: "inactive_code", appointment: target.appointment };
+    }
+
+    if (
+      target.boundChatId &&
+      (target.boundChatId !== telegramUser.chatId || target.boundUserId !== telegramUser.userId)
+    ) {
+      return { ok: false, reason: "code_already_claimed", appointment: target.appointment };
+    }
+
+    registry.appointments = registry.appointments.map((entry) => {
+      if (
+        entry.boundChatId === telegramUser.chatId &&
+        entry.appointment !== target.appointment
+      ) {
+        return {
+          ...entry,
+          boundChatId: null,
+          boundUserId: null,
+          boundUsername: null,
+          boundFullName: null,
+          boundAt: null
+        };
+      }
+
+      return entry;
+    });
+
+    registry.appointments[targetIndex] = {
+      ...registry.appointments[targetIndex],
+      boundChatId: telegramUser.chatId,
+      boundUserId: telegramUser.userId,
+      boundUsername: telegramUser.username,
+      boundFullName: telegramUser.fullName,
+      boundAt: new Date().toISOString()
+    };
+    registry.adminAppointments = pruneUnboundAdminAppointments(registry);
+    registry.updatedAt = new Date().toISOString();
+
+    await writeAppointmentRegistry(registry);
+
+    return {
+      ok: true,
+      appointment: registry.appointments[targetIndex].appointment,
+      secretCode: registry.appointments[targetIndex].secretCode
+    };
   });
-
-  registry.appointments[targetIndex] = {
-    ...registry.appointments[targetIndex],
-    boundChatId: telegramUser.chatId,
-    boundUserId: telegramUser.userId,
-    boundUsername: telegramUser.username,
-    boundFullName: telegramUser.fullName,
-    boundAt: new Date().toISOString()
-  };
-  registry.adminAppointments = pruneUnboundAdminAppointments(registry);
-  registry.updatedAt = new Date().toISOString();
-
-  await writeAppointmentRegistry(registry);
-
-  return {
-    ok: true,
-    appointment: registry.appointments[targetIndex].appointment,
-    secretCode: registry.appointments[targetIndex].secretCode
-  };
 }
