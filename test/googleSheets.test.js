@@ -127,6 +127,16 @@ test("date lookup follows the actual header row instead of fixed column offsets"
   assert.equal(map.get(2), 3);
 });
 
+test("new-sheet header update request targets the real sheet grid", () => {
+  const request = __testing.buildHeaderUpdateRequest(456, ["Appointment", "1 Mar"]);
+
+  assert.equal(request.updateCells.start.sheetId, 456);
+  assert.deepEqual(
+    request.updateCells.rows[0].values.map((cell) => cell.userEnteredValue.stringValue),
+    ["Appointment", "1 Mar"]
+  );
+});
+
 test("pending attendance overlays replace the snapshot value seen by the bot", async () => {
   const { applyAttendanceEntriesToSnapshotBundle } = await import("../src/googleSheets.js");
   const snapshotBundle = {

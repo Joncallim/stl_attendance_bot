@@ -5,6 +5,7 @@ import {
   addAppointmentToSheets,
   createGoogleSheetsClient,
   ensureNextMonthSheetExists,
+  loadAttendanceSnapshotsFromLocalCache,
   preloadAttendanceSnapshots,
   removeAppointmentFromSheets,
   summarizeAttendanceOptionUsage,
@@ -1701,14 +1702,17 @@ async function ensureSheetReadiness(sheets, config, cache, options = {}) {
     return;
   }
 
-  if (!force && hasWarmCache && !syncStatus.cycleInProgress) {
-    cache.syncManager.runCycle({ force: false }).catch((error) => {
-      console.error("Background sync refresh failed:", error);
-    });
+  if (!force) {
+    if (!syncStatus.cycleInProgress) {
+      cache.syncManager.runCycle({ force: false }).catch((error) => {
+        console.error("Background sync refresh failed:", error);
+      });
+    }
+
     return;
   }
 
-  await cache.syncManager.runCycle({ force });
+  await cache.syncManager.runCycle({ force: true });
 }
 
 async function applyAttendanceOptionChange(sheets, config, cache, nextOptions) {
@@ -2252,8 +2256,25 @@ export function createAttendanceBot(config) {
     },
     preloadSnapshots: async (options = {}) => withSheetOperation(async () => {
       await preloadSheetSnapshots(sheets, config, adminCache, options);
-    })
+      })
   });
+
+  refreshAdminCache(adminCache, config).catch((error) => {
+    console.error("Initial admin cache hydrate failed:", error);
+  });
+  loadAttendanceSnapshotsFromLocalCache()
+    .then((snapshotBundle) => {
+      if (!snapshotBundle) {
+        return;
+      }
+
+      adminCache.sheetSnapshots = snapshotBundle;
+      adminCache.summaryMemo.clear();
+      adminCache.summaryMemoVersion = snapshotBundle.synchronizedAt ?? null;
+    })
+    .catch((error) => {
+      console.error("Initial local snapshot hydrate failed:", error);
+    });
 
   bot.use(
     session({

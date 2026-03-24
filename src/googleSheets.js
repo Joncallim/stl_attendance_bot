@@ -481,10 +481,11 @@ async function writeHeaderRow(sheets, spreadsheetId, title, header) {
   });
 }
 
-function buildHeaderUpdateRequest(header) {
+function buildHeaderUpdateRequest(sheetId, header) {
   return {
     updateCells: {
       start: {
+        sheetId,
         rowIndex: 0,
         columnIndex: 0
       },
@@ -614,7 +615,7 @@ async function buildDisabledDayFormattingRequests(sheetId, date, timezone) {
 
 async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, header, options, timezone) {
   const requests = [
-    buildHeaderUpdateRequest(header),
+    buildHeaderUpdateRequest(sheetId, header),
     buildAttendanceValidationRequest(sheetId, header.length, options),
     ...(await buildDisabledDayFormattingRequests(sheetId, date, timezone))
   ];
@@ -1018,6 +1019,26 @@ async function readLocalSheetCache() {
     updatedAt: null,
     snapshots: {}
   });
+}
+
+export async function loadAttendanceSnapshotsFromLocalCache() {
+  const localCache = await readLocalSheetCache();
+  const snapshots = new Map();
+
+  for (const [title, payload] of Object.entries(localCache.snapshots ?? {})) {
+    const snapshot = deserializeSnapshot(payload);
+
+    if (!snapshot) {
+      continue;
+    }
+
+    snapshots.set(title, snapshot);
+  }
+
+  return {
+    synchronizedAt: localCache.updatedAt ?? null,
+    snapshots
+  };
 }
 
 async function writeLocalSheetCache(cache) {
@@ -1806,6 +1827,7 @@ export async function summarizeAttendanceOptionUsage(sheets, config) {
 export const __testing = {
   buildManagedMonthlyRows,
   buildDateColumnMap,
+  buildHeaderUpdateRequest,
   ensureHeaderRowIfBlank,
   getExpectedDateHeaderLabel,
   writeMonthlySheetRows,
