@@ -10,14 +10,14 @@ test("sync manager serializes overlapping cycles and tracks timestamps", async (
       calls.push("flush");
       await delay(25);
     },
-    syncRoster: async () => {
-      calls.push("roster");
+    refreshOnboarding: async () => {
+      calls.push("onboarding");
     },
     refreshAdminCache: async () => {
       calls.push("cache");
     },
-    preloadSnapshots: async () => {
-      calls.push("snapshot");
+    refreshMonthSlices: async () => {
+      calls.push("months");
     }
   });
 
@@ -26,11 +26,11 @@ test("sync manager serializes overlapping cycles and tracks timestamps", async (
     syncManager.runCycle({ force: true })
   ]);
 
-  assert.deepEqual(calls, ["flush", "roster", "cache", "snapshot"]);
+  assert.deepEqual(calls, ["flush", "onboarding", "cache", "months"]);
 
   const status = syncManager.getStatus();
   assert.equal(status.cycleInProgress, false);
   assert.ok(status.lastQueueFlushAt > 0);
-  assert.ok(status.lastRosterSyncAt > 0);
-  assert.ok(status.lastSnapshotSyncAt > 0);
+  assert.ok(status.lastOnboardingRefreshAt > 0);
+  assert.ok(status.lastMonthRefreshAt > 0);
 });

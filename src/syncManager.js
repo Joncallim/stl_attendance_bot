@@ -1,14 +1,14 @@
 export function createSyncManager({
   flushQueue,
-  syncRoster,
-  refreshAdminCache,
-  preloadSnapshots
+  refreshOnboarding,
+  refreshMonthSlices,
+  refreshAdminCache
 }) {
   const state = {
     cyclePromise: null,
     lastQueueFlushAt: 0,
-    lastRosterSyncAt: 0,
-    lastSnapshotSyncAt: 0
+    lastOnboardingRefreshAt: 0,
+    lastMonthRefreshAt: 0
   };
 
   async function runCycle(options = {}) {
@@ -22,18 +22,24 @@ export function createSyncManager({
         state.lastQueueFlushAt = Date.now();
       }
 
-      if (syncRoster) {
-        await syncRoster();
-        state.lastRosterSyncAt = Date.now();
+      if (refreshOnboarding) {
+        const refreshed = await refreshOnboarding(options);
+
+        if (refreshed !== false) {
+          state.lastOnboardingRefreshAt = Date.now();
+        }
       }
 
       if (refreshAdminCache) {
         await refreshAdminCache();
       }
 
-      if (preloadSnapshots) {
-        await preloadSnapshots(options);
-        state.lastSnapshotSyncAt = Date.now();
+      if (refreshMonthSlices) {
+        const refreshed = await refreshMonthSlices(options);
+
+        if (refreshed !== false) {
+          state.lastMonthRefreshAt = Date.now();
+        }
       }
     })().finally(() => {
       state.cyclePromise = null;
@@ -48,8 +54,8 @@ export function createSyncManager({
       return {
         cycleInProgress: Boolean(state.cyclePromise),
         lastQueueFlushAt: state.lastQueueFlushAt,
-        lastRosterSyncAt: state.lastRosterSyncAt,
-        lastSnapshotSyncAt: state.lastSnapshotSyncAt
+        lastOnboardingRefreshAt: state.lastOnboardingRefreshAt,
+        lastMonthRefreshAt: state.lastMonthRefreshAt
       };
     }
   };

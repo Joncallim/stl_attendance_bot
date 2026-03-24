@@ -3,10 +3,12 @@ import { Markup, Telegraf, session } from "telegraf";
 import {
   applyAttendanceEntriesToSnapshotBundle,
   addAppointmentToSheets,
+  buildQueuedAttendanceEventMetadata,
   createGoogleSheetsClient,
   ensureNextMonthSheetExists,
   loadAttendanceSnapshotsFromLocalCache,
   preloadAttendanceSnapshots,
+  reconcilePendingAttendanceWithSheets,
   removeAppointmentFromSheets,
   summarizeAttendanceOptionUsage,
   syncOnboardingCodeColumn,
@@ -18,6 +20,7 @@ import {
 import {
   enqueueAttendanceEvent,
   enqueueAttendanceEvents,
+  getAttendanceQueueStatus,
   listPendingAttendanceEvents,
   flushAttendanceQueue
 } from "./attendanceQueue.js";
@@ -1033,6 +1036,85 @@ function formatSyncStatusTimestamp(timestamp, timezone) {
   return formatCorrectAsAt(new Date(timestamp), timezone);
 }
 
+function getLatestHomeSynchronizationTimestamp(syncStatus) {
+  if (!syncStatus) {
+    return 0;
+  }
+
+  return Math.max(
+    Number(syncStatus.lastQueueFlushAt || 0),
+    Number(syncStatus.lastOnboardingRefreshAt || 0),
+    Number(syncStatus.lastMonthRefreshAt || 0)
+  );
+}
+
+function formatHomeSynchronizationTimestamp(timestamp, timezone) {
+  if (!timestamp) {
+    return "Not completed yet";
+  }
+
+  const date = new Date(timestamp);
+  const time = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(date).replaceAll(":", "");
+  const day = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    day: "2-digit"
+  }).format(date);
+  const month = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    month: "short"
+  }).format(date);
+  const year = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    year: "2-digit"
+  }).format(date);
+  return `${time} ${day} ${month} ${year}`;
+}
+
+function buildHomeMenuText({ greeting, name, isAdminUser, timezone, syncStatus }) {
+  const descriptions = [
+    "📝 Today's Attendance: Submit or update your attendance for today.",
+    ...getHomeWeekDescriptions(timezone),
+    "⚠️ Deregister: Remove your Telegram binding and rotate your code.",
+    "📊 Summary: View the attendance summary for the selected day.",
+    "❓ Help: Show the command and usage guide.",
+    "❌ Close: Close this menu."
+  ];
+
+  if (isAdminUser) {
+    descriptions.splice(
+      2,
+      0,
+      "🛠️ Admin Menu: Manage roster sync, invitations, admins, prompts, and deregistration."
+    );
+  }
+
+  const lines = [
+    `${greeting}, ${name}.`,
+    "",
+    "Choose an action below:",
+    "",
+    ...descriptions
+  ];
+
+  if (isAdminUser) {
+    const latestSynchronizationAt = getLatestHomeSynchronizationTimestamp(syncStatus);
+    lines.push(
+      "",
+      "---",
+      "",
+      `Last Synchronisation: ${formatHomeSynchronizationTimestamp(latestSynchronizationAt, timezone)}`
+    );
+  }
+
+  return lines.join("\n");
+}
+
 function buildAdminMenuDescription() {
   return [
     "Admin Menu",
@@ -1148,17 +1230,33 @@ function getUnaccountedAppointments(cache, config, date) {
   return snapshot.appointments.filter((appointment, index) => !String(statuses[index] ?? "").trim());
 }
 
+async function renderCachedSummaryOrWarmup(ctx, cache, config, targetDate, backTarget = "admin:menu:roster") {
+  const summary = getCachedSummarySnapshot(cache, config, targetDate);
+
+  if (summary) {
+    await sendOrUpdateAdminMessage(
+      ctx,
+      formatSummaryMessage(summary, config),
+      buildSummaryMenu(targetDate, config.timezone, backTarget),
+      { parse_mode: "HTML" }
+    );
+    return true;
+  }
+
+  await sendOrUpdateAdminMessage(
+    ctx,
+    [
+      `Summary for ${formatAttendanceDateLabel(targetDate, config.timezone)} is warming up.`,
+      "The cache is being refreshed in the background. Try again in a few seconds."
+    ].join("\n"),
+    buildSummaryMenu(targetDate, config.timezone, backTarget)
+  );
+  return false;
+}
+
 function buildChatUrlForRegistryEntry(entry) {
   if (entry?.boundUsername) {
     return `https://t.me/${entry.boundUsername}`;
-  }
-
-  if (entry?.boundUserId) {
-    return `tg://user?id=${entry.boundUserId}`;
-  }
-
-  if (entry?.boundChatId) {
-    return `tg://user?id=${entry.boundChatId}`;
   }
 
   return null;
@@ -1347,7 +1445,12 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, appointment, cache) {
       appointment,
       status: entry.status,
       date: new Date(entry.date),
-      source: "weekly"
+      source: "weekly",
+      ...buildQueuedAttendanceEventMetadata(cache.sheetSnapshots, config, {
+        appointment,
+        status: entry.status,
+        date: new Date(entry.date)
+      })
     }));
     await enqueueAttendanceEvents(
       config,
@@ -1575,32 +1678,14 @@ async function renderHomeMenu(ctx, config, options = {}) {
   const isAdminUser = options.isAdminUser ?? (await isAdmin(ctx, config));
   const greeting = getGreetingForTime(config.timezone);
   const name = user?.appointment || "there";
-  const descriptions = [
-    "📝 Today's Attendance: Submit or update your attendance for today.",
-    ...getHomeWeekDescriptions(config.timezone),
-    "⚠️ Deregister: Remove your Telegram binding and rotate your code.",
-    "📊 Summary: View the attendance summary for the selected day.",
-    "❓ Help: Show the command and usage guide.",
-    "❌ Close: Close this menu."
-  ];
-
-  if (isAdminUser) {
-    descriptions.splice(
-      2,
-      0,
-      "🛠️ Admin Menu: Manage roster sync, invitations, admins, prompts, and deregistration."
-    );
-  }
-
-  const text = [
-    `${greeting}, ${name}.`,
-    "",
-    "Choose an action below:",
-    "",
-    ...descriptions,
-    "",
-    "---"
-  ].join("\n");
+  const syncStatus = options.syncStatus ?? options.cache?.syncManager?.getStatus() ?? null;
+  const text = buildHomeMenuText({
+    greeting,
+    name,
+    isAdminUser,
+    timezone: config.timezone,
+    syncStatus
+  });
 
   await sendOrUpdateAdminMessage(ctx, text, buildHomeMenu(isAdminUser, config.timezone));
 }
@@ -1681,13 +1766,13 @@ async function ensureSheetReadiness(sheets, config, cache, options = {}) {
   const hasWarmCache =
     cache.activeCodes.length > 0 || cache.admins.length > 0 || cache.sheetSnapshots !== null;
   const syncStatus = cache.syncManager?.getStatus() ?? {
-    lastRosterSyncAt: 0,
-    lastSnapshotSyncAt: 0,
+    lastOnboardingRefreshAt: 0,
+    lastMonthRefreshAt: 0,
     cycleInProgress: false
   };
   const lastMeaningfulSyncAt = Math.max(
-    syncStatus.lastRosterSyncAt ?? 0,
-    syncStatus.lastSnapshotSyncAt ?? 0
+    syncStatus.lastOnboardingRefreshAt ?? 0,
+    syncStatus.lastMonthRefreshAt ?? 0
   );
   const isFresh = Date.now() - lastMeaningfulSyncAt < 60_000;
 
@@ -2036,11 +2121,12 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
   if (action === "pending") {
     await ensureSheetReadiness(sheets, config, cache);
     const pending = cache.pending;
-    await ctx.reply(
+    await sendOrUpdateAdminMessage(
+      ctx,
       pending.length === 0
         ? "All active personnel have onboarded."
         : pending.map((entry) => `${entry.appointment} - ${entry.secretCode}`).join("\n"),
-      Markup.removeKeyboard()
+      buildAdminRosterMenu()
     );
     return;
   }
@@ -2099,16 +2185,8 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
 
   if (action === "summary") {
     const targetDate = new Date();
-    await preloadSheetSnapshots(sheets, config, cache);
-    const summary =
-      getCachedSummarySnapshot(cache, config, targetDate) ??
-      (await summarizeStatuses(sheets, config, { date: targetDate }));
-    await sendOrUpdateAdminMessage(
-      ctx,
-      formatSummaryMessage(summary, config),
-      buildSummaryMenu(targetDate, config.timezone),
-      { parse_mode: "HTML" }
-    );
+    await ensureSheetReadiness(sheets, config, cache);
+    await renderCachedSummaryOrWarmup(ctx, cache, config, targetDate);
     return;
   }
 
@@ -2173,16 +2251,8 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       return;
     }
 
-    await preloadSheetSnapshots(sheets, config, cache);
-    const summary =
-      getCachedSummarySnapshot(cache, config, targetDate) ??
-      (await summarizeStatuses(sheets, config, { date: targetDate }));
-    await sendOrUpdateAdminMessage(
-      ctx,
-      formatSummaryMessage(summary, config),
-      buildSummaryMenu(targetDate, config.timezone),
-      { parse_mode: "HTML" }
-    );
+    await ensureSheetReadiness(sheets, config, cache);
+    await renderCachedSummaryOrWarmup(ctx, cache, config, targetDate);
     return;
   }
 }
@@ -2246,17 +2316,21 @@ export function createAttendanceBot(config) {
   adminCache.syncManager = createSyncManager({
     flushQueue: async () =>
       withSheetOperation(async () =>
-        flushAttendanceQueue((entries) => writeAttendanceStatuses(sheets, config, entries))
+        flushAttendanceQueue((entries) => reconcilePendingAttendanceWithSheets(sheets, config, entries, {
+          force: true
+        }))
       ),
-    syncRoster: async () => withSheetOperation(async () => {
+    refreshOnboarding: async () => withSheetOperation(async () => {
       await syncRosterState(sheets, config);
+      return true;
+    }),
+    refreshMonthSlices: async (options = {}) => withSheetOperation(async () => {
+      await preloadSheetSnapshots(sheets, config, adminCache, options);
+      return true;
     }),
     refreshAdminCache: async () => {
       await refreshAdminCache(adminCache, config);
-    },
-    preloadSnapshots: async (options = {}) => withSheetOperation(async () => {
-      await preloadSheetSnapshots(sheets, config, adminCache, options);
-      })
+    }
   });
 
   refreshAdminCache(adminCache, config).catch((error) => {
@@ -2333,7 +2407,10 @@ export function createAttendanceBot(config) {
       return;
     }
 
-    await renderHomeMenu(ctx, config, { user });
+    await renderHomeMenu(ctx, config, {
+      user,
+      cache: adminCache
+    });
   });
 
   bot.command("attendance", async (ctx) => {
@@ -2379,9 +2456,10 @@ export function createAttendanceBot(config) {
     const syncStatus = adminCache.syncManager?.getStatus() ?? {
       cycleInProgress: false,
       lastQueueFlushAt: 0,
-      lastRosterSyncAt: 0,
-      lastSnapshotSyncAt: 0
+      lastOnboardingRefreshAt: 0,
+      lastMonthRefreshAt: 0
     };
+    const queueStatus = await getAttendanceQueueStatus();
     const preloadStatus = syncStatus.cycleInProgress
       ? "Background synchronisation is in progress."
       : "Background synchronisation is idle.";
@@ -2390,8 +2468,11 @@ export function createAttendanceBot(config) {
       [
         "Google Sheets synchronisation status:",
         `Queue flush: ${formatSyncStatusTimestamp(syncStatus.lastQueueFlushAt, config.timezone)}`,
-        `Roster sync: ${formatSyncStatusTimestamp(syncStatus.lastRosterSyncAt, config.timezone)}`,
-        `Snapshot sync: ${formatSyncStatusTimestamp(syncStatus.lastSnapshotSyncAt, config.timezone)}`,
+        `ONBOARDING refresh: ${formatSyncStatusTimestamp(syncStatus.lastOnboardingRefreshAt, config.timezone)}`,
+        `Month slice refresh: ${formatSyncStatusTimestamp(syncStatus.lastMonthRefreshAt, config.timezone)}`,
+        `Queue depth: ${queueStatus.queueDepth}`,
+        `Conflicted writes: ${queueStatus.conflictedCount}`,
+        `Next retry: ${queueStatus.nextRetryAt ? formatSyncStatusTimestamp(queueStatus.nextRetryAt, config.timezone) : "No retry scheduled"}`,
         preloadStatus
       ].join("\n")
     );
@@ -2722,7 +2803,8 @@ export function createAttendanceBot(config) {
         Markup.removeKeyboard()
       );
       await renderHomeMenu(ctx, config, {
-        user: await getUserByChatId(ctx.chat.id)
+        user: await getUserByChatId(ctx.chat.id),
+        cache: adminCache
       });
       return;
     }
@@ -2770,7 +2852,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action === "main") {
-      await renderHomeMenu(ctx, config);
+      await renderHomeMenu(ctx, config, { cache: adminCache });
       return;
     }
 
@@ -2886,7 +2968,12 @@ export function createAttendanceBot(config) {
         appointment: user.appointment,
         status: picked,
         date: new Date(),
-        source: "daily"
+        source: "daily",
+        ...buildQueuedAttendanceEventMetadata(adminCache.sheetSnapshots, config, {
+          appointment: user.appointment,
+          status: picked,
+          date: new Date()
+        })
       };
       await enqueueAttendanceEvent(config, queuedEntry);
 
@@ -3128,19 +3215,8 @@ export function createAttendanceBot(config) {
 
     if (action === "summary") {
       const targetDate = new Date();
-      await preloadSheetSnapshots(sheets, config, adminCache);
-      const summary =
-        getCachedSummarySnapshot(adminCache, config, targetDate) ?? (
-          await summarizeStatuses(sheets, config, {
-            date: targetDate
-          })
-        );
-      await sendOrUpdateAdminMessage(
-        ctx,
-        formatSummaryMessage(summary, config),
-        buildSummaryMenu(targetDate, config.timezone, "home:main"),
-        { parse_mode: "HTML" }
-      );
+      await ensureSheetReadiness(sheets, config, adminCache);
+      await renderCachedSummaryOrWarmup(ctx, adminCache, config, targetDate, "home:main");
       return;
     }
 
@@ -3148,7 +3224,7 @@ export function createAttendanceBot(config) {
       const targetDate = parseIsoDate(action.split(":")[2]);
 
       if (!targetDate) {
-        await renderHomeMenu(ctx, config);
+        await renderHomeMenu(ctx, config, { cache: adminCache });
         return;
       }
 
@@ -3201,23 +3277,12 @@ export function createAttendanceBot(config) {
       const targetDate = parseIsoDate(action.split(":")[1]);
 
       if (!targetDate) {
-        await renderHomeMenu(ctx, config);
+        await renderHomeMenu(ctx, config, { cache: adminCache });
         return;
       }
 
-      await preloadSheetSnapshots(sheets, config, adminCache);
-      const summary =
-        getCachedSummarySnapshot(adminCache, config, targetDate) ?? (
-          await summarizeStatuses(sheets, config, {
-            date: targetDate
-          })
-        );
-      await sendOrUpdateAdminMessage(
-        ctx,
-        formatSummaryMessage(summary, config),
-        buildSummaryMenu(targetDate, config.timezone, "home:main"),
-        { parse_mode: "HTML" }
-      );
+      await ensureSheetReadiness(sheets, config, adminCache);
+      await renderCachedSummaryOrWarmup(ctx, adminCache, config, targetDate, "home:main");
       return;
     }
   });
@@ -3557,11 +3622,19 @@ export function createAttendanceBot(config) {
 
   setInterval(async () => {
     try {
-      await adminCache.syncManager.runCycle({ force: true });
+      await adminCache.syncManager.runCycle({ force: false });
     } catch (error) {
       console.error("Background sheet preload failed:", error);
     }
   }, 60 * 1000);
+
+  setInterval(async () => {
+    try {
+      await adminCache.syncManager.runCycle({ force: true });
+    } catch (error) {
+      console.error("Five-minute sheet reconciliation failed:", error);
+    }
+  }, 5 * 60 * 1000);
 
   cron.schedule(
     "5 0 * * *",
@@ -3632,3 +3705,9 @@ export function createAttendanceBot(config) {
 
   return bot;
 }
+
+export const __testing = {
+  buildHomeMenuText,
+  formatHomeSynchronizationTimestamp,
+  getLatestHomeSynchronizationTimestamp
+};

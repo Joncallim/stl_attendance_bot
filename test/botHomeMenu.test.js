@@ -1,0 +1,70 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+process.env.GOOGLE_PRIVATE_KEY ??= "test-key";
+process.env.TELEGRAM_BOT_TOKEN ??= "test-token";
+process.env.GOOGLE_SHEETS_SPREADSHEET_ID ??= "test-sheet";
+process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL ??= "bot@example.com";
+
+const { __testing } = await import("../src/bot.js");
+
+test("admin home menu includes admin action and synchronization footer", () => {
+  const text = __testing.buildHomeMenuText({
+    greeting: "Good Evening",
+    name: "SCSE",
+    isAdminUser: true,
+    timezone: "Asia/Singapore",
+    syncStatus: {
+      lastQueueFlushAt: Date.UTC(2026, 2, 24, 10, 45, 12),
+      lastOnboardingRefreshAt: Date.UTC(2026, 2, 24, 10, 44, 0),
+      lastMonthRefreshAt: Date.UTC(2026, 2, 24, 10, 43, 0)
+    }
+  });
+
+  assert.match(text, /🛠️ Admin Menu:/);
+  assert.match(text, /\n---\n/);
+  assert.match(text, /Last Synchronisation: 184512 24 Mar 26/);
+});
+
+test("admin home menu uses latest successful sync timestamp", () => {
+  const latest = __testing.getLatestHomeSynchronizationTimestamp({
+    lastQueueFlushAt: 100,
+    lastOnboardingRefreshAt: 300,
+    lastMonthRefreshAt: 200
+  });
+
+  assert.equal(latest, 300);
+});
+
+test("admin home menu shows not completed yet when no sync exists", () => {
+  const text = __testing.buildHomeMenuText({
+    greeting: "Good Evening",
+    name: "SCSE",
+    isAdminUser: true,
+    timezone: "Asia/Singapore",
+    syncStatus: {
+      lastQueueFlushAt: 0,
+      lastOnboardingRefreshAt: 0,
+      lastMonthRefreshAt: 0
+    }
+  });
+
+  assert.match(text, /Last Synchronisation: Not completed yet/);
+});
+
+test("non-admin home menu has no admin section or footer", () => {
+  const text = __testing.buildHomeMenuText({
+    greeting: "Good Evening",
+    name: "SCSE",
+    isAdminUser: false,
+    timezone: "Asia/Singapore",
+    syncStatus: {
+      lastQueueFlushAt: Date.UTC(2026, 2, 24, 10, 45, 12)
+    }
+  });
+
+  assert.doesNotMatch(text, /🛠️ Admin Menu:/);
+  assert.doesNotMatch(text, /---/);
+  assert.doesNotMatch(text, /Last Synchronisation:/);
+  assert.match(text, /❌ Close: Close this menu\.$/);
+});

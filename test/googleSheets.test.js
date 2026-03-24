@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { __testing } from "../src/googleSheets.js";
+import os from "node:os";
+import path from "node:path";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { __testing, reconcilePendingAttendanceWithSheets } from "../src/googleSheets.js";
 
 function createFakeSheets(columnValues) {
   const calls = {
@@ -49,6 +52,18 @@ function createFakeSheets(columnValues) {
   };
 }
 
+async function withTempDataDir(run) {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "attendance-sheet-cache-"));
+  process.env.ATTENDANCE_BOT_DATA_DIR = tempDir;
+
+  try {
+    await run(tempDir);
+  } finally {
+    delete process.env.ATTENDANCE_BOT_DATA_DIR;
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 test("monthly managed-row writes preserve rows below Remarks and stay batched", async () => {
   const fake = createFakeSheets(["ALPHA", "Remarks", "Manual note"]);
 
@@ -58,6 +73,8 @@ test("monthly managed-row writes preserve rows below Remarks and stay batched", 
     123,
     "Mar 26",
     3,
+    ["Appointment", "1 Mar", "2 Mar"],
+    "Asia/Singapore",
     [["ALPHA", "PRESENT", ""]],
     [["ALPHA", "PRESENT", ""]],
     ["Remarks"]
@@ -137,6 +154,28 @@ test("new-sheet header update request targets the real sheet grid", () => {
   );
 });
 
+test("month shifting rolls cleanly into the next year", () => {
+  const decemberDate = new Date("2026-12-15T12:00:00.000Z");
+  const januaryDate = __testing.shiftMonth(decemberDate, "Asia/Singapore", 1);
+
+  assert.equal(__testing.getMonthParts(januaryDate, "Asia/Singapore").title, "Jan 27");
+});
+
+test("onboarding parsing keeps unmanaged rows below the terminal stop marker", () => {
+  const parsed = __testing.parseOnboardingManagedRows([
+    ["Appointment", "Secret Code"],
+    ["ALPHA", "A1"],
+    ["BRAVO", "B1"],
+    ["Remarks", ""],
+    ["Manual note", "leave me alone"]
+  ], ["Remarks"]);
+
+  assert.deepEqual(parsed.appointments, ["ALPHA", "BRAVO"]);
+  assert.equal(parsed.stopRowNumber, 4);
+  assert.equal(parsed.stopMarkerMissing, false);
+  assert.equal(parsed.hadInlineStopMarkerDrift, false);
+});
+
 test("pending attendance overlays replace the snapshot value seen by the bot", async () => {
   const { applyAttendanceEntriesToSnapshotBundle } = await import("../src/googleSheets.js");
   const snapshotBundle = {
@@ -162,6 +201,43 @@ test("pending attendance overlays replace the snapshot value seen by the bot", a
   assert.equal(nextBundle.snapshots.get("Mar 26").statusesByDay.get(24)[0], "WFH");
 });
 
+test("cached summary remains stable when month slices are rebuilt from deserialized snapshots", async () => {
+  const { summarizeStatusesFromSnapshot } = await import("../src/googleSheets.js");
+  const snapshotBundle = {
+    synchronizedAt: new Date().toISOString(),
+    snapshots: new Map([["Mar 26", {
+      title: "Mar 26",
+      appointments: ["ALPHA"],
+      statusesByDay: new Map([[24, ["PRESENT"]]]),
+      synchronizedAt: new Date().toISOString()
+    }]])
+  };
+
+  const rebuiltBundle = {
+    synchronizedAt: new Date().toISOString(),
+    snapshots: new Map(
+      [...snapshotBundle.snapshots.entries()].map(([title, snapshot]) => [
+        title,
+        {
+          title: snapshot.title,
+          appointments: [...snapshot.appointments],
+          statusesByDay: new Map([...snapshot.statusesByDay.entries()]),
+          synchronizedAt: snapshot.synchronizedAt
+        }
+      ])
+    )
+  };
+
+  const summary = summarizeStatusesFromSnapshot(
+    rebuiltBundle,
+    { timezone: "Asia/Singapore" },
+    { date: new Date("2026-03-24T12:00:00.000Z") }
+  );
+
+  assert.equal(summary.summary.present, 1);
+  assert.equal(summary.summary.total, 1);
+});
+
 test("managed area grows by inserting a row instead of clearing and rewriting the block", async () => {
   const fake = createFakeSheets(["ALPHA", "Remarks", "Manual note"]);
 
@@ -171,6 +247,8 @@ test("managed area grows by inserting a row instead of clearing and rewriting th
     123,
     "Mar 26",
     3,
+    ["Appointment", "1 Mar", "2 Mar"],
+    "Asia/Singapore",
     [["ALPHA", "PRESENT", ""]],
     [
       ["ALPHA", "PRESENT", ""],
@@ -196,4 +274,136 @@ test("managed area grows by inserting a row instead of clearing and rewriting th
     range: "'Mar 26'!A3:C3",
     values: [["BRAVO", "", ""]]
   }]]);
+});
+
+test("five-minute reconciliation prefers direct sheet edits over queued bot changes", async () => {
+  await withTempDataDir(async (tempDir) => {
+    await writeFile(
+      path.join(tempDir, "sheet-cache.json"),
+      JSON.stringify({
+        updatedAt: "2026-03-24T00:00:00.000Z",
+        spreadsheetMetadata: {
+          fetchedAt: "2026-03-24T00:00:00.000Z",
+          sheetIdsByTitle: {
+            ONBOARDING: 1,
+            "Mar 26": 2
+          }
+        },
+        onboardingSlice: null,
+        monthSlices: {
+          "Mar 26": {
+            title: "Mar 26",
+            headerRow: ["Appointment", "24 Mar"],
+            recognizedDateColumns: { "24": 1 },
+            appointments: ["ALPHA"],
+            rowNumbersByAppointment: { ALPHA: 2 },
+            managedAreaHash: "baseline",
+            fetchedAt: "2026-03-24T00:00:00.000Z",
+            snapshot: {
+              title: "Mar 26",
+              appointments: ["ALPHA"],
+              statusesByDay: { "24": ["PRESENT"] },
+              synchronizedAt: "2026-03-24T00:00:00.000Z"
+            }
+          }
+        },
+        snapshots: {}
+      })
+    );
+
+    const calls = {
+      batchValueUpdate: []
+    };
+    const sheets = {
+      spreadsheets: {
+        get: async () => ({
+          data: {
+            sheets: [
+              { properties: { title: "ONBOARDING", sheetId: 1 } },
+              { properties: { title: "Mar 26", sheetId: 2 } }
+            ]
+          }
+        }),
+        batchUpdate: async () => ({ data: {} }),
+        values: {
+          get: async (request) => {
+            if (request.range === "'ONBOARDING'!A1:B1000") {
+              return {
+                data: {
+                  values: [
+                    ["Appointment", "Secret Code"],
+                    ["ALPHA", "CODE"],
+                    ["Remarks", ""]
+                  ]
+                }
+              };
+            }
+
+            if (request.range === "'Mar 26'!A1:ZZ1000" || request.range === "'Mar 26'!A1:ZZ1") {
+              return {
+                data: {
+                  values: [
+                    ["Appointment", "24 Mar"],
+                    ["ALPHA", "WFH"],
+                    ["Remarks", ""]
+                  ]
+                }
+              };
+            }
+
+            if (request.range === "'Mar 26'!A2:A") {
+              return {
+                data: {
+                  values: [["ALPHA"], ["Remarks"]]
+                }
+              };
+            }
+
+            if (request.range.startsWith("'Mar 26'!A2:")) {
+              return {
+                data: {
+                  values: [
+                    ["ALPHA", "WFH"],
+                    ["Remarks", ""]
+                  ]
+                }
+              };
+            }
+
+            return { data: { values: [] } };
+          },
+          update: async () => ({}),
+          clear: async () => ({}),
+          batchUpdate: async (request) => {
+            calls.batchValueUpdate.push(request.requestBody.data);
+            return {};
+          }
+        }
+      }
+    };
+
+    const result = await reconcilePendingAttendanceWithSheets(
+      sheets,
+      {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      },
+      [{
+        id: "event-1",
+        appointment: "ALPHA",
+        status: "OS",
+        date: new Date("2026-03-24T12:00:00.000Z"),
+        targetSheetTitle: "Mar 26"
+      }],
+      { force: true }
+    );
+
+    assert.equal(calls.batchValueUpdate.length, 0);
+    assert.deepEqual(result.writtenEventIds, []);
+    assert.equal(result.conflictedEvents.length, 1);
+    assert.equal(result.conflictedEvents[0].reason, "cell_value_changed_by_human");
+  });
 });

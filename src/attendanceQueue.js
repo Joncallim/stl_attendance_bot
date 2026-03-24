@@ -24,9 +24,13 @@ function createQueueState(records) {
     if (record.kind === "attendance_enqueued") {
       events.set(record.event.id, {
         ...record.event,
+        queueStatus: "pending",
         flushedAt: null,
         failedAt: null,
-        lastError: null
+        lastError: null,
+        conflictReason: null,
+        retryCount: 0,
+        nextRetryAt: null
       });
     }
 
@@ -34,9 +38,12 @@ function createQueueState(records) {
       const current = events.get(record.eventId);
 
       if (current) {
+        current.queueStatus = "flushed";
         current.flushedAt = record.flushedAt;
         current.failedAt = null;
         current.lastError = null;
+        current.conflictReason = null;
+        current.nextRetryAt = null;
       }
     }
 
@@ -44,8 +51,35 @@ function createQueueState(records) {
       const current = events.get(record.eventId);
 
       if (current) {
+        current.queueStatus = "failed_retryable";
         current.failedAt = record.failedAt;
         current.lastError = record.error;
+        current.retryCount = Number(record.retryCount ?? current.retryCount ?? 0);
+        current.nextRetryAt = record.nextRetryAt ?? null;
+      }
+    }
+
+    if (record.kind === "attendance_conflicted") {
+      const current = events.get(record.eventId);
+
+      if (current) {
+        current.queueStatus = "conflicted";
+        current.conflictReason = record.reason ?? "sheet_layout_changed";
+        current.lastError = record.error ?? null;
+        current.nextRetryAt = null;
+      }
+    }
+
+    if (record.kind === "attendance_skipped") {
+      const current = events.get(record.eventId);
+
+      if (current) {
+        current.queueStatus = "skipped_noop";
+        current.flushedAt = record.skippedAt ?? null;
+        current.failedAt = null;
+        current.lastError = null;
+        current.conflictReason = null;
+        current.nextRetryAt = null;
       }
     }
   }
@@ -85,7 +119,11 @@ export async function loadAttendanceQueueState() {
 
 export async function listPendingAttendanceEvents() {
   const state = await loadAttendanceQueueState();
-  return [...state.events.values()].filter((event) => !event.flushedAt);
+  const now = Date.now();
+  return [...state.events.values()].filter((event) =>
+    (event.queueStatus === "pending" || event.queueStatus === "failed_retryable") &&
+    (!event.nextRetryAt || new Date(event.nextRetryAt).getTime() <= now)
+  );
 }
 
 export async function enqueueAttendanceEvent(config, event) {
@@ -98,7 +136,12 @@ export async function enqueueAttendanceEvent(config, event) {
       status: event.status,
       date: toEventDateString(event.date ?? new Date(), config.timezone),
       createdAt: new Date().toISOString(),
-      source: event.source ?? "daily"
+      source: event.source ?? "daily",
+      targetSheetTitle: event.targetSheetTitle ?? null,
+      expectedPreviousValue: event.expectedPreviousValue ?? "",
+      expectedAppointment: event.expectedAppointment ?? event.appointment,
+      expectedDateLabel: event.expectedDateLabel ?? null,
+      baseCacheTimestamp: event.baseCacheTimestamp ?? null
     };
 
     await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
@@ -111,9 +154,13 @@ export async function enqueueAttendanceEvent(config, event) {
     });
     state.events.set(nextEvent.id, {
       ...nextEvent,
+      queueStatus: "pending",
       flushedAt: null,
       failedAt: null,
-      lastError: null
+      lastError: null,
+      conflictReason: null,
+      retryCount: 0,
+      nextRetryAt: null
     });
 
     return nextEvent;
@@ -130,7 +177,12 @@ export async function enqueueAttendanceEvents(config, events) {
       status: event.status,
       date: toEventDateString(event.date ?? new Date(), config.timezone),
       createdAt: new Date().toISOString(),
-      source: event.source ?? "weekly"
+      source: event.source ?? "weekly",
+      targetSheetTitle: event.targetSheetTitle ?? null,
+      expectedPreviousValue: event.expectedPreviousValue ?? "",
+      expectedAppointment: event.expectedAppointment ?? event.appointment,
+      expectedDateLabel: event.expectedDateLabel ?? null,
+      baseCacheTimestamp: event.baseCacheTimestamp ?? null
     }));
 
     for (const event of nextEvents) {
@@ -144,9 +196,13 @@ export async function enqueueAttendanceEvents(config, events) {
       });
       state.events.set(event.id, {
         ...event,
+        queueStatus: "pending",
         flushedAt: null,
         failedAt: null,
-        lastError: null
+        lastError: null,
+        conflictReason: null,
+        retryCount: 0,
+        nextRetryAt: null
       });
     }
 
@@ -157,8 +213,12 @@ export async function enqueueAttendanceEvents(config, events) {
 export async function flushAttendanceQueue(writeEntries) {
   return runSerialized(QUEUE_MUTEX_KEY, async () => {
     const state = await loadAttendanceQueueState();
+    const now = Date.now();
     const pendingEvents = [...state.events.values()]
-      .filter((event) => !event.flushedAt)
+      .filter((event) =>
+        (event.queueStatus === "pending" || event.queueStatus === "failed_retryable") &&
+        (!event.nextRetryAt || new Date(event.nextRetryAt).getTime() <= now)
+      )
       .sort((left, right) => {
         if (left.createdAt !== right.createdAt) {
           return left.createdAt.localeCompare(right.createdAt);
@@ -172,70 +232,188 @@ export async function flushAttendanceQueue(writeEntries) {
     }
 
     const coalescedEntries = new Map();
+    const eventGroups = new Map();
 
     for (const event of pendingEvents) {
-      coalescedEntries.set(`${event.appointment}:${event.date}`, event);
+      const key = `${event.appointment}:${event.date}`;
+      coalescedEntries.set(key, event);
+
+      if (!eventGroups.has(key)) {
+        eventGroups.set(key, []);
+      }
+
+      eventGroups.get(key).push(event);
     }
 
     const finalEvents = [...coalescedEntries.values()];
 
     try {
-      await writeEntries(
+      const outcome = await writeEntries(
         finalEvents.map((event) => ({
-          appointment: event.appointment,
-          status: event.status,
+          ...event,
           date: new Date(`${event.date}T12:00:00.000Z`)
         }))
       );
+      const writtenEventIds = new Set(
+        Array.isArray(outcome?.writtenEventIds)
+          ? outcome.writtenEventIds
+          : finalEvents.map((event) => event.id)
+      );
+      const skippedEvents = Array.isArray(outcome?.skippedEvents) ? outcome.skippedEvents : [];
+      const conflictedEvents = Array.isArray(outcome?.conflictedEvents) ? outcome.conflictedEvents : [];
 
       const flushedAt = new Date().toISOString();
 
-      for (const event of pendingEvents) {
-        await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
-          kind: "attendance_flushed",
-          eventId: event.id,
-          flushedAt
-        });
-        state.records.push({
-          kind: "attendance_flushed",
-          eventId: event.id,
-          flushedAt
-        });
-        const current = state.events.get(event.id);
+      for (const event of finalEvents) {
+        if (!writtenEventIds.has(event.id)) {
+          continue;
+        }
 
-        if (current) {
-          current.flushedAt = flushedAt;
-          current.failedAt = null;
-          current.lastError = null;
+        const groupedEvents = eventGroups.get(`${event.appointment}:${event.date}`) ?? [event];
+
+        for (const groupedEvent of groupedEvents) {
+          await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
+            kind: "attendance_flushed",
+            eventId: groupedEvent.id,
+            flushedAt
+          });
+          state.records.push({
+            kind: "attendance_flushed",
+            eventId: groupedEvent.id,
+            flushedAt
+          });
+          const current = state.events.get(groupedEvent.id);
+
+          if (current) {
+            current.queueStatus = "flushed";
+            current.flushedAt = flushedAt;
+            current.failedAt = null;
+            current.lastError = null;
+            current.conflictReason = null;
+            current.nextRetryAt = null;
+          }
+        }
+      }
+
+      for (const skippedEvent of skippedEvents) {
+        const sourceEvent = state.events.get(skippedEvent.eventId);
+        const groupedEvents = sourceEvent
+          ? eventGroups.get(`${sourceEvent.appointment}:${sourceEvent.date}`) ?? [sourceEvent]
+          : [];
+
+        for (const groupedEvent of groupedEvents) {
+          await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
+            kind: "attendance_skipped",
+            eventId: groupedEvent.id,
+            skippedAt: flushedAt,
+            reason: skippedEvent.reason ?? "noop"
+          });
+          state.records.push({
+            kind: "attendance_skipped",
+            eventId: groupedEvent.id,
+            skippedAt: flushedAt,
+            reason: skippedEvent.reason ?? "noop"
+          });
+          const current = state.events.get(groupedEvent.id);
+
+          if (current) {
+            current.queueStatus = "skipped_noop";
+            current.flushedAt = flushedAt;
+            current.failedAt = null;
+            current.lastError = null;
+            current.conflictReason = null;
+            current.nextRetryAt = null;
+          }
+        }
+      }
+
+      for (const conflictedEvent of conflictedEvents) {
+        const sourceEvent = state.events.get(conflictedEvent.eventId);
+        const groupedEvents = sourceEvent
+          ? eventGroups.get(`${sourceEvent.appointment}:${sourceEvent.date}`) ?? [sourceEvent]
+          : [];
+
+        for (const groupedEvent of groupedEvents) {
+          await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
+            kind: "attendance_conflicted",
+            eventId: groupedEvent.id,
+            conflictedAt: flushedAt,
+            reason: conflictedEvent.reason ?? "sheet_layout_changed",
+            error: conflictedEvent.error ?? null
+          });
+          state.records.push({
+            kind: "attendance_conflicted",
+            eventId: groupedEvent.id,
+            conflictedAt: flushedAt,
+            reason: conflictedEvent.reason ?? "sheet_layout_changed",
+            error: conflictedEvent.error ?? null
+          });
+          const current = state.events.get(groupedEvent.id);
+
+          if (current) {
+            current.queueStatus = "conflicted";
+            current.conflictReason = conflictedEvent.reason ?? "sheet_layout_changed";
+            current.lastError = conflictedEvent.error ?? null;
+            current.nextRetryAt = null;
+          }
         }
       }
 
       return { flushedEvents: finalEvents, pendingEvents: [] };
     } catch (error) {
       const failedAt = new Date().toISOString();
+      const maxRetryCount = Math.max(...pendingEvents.map((event) => Number(event.retryCount ?? 0)), 0);
+      const nextRetryCount = maxRetryCount + 1;
+      const nextRetryAt = new Date(
+        Date.now() + Math.min(15 * 60 * 1000, 1000 * (2 ** Math.min(nextRetryCount, 5))) + Math.floor(Math.random() * 250)
+      ).toISOString();
 
       for (const event of pendingEvents) {
         await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
           kind: "attendance_flush_failed",
           eventId: event.id,
           failedAt,
-          error: error.message
+          error: error.message,
+          retryCount: Number(event.retryCount ?? 0) + 1,
+          nextRetryAt
         });
         state.records.push({
           kind: "attendance_flush_failed",
           eventId: event.id,
           failedAt,
-          error: error.message
+          error: error.message,
+          retryCount: Number(event.retryCount ?? 0) + 1,
+          nextRetryAt
         });
         const current = state.events.get(event.id);
 
         if (current) {
+          current.queueStatus = "failed_retryable";
           current.failedAt = failedAt;
           current.lastError = error.message;
+          current.retryCount = Number(current.retryCount ?? 0) + 1;
+          current.nextRetryAt = nextRetryAt;
         }
       }
 
       throw error;
     }
   });
+}
+
+export async function getAttendanceQueueStatus() {
+  const state = await loadAttendanceQueueState();
+  const events = [...state.events.values()];
+  const pending = events.filter((event) => event.queueStatus === "pending" || event.queueStatus === "failed_retryable");
+  const conflicted = events.filter((event) => event.queueStatus === "conflicted");
+  const nextRetryAt = pending
+    .map((event) => event.nextRetryAt)
+    .filter(Boolean)
+    .sort()[0] ?? null;
+
+  return {
+    queueDepth: pending.length,
+    conflictedCount: conflicted.length,
+    nextRetryAt
+  };
 }

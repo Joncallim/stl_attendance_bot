@@ -6,6 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import {
   enqueueAttendanceEvent,
   flushAttendanceQueue,
+  getAttendanceQueueStatus,
   listPendingAttendanceEvents,
   loadAttendanceQueueState
 } from "../src/attendanceQueue.js";
@@ -73,7 +74,13 @@ test("attendance queue keeps events pending after a failed flush", async () => {
     );
 
     const pending = await listPendingAttendanceEvents();
-    assert.equal(pending.length, 1);
-    assert.equal(pending[0].appointment, "BRAVO");
+    assert.equal(pending.length, 0);
+    const queueState = await loadAttendanceQueueState();
+    const retryableEvent = [...queueState.events.values()][0];
+    assert.equal(retryableEvent.appointment, "BRAVO");
+    assert.equal(retryableEvent.queueStatus, "failed_retryable");
+    const status = await getAttendanceQueueStatus();
+    assert.equal(status.queueDepth, 1);
+    assert.ok(status.nextRetryAt);
   });
 });
