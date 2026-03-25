@@ -33,6 +33,50 @@ This bot records attendance through Telegram and writes each response into a sha
 - `data/sheet-cache.json`: local attendance snapshot cache used for conservative recovery if a month sheet is wiped.
 - `data/attendance-queue.ndjson`: append-only attendance event log that survives restarts until the next successful sheet flush.
 
+### Local State Schema (JSON "Database")
+
+The bot does not use SQLite or Postgres. It uses JSON files in `data/` as its local database.
+
+#### `users.json`
+
+Array of Telegram user records, typically including:
+
+- `chatId`: Telegram chat ID (string)
+- `userId`: Telegram user ID (string)
+- `username`: Telegram username
+- `fullName`: Telegram display name
+- `appointment`: currently bound appointment, or `null`
+- `onboardingSecretCode`: onboarding code in progress, or `null`
+- `onboardingCompletedAt`: ISO timestamp, or `null`
+- `awaitingSecretCode`: whether bot is waiting for code input
+- `awaitingAttendance`: whether bot is waiting for attendance input
+- `updatedAt`: ISO timestamp of latest user-state update
+
+#### `appointment-registry.json`
+
+Object with:
+
+- `updatedAt`: ISO timestamp
+- `appointments`: array of appointment entries
+- `adminAppointments`: array of custom admin appointment names
+
+Each entry in `appointments` includes:
+
+- `appointment`: appointment name
+- `secretCode`: onboarding secret code
+- `active`: whether appointment is currently active
+- `boundChatId`, `boundUserId`, `boundUsername`, `boundFullName`, `boundAt`: Telegram binding metadata (or `null` when unbound)
+
+#### `settings.json`
+
+Object with:
+
+- `updatedAt`: ISO timestamp
+- `attendanceOptions`: custom option order, or `null`
+- `attendanceOptionsVersion`: schema version number
+- `attendanceOptionUsage`: usage counters or metadata for sort-by-frequency
+- `attendanceOptionUsageUpdatedAt`: ISO timestamp for usage scan
+
 ## User Commands
 
 - `/start`: onboard first-time users or open the main menu for bound users.
