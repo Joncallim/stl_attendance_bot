@@ -17,23 +17,25 @@ test("admin home menu includes admin action and synchronization footer", () => {
     syncStatus: {
       lastQueueFlushAt: Date.UTC(2026, 2, 24, 10, 45, 12),
       lastOnboardingRefreshAt: Date.UTC(2026, 2, 24, 10, 44, 0),
-      lastMonthRefreshAt: Date.UTC(2026, 2, 24, 10, 43, 0)
+      lastMonthRefreshAt: Date.UTC(2026, 2, 24, 10, 43, 0),
+      lastFiveMinuteReconcileAt: Date.UTC(2026, 2, 24, 10, 42, 0)
     }
   });
 
   assert.match(text, /🛠️ Admin Menu:/);
   assert.match(text, /\n---\n/);
-  assert.match(text, /Last Synchronisation: 184512 24 Mar 26/);
+  assert.match(text, /Last Synchronisation: 184200 24 Mar 26/);
 });
 
-test("admin home menu uses latest successful sync timestamp", () => {
+test("admin home menu uses five-minute reconciliation timestamp only", () => {
   const latest = __testing.getLatestHomeSynchronizationTimestamp({
     lastQueueFlushAt: 100,
     lastOnboardingRefreshAt: 300,
-    lastMonthRefreshAt: 200
+    lastMonthRefreshAt: 200,
+    lastFiveMinuteReconcileAt: 250
   });
 
-  assert.equal(latest, 300);
+  assert.equal(latest, 250);
 });
 
 test("admin home menu shows not completed yet when no sync exists", () => {
@@ -45,7 +47,8 @@ test("admin home menu shows not completed yet when no sync exists", () => {
     syncStatus: {
       lastQueueFlushAt: 0,
       lastOnboardingRefreshAt: 0,
-      lastMonthRefreshAt: 0
+      lastMonthRefreshAt: 0,
+      lastFiveMinuteReconcileAt: 0
     }
   });
 

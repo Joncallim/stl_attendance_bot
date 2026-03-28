@@ -8,7 +8,8 @@ export function createSyncManager({
     cyclePromise: null,
     lastQueueFlushAt: 0,
     lastOnboardingRefreshAt: 0,
-    lastMonthRefreshAt: 0
+    lastMonthRefreshAt: 0,
+    lastFiveMinuteReconcileAt: 0
   };
 
   async function runCycle(options = {}) {
@@ -41,6 +42,10 @@ export function createSyncManager({
           state.lastMonthRefreshAt = Date.now();
         }
       }
+
+      if (options.reason === "five-minute") {
+        state.lastFiveMinuteReconcileAt = Date.now();
+      }
     })().finally(() => {
       state.cyclePromise = null;
     });
@@ -55,7 +60,8 @@ export function createSyncManager({
         cycleInProgress: Boolean(state.cyclePromise),
         lastQueueFlushAt: state.lastQueueFlushAt,
         lastOnboardingRefreshAt: state.lastOnboardingRefreshAt,
-        lastMonthRefreshAt: state.lastMonthRefreshAt
+        lastMonthRefreshAt: state.lastMonthRefreshAt,
+        lastFiveMinuteReconcileAt: state.lastFiveMinuteReconcileAt
       };
     }
   };

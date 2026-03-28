@@ -11,9 +11,254 @@ const SPREADSHEET_METADATA_TTL_MS = 15 * 60 * 1000;
 const ONBOARDING_SLICE_TTL_MS = 2 * 60 * 1000;
 const MONTH_SLICE_TTL_MS = 60 * 1000;
 const DEFAULT_MAX_MANAGED_ROWS = 1000;
+const DEFAULT_BOOTSTRAP_APPOINTMENTS = ["USER1", "USER2", "USER3"];
+const ATTENDANCE_OPTION_USAGE_MONTH_WINDOW = 3;
+const GOOGLE_SHEETS_MAX_RETRY_ATTEMPTS = 5;
+const GOOGLE_SHEETS_INITIAL_RETRY_DELAY_MS = 1000;
+const GOOGLE_SHEETS_MAX_RETRY_DELAY_MS = 32000;
+const runtimeSheetContext = new WeakMap();
 
 function normalizeAppointmentLabel(value) {
   return String(value ?? "").trim();
+}
+
+function normalizeAppointmentIdentity(value) {
+  return normalizeAppointmentLabel(value).toUpperCase();
+}
+
+function normalizeAppointmentForOrdering(value) {
+  return normalizeAppointmentIdentity(value)
+    .replace(/[–—]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+const TOP_BLOCK_ORDER = new Map([
+  ["CO", 0],
+  ["XO", 1],
+  ["OPS", 2],
+  ["NO", 3],
+  ["AOPS", 4],
+  ["SCSE", 5],
+  ["SME", 6],
+  ["ME", 7],
+  ["COXN", 8],
+  ["ASE", 9],
+  ["ANO", 10],
+  ["YO", 11],
+  ["MID", 12]
+]);
+
+const DEPARTMENT_SPECS = [
+  { label: "C2", order: 0, chiefPatterns: [/^CC2(.*)$/] },
+  { label: "WS", order: 1, chiefPatterns: [/^CWS(.*)$/] },
+  { label: "WCS", order: 2, chiefPatterns: [/^CWCS(.*)$/] },
+  { label: "UW", order: 3, chiefPatterns: [/^CUW(.*)$/] },
+  { label: "NAV", order: 4, chiefPatterns: [] },
+  { label: "COMMS", order: 5, chiefPatterns: [/^CCOMMS(.*)$/] },
+  { label: "ELECTRONIC SPECIALIST", order: 6, chiefPatterns: [/^CHIEF ELECTRONIC SPECIALIST(.*)$/] },
+  { label: "COMMS SPECIALIST", order: 7, chiefPatterns: [/^CHIEF COMMS SPECIALIST(.*)$/] },
+  { label: "MS", order: 8, chiefPatterns: [/^CMS(.*)$/] },
+  { label: "ECS", order: 9, chiefPatterns: [/^CECS(.*)$/] },
+  { label: "CHEF", order: 10, chiefPatterns: [/^CCHEF(.*)$/] }
+];
+
+const DEPARTMENT_PARSE_SPECS = [...DEPARTMENT_SPECS].sort(
+  (left, right) => right.label.length - left.label.length
+);
+
+function compareVariantSuffix(left, right) {
+  if (!left && !right) {
+    return 0;
+  }
+
+  if (!left) {
+    return -1;
+  }
+
+  if (!right) {
+    return 1;
+  }
+
+  return left.localeCompare(right);
+}
+
+function parseNumberWithSuffix(value) {
+  const match = value.match(/^\s*(\d+)(.*)$/);
+
+  if (!match) {
+    return {
+      number: -1,
+      suffix: value.trim()
+    };
+  }
+
+  return {
+    number: Number(match[1]),
+    suffix: String(match[2] ?? "").trim()
+  };
+}
+
+function parseTopBlockAppointment(label, originalIndex) {
+  const normalized = normalizeAppointmentForOrdering(label);
+  const exactFamilies = ["COXN", "CO", "XO", "NO", "SCSE", "SME", "ME"];
+
+  for (const family of exactFamilies) {
+    const match = normalized.match(new RegExp(`^${family}(.*)$`));
+
+    if (match && (match[1] === "" || /^[\s(-]/.test(match[1]))) {
+      return {
+        bucketOrder: TOP_BLOCK_ORDER.get(family),
+        family,
+        roleOrder: 0,
+        number: -1,
+        variantSuffix: String(match[1] ?? "").trim(),
+        originalIndex
+      };
+    }
+  }
+
+  for (const family of ["OPS", "AOPS", "ASE", "ANO", "YO"]) {
+    const match = normalized.match(new RegExp(`^${family}(.*)$`));
+
+    if (match && (match[1] === "" || /^[\s(-]/.test(match[1]))) {
+      const parsed = parseNumberWithSuffix(match[1]);
+      return {
+        bucketOrder: TOP_BLOCK_ORDER.get(family),
+        family,
+        roleOrder: 0,
+        number: parsed.number,
+        variantSuffix: parsed.suffix,
+        originalIndex
+      };
+    }
+  }
+
+  const midMatch = normalized.match(/^MIDS?(.*)$/);
+
+  if (midMatch && (midMatch[1] === "" || /^[\s(-]/.test(midMatch[1]))) {
+    const parsed = parseNumberWithSuffix(midMatch[1]);
+    return {
+      bucketOrder: TOP_BLOCK_ORDER.get("MID"),
+      family: "MID",
+      roleOrder: 0,
+      number: parsed.number,
+      variantSuffix: parsed.suffix,
+      originalIndex
+    };
+  }
+
+  return null;
+}
+
+function parseDepartmentAppointment(label, originalIndex) {
+  const normalized = normalizeAppointmentForOrdering(label);
+
+  for (const spec of DEPARTMENT_PARSE_SPECS) {
+
+    for (const pattern of spec.chiefPatterns) {
+      const chiefMatch = normalized.match(pattern);
+
+      if (chiefMatch) {
+        return {
+          bucketOrder: 100 + spec.order,
+          family: `${spec.label}:CHIEF`,
+          roleOrder: 0,
+          number: -1,
+          variantSuffix: String(chiefMatch[1] ?? "").trim(),
+          originalIndex
+        };
+      }
+    }
+
+    const prefixPattern = new RegExp(`^${spec.label.replace(/\s+/g, "\\s+")}(.*)$`);
+    const prefixMatch = normalized.match(prefixPattern);
+
+    if (!prefixMatch || (prefixMatch[1] && !/^[\s(-]/.test(prefixMatch[1]))) {
+      continue;
+    }
+
+    const remainder = String(prefixMatch[1] ?? "").trim();
+
+    for (const [pattern, roleOrder, familySuffix] of [
+      [/^SUP(?:\s+(\d+))?(.*)$/, 1, "SUP"],
+      [/^(\d+)(.*)$/, 2, "SEAT"],
+      [/^WPL(?:\s+(\d+))?(.*)$/, 3, "WPL"],
+      [/^OJT(?:\s+(\d+))?(.*)$/, 4, "OJT"]
+    ]) {
+      const match = remainder.match(pattern);
+
+      if (!match) {
+        continue;
+      }
+
+        return {
+          bucketOrder: 100 + spec.order,
+          family: `${spec.label}:${familySuffix}`,
+        roleOrder,
+        number: match[1] ? Number(match[1]) : -1,
+        variantSuffix: String(match[2] ?? "").trim(),
+        originalIndex
+      };
+    }
+
+    return {
+      bucketOrder: 100 + spec.order,
+      family: `${spec.label}:OTHER`,
+      roleOrder: 5,
+      number: -1,
+      variantSuffix: remainder,
+      originalIndex
+    };
+  }
+
+  return null;
+}
+
+function parseAppointmentOrderingMetadata(label, originalIndex) {
+  return parseTopBlockAppointment(label, originalIndex) ??
+    parseDepartmentAppointment(label, originalIndex) ?? {
+      bucketOrder: Number.MAX_SAFE_INTEGER,
+      family: normalizeAppointmentForOrdering(label),
+      roleOrder: Number.MAX_SAFE_INTEGER,
+      number: -1,
+      variantSuffix: "",
+      originalIndex
+    };
+}
+
+function orderAppointmentsCanonically(appointments = []) {
+  return appointments
+    .map((value, originalIndex) => ({ value, originalIndex }))
+    .sort((left, right) => {
+      const leftMeta = parseAppointmentOrderingMetadata(left.value, left.originalIndex);
+      const rightMeta = parseAppointmentOrderingMetadata(right.value, right.originalIndex);
+
+      if (leftMeta.bucketOrder !== rightMeta.bucketOrder) {
+        return leftMeta.bucketOrder - rightMeta.bucketOrder;
+      }
+
+      if (leftMeta.roleOrder !== rightMeta.roleOrder) {
+        return leftMeta.roleOrder - rightMeta.roleOrder;
+      }
+
+      if (leftMeta.family !== rightMeta.family) {
+        return leftMeta.family.localeCompare(rightMeta.family);
+      }
+
+      if (leftMeta.number !== rightMeta.number) {
+        return leftMeta.number - rightMeta.number;
+      }
+
+      const suffixResult = compareVariantSuffix(leftMeta.variantSuffix, rightMeta.variantSuffix);
+
+      if (suffixResult !== 0) {
+        return suffixResult;
+      }
+
+      return left.originalIndex - right.originalIndex;
+    })
+    .map((entry) => entry.value);
 }
 
 async function readJsonFile(filePath, fallbackValue) {
@@ -29,6 +274,10 @@ function isStopMarker(value, stopMarkers) {
   return stopMarkers.some((marker) => normalizedValue === marker.toUpperCase());
 }
 
+function isLegacyRemarksBoundary(value) {
+  return normalizeAppointmentIdentity(value) === "REMARKS";
+}
+
 function sanitizeAppointments(values, stopMarkers) {
   const appointments = [];
   let stopped = false;
@@ -40,7 +289,7 @@ function sanitizeAppointments(values, stopMarkers) {
       continue;
     }
 
-    if (isStopMarker(value, stopMarkers)) {
+    if (isStopMarker(value, stopMarkers) || isLegacyRemarksBoundary(value)) {
       stopped = true;
       break;
     }
@@ -79,6 +328,29 @@ function uniquifyAppointments(appointments) {
   });
 }
 
+function dedupeAppointmentsPreservingOrder(appointments = []) {
+  const seen = new Set();
+  const deduped = [];
+  const duplicates = [];
+
+  for (const appointment of appointments) {
+    const identity = normalizeAppointmentIdentity(appointment);
+
+    if (seen.has(identity)) {
+      duplicates.push(appointment);
+      continue;
+    }
+
+    seen.add(identity);
+    deduped.push(appointment);
+  }
+
+  return {
+    appointments: deduped,
+    duplicates
+  };
+}
+
 function computeManagedAreaHash(value) {
   return JSON.stringify(value);
 }
@@ -92,7 +364,7 @@ function isSliceFresh(fetchedAt, ttlMs) {
 }
 
 function getPrimaryStopMarker(stopMarkers = []) {
-  return stopMarkers[0] ?? "Remarks";
+  return stopMarkers[0] ?? "";
 }
 
 function buildDefaultSheetCache() {
@@ -106,6 +378,81 @@ function buildDefaultSheetCache() {
     monthSlices: {},
     snapshots: {}
   };
+}
+
+function getRuntimeSheetContext(cache) {
+  if (!cache) {
+    return null;
+  }
+
+  if (!runtimeSheetContext.has(cache)) {
+    runtimeSheetContext.set(cache, {
+      spreadsheet: null
+    });
+  }
+
+  return runtimeSheetContext.get(cache);
+}
+
+function isRetryableGoogleSheetsError(error) {
+  const status = Number(error?.code ?? error?.status ?? error?.response?.status ?? 0);
+  const reasons = [
+    error?.errors?.[0]?.reason,
+    error?.response?.data?.error?.status,
+    error?.response?.data?.error?.errors?.[0]?.reason
+  ]
+    .filter(Boolean)
+    .map((value) => String(value).toLowerCase());
+
+  return status === 429 ||
+    status >= 500 ||
+    reasons.some((reason) =>
+      reason.includes("ratelimit") ||
+      reason.includes("quota") ||
+      reason.includes("resource_exhausted") ||
+      reason.includes("backenderror")
+    );
+}
+
+function getGoogleSheetsRetryDelay(attempt, options = {}) {
+  const randomFn = options.randomFn ?? Math.random;
+  const cappedBaseDelay = Math.min(
+    GOOGLE_SHEETS_INITIAL_RETRY_DELAY_MS * (2 ** (attempt - 1)),
+    GOOGLE_SHEETS_MAX_RETRY_DELAY_MS
+  );
+
+  return Math.floor(randomFn() * cappedBaseDelay);
+}
+
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runGoogleSheetsRequest(operation, request, options = {}) {
+  const maxAttempts = options.maxAttempts ?? GOOGLE_SHEETS_MAX_RETRY_ATTEMPTS;
+  const sleepFn = options.sleepFn ?? sleep;
+  const logFn = options.logFn ?? console.warn;
+  let attempt = 0;
+
+  while (attempt < maxAttempts) {
+    attempt += 1;
+
+    try {
+      return await request();
+    } catch (error) {
+      if (!isRetryableGoogleSheetsError(error) || attempt >= maxAttempts) {
+        throw error;
+      }
+
+      const delayMs = getGoogleSheetsRetryDelay(attempt, options);
+      logFn(
+        `Google Sheets request retry ${attempt}/${maxAttempts} for ${operation} after ${delayMs}ms: ${error.message}`
+      );
+      await sleepFn(delayMs);
+    }
+  }
+
+  throw new Error(`Google Sheets request exhausted retries for ${operation}`);
 }
 
 function columnNumberToLabel(columnNumber) {
@@ -251,44 +598,82 @@ function parseMonthSheetTitle(title) {
   };
 }
 
-async function getSpreadsheet(sheets, spreadsheetId) {
-  const response = await sheets.spreadsheets.get({
-    spreadsheetId,
-    includeGridData: false
-  });
-  return response.data;
+async function getSpreadsheet(sheets, spreadsheetId, options = {}) {
+  const runtimeContext = getRuntimeSheetContext(options.cache);
+
+  if (runtimeContext?.spreadsheet && options.force !== true) {
+    return runtimeContext.spreadsheet;
+  }
+
+  const response = await runGoogleSheetsRequest("spreadsheets.get", () =>
+    sheets.spreadsheets.get({
+      spreadsheetId,
+      includeGridData: false
+    })
+  );
+  const spreadsheet = response.data;
+
+  if (runtimeContext) {
+    runtimeContext.spreadsheet = spreadsheet;
+  }
+
+  return spreadsheet;
 }
 
-async function getSheetByTitle(sheets, spreadsheetId, title) {
-  const spreadsheet = await getSpreadsheet(sheets, spreadsheetId);
+async function getSheetByTitle(sheets, spreadsheetId, title, options = {}) {
+  const spreadsheet = await getSpreadsheet(sheets, spreadsheetId, options);
   return spreadsheet.sheets?.find((entry) => entry.properties?.title === title) ?? null;
 }
 
 async function addSheet(sheets, spreadsheetId, title) {
-  const response = await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests: [
-        {
-          addSheet: {
-            properties: {
-              title,
-              gridProperties: {
-                frozenRowCount: 1,
-                frozenColumnCount: 1
+  const response = await runGoogleSheetsRequest(`spreadsheets.batchUpdate:addSheet:${title}`, () =>
+    sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [
+          {
+            addSheet: {
+              properties: {
+                title,
+                gridProperties: {
+                  frozenRowCount: 1,
+                  frozenColumnCount: 1
+                }
               }
             }
           }
-        }
-      ]
-    }
-  });
+        ]
+      }
+    })
+  );
 
   return response.data.replies?.[0]?.addSheet ?? null;
 }
 
-async function ensureSheet(sheets, spreadsheetId, title) {
-  const existing = await getSheetByTitle(sheets, spreadsheetId, title);
+async function ensureSheet(sheets, spreadsheetId, title, options = {}) {
+  if (options.cache) {
+    const metadata = await updateSpreadsheetMetadataCache(
+      sheets,
+      { spreadsheetId },
+      options.cache,
+      options.forceMetadata === true
+    );
+    const existingSheetId = metadata.sheetIdsByTitle?.[title];
+
+    if (Number.isInteger(existingSheetId)) {
+      return {
+        sheet: {
+          properties: {
+            title,
+            sheetId: existingSheetId
+          }
+        },
+        created: false
+      };
+    }
+  }
+
+  const existing = await getSheetByTitle(sheets, spreadsheetId, title, options);
 
   if (existing) {
     return {
@@ -297,17 +682,44 @@ async function ensureSheet(sheets, spreadsheetId, title) {
     };
   }
 
+  const addedSheet = await addSheet(sheets, spreadsheetId, title);
+
+  if (options.cache) {
+    const metadata = options.cache.spreadsheetMetadata ?? buildDefaultSheetCache().spreadsheetMetadata;
+    options.cache.spreadsheetMetadata = {
+      ...metadata,
+      fetchedAt: new Date().toISOString(),
+      sheetIdsByTitle: {
+        ...(metadata.sheetIdsByTitle ?? {}),
+        [title]: addedSheet?.properties?.sheetId ?? null
+      }
+    };
+    const runtimeContext = getRuntimeSheetContext(options.cache);
+
+    if (runtimeContext?.spreadsheet) {
+      runtimeContext.spreadsheet = {
+        ...runtimeContext.spreadsheet,
+        sheets: [
+          ...(runtimeContext.spreadsheet.sheets ?? []),
+          addedSheet
+        ]
+      };
+    }
+  }
+
   return {
-    sheet: await addSheet(sheets, spreadsheetId, title),
+    sheet: addedSheet,
     created: true
   };
 }
 
 async function readAppointmentColumn(sheets, spreadsheetId, title, stopMarkers = []) {
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${title}'!A2:A`
-  });
+  const response = await runGoogleSheetsRequest(`spreadsheets.values.get:${title}:A2:A`, () =>
+    sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${title}'!A2:A`
+    })
+  );
 
   const rawValues = (response.data.values ?? []).map(([value]) => value);
   return sanitizeAppointments(rawValues, stopMarkers);
@@ -320,6 +732,8 @@ function parseOnboardingManagedRows(values, stopMarkers = []) {
   let stopRowNumber = null;
   let stopMarkerMissing = false;
   let hadInlineStopMarkerDrift = false;
+  let hasBlankRowDrift = false;
+  const blankRowNumbers = [];
 
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index] ?? [];
@@ -327,14 +741,28 @@ function parseOnboardingManagedRows(values, stopMarkers = []) {
     const rowNumber = index + 2;
 
     if (!appointment) {
+      const hasLaterManagedAppointment = rows.slice(index + 1).some((nextRow) => {
+        const nextAppointment = normalizeAppointmentLabel(nextRow?.[0]);
+        return nextAppointment && !isStopMarker(nextAppointment, stopMarkers);
+      });
+
+      if (hasLaterManagedAppointment) {
+        hasBlankRowDrift = true;
+        blankRowNumbers.push(rowNumber);
+        continue;
+      }
+
       boundaryRowNumber = rowNumber;
       stopMarkerMissing = true;
       break;
     }
 
-    if (isStopMarker(appointment, stopMarkers)) {
+    if (isStopMarker(appointment, stopMarkers) || isLegacyRemarksBoundary(appointment)) {
       stopRowNumber = rowNumber;
       boundaryRowNumber = rowNumber;
+      hadInlineStopMarkerDrift = rows.slice(index + 1).some((nextRow) =>
+        Boolean(normalizeAppointmentLabel(nextRow?.[0]))
+      );
       break;
     }
 
@@ -350,21 +778,81 @@ function parseOnboardingManagedRows(values, stopMarkers = []) {
     stopMarkerMissing = true;
   }
 
-  const appointments = uniquifyAppointments(managedRows.map((row) => row.appointment));
-  const normalizedManagedRows = managedRows.map((row, index) => ({
-    ...row,
-    appointment: appointments[index]
-  }));
+  const dedupedAppointments = dedupeAppointmentsPreservingOrder(
+    managedRows.map((row) => row.appointment)
+  );
+  const canonicalIdentities = new Set(
+    dedupedAppointments.appointments.map((appointment) => normalizeAppointmentIdentity(appointment))
+  );
+  const normalizedManagedRows = managedRows.filter((row) =>
+    canonicalIdentities.has(normalizeAppointmentIdentity(row.appointment))
+  ).filter((row, index, filteredRows) =>
+    filteredRows.findIndex(
+      (candidate) =>
+        normalizeAppointmentIdentity(candidate.appointment) ===
+        normalizeAppointmentIdentity(row.appointment)
+    ) === index
+  );
 
   return {
-    appointments,
+    appointments: dedupedAppointments.appointments,
     managedRows: normalizedManagedRows,
+    duplicateAppointments: dedupedAppointments.duplicates,
     stopRowNumber,
     boundaryRowNumber,
     stopMarkerMissing,
     hadInlineStopMarkerDrift,
+    hasBlankRowDrift,
+    blankRowNumbers,
     managedRangeEndRow: boundaryRowNumber - 1
   };
+}
+
+function buildLiveManagedMonthlyRows(values, headerLength, stopMarkers = [], canonicalAppointments = []) {
+  const canonicalIdentities = new Set(
+    canonicalAppointments.map((appointment) => normalizeAppointmentIdentity(appointment))
+  );
+  const seenCanonicalIdentities = new Set();
+  const rows = [];
+
+  for (let index = 1; index < values.length; index += 1) {
+    const normalizedRow = normalizeRowValues(values[index] ?? [], headerLength);
+    const appointment = normalizeAppointmentLabel(normalizedRow[0]);
+
+    if (!appointment) {
+      continue;
+    }
+
+    const appointmentIdentity = normalizeAppointmentIdentity(appointment);
+
+    if (isStopMarker(appointment, stopMarkers)) {
+      break;
+    }
+
+    if (isLegacyRemarksBoundary(appointment)) {
+      if (canonicalIdentities.size === 0 || seenCanonicalIdentities.size >= canonicalIdentities.size) {
+        break;
+      }
+    }
+
+    rows.push({
+      rowNumber: index + 1,
+      appointment,
+      row: normalizedRow
+    });
+
+    if (canonicalIdentities.has(appointmentIdentity)) {
+      seenCanonicalIdentities.add(appointmentIdentity);
+      continue;
+    }
+
+    if (canonicalIdentities.size > 0 && seenCanonicalIdentities.size >= canonicalIdentities.size) {
+      rows.pop();
+      break;
+    }
+  }
+
+  return rows;
 }
 
 async function readHeaderRow(sheets, spreadsheetId, title, fallbackHeader = []) {
@@ -381,10 +869,13 @@ async function getStopAwareWriteBoundary(
   stopMarkers = [],
   maxRow = 1000
 ) {
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${title}'!A2:A${maxRow}`
-  });
+  const response = await runGoogleSheetsRequest(
+    `spreadsheets.values.get:${title}:A2:A${maxRow}`,
+    () => sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${title}'!A2:A${maxRow}`
+    })
+  );
   const rawValues = (response.data.values ?? []).map(([value]) => normalizeAppointmentLabel(value));
   const stopIndex = rawValues.findIndex((value) => isStopMarker(value, stopMarkers));
   const stopRowNumber = stopIndex === -1 ? null : stopIndex + 2;
@@ -406,34 +897,29 @@ async function writeAppointmentColumn(
   const parsed = parseOnboardingManagedRows(values, options.stopMarkers ?? []);
   const existingCodes = new Map(parsed.managedRows.map((row) => [row.appointment, row.secretCode]));
   const rows = appointments.map((appointment) => [appointment, existingCodes.get(appointment) ?? ""]);
-  await writeOnboardingRows(sheets, spreadsheetId, title, rows, options.stopMarkers ?? []);
+  await writeOnboardingRows(sheets, spreadsheetId, title, rows, options.stopMarkers ?? [], options);
 }
 
-async function readMonthlySheetRows(sheets, spreadsheetId, title, headerLength, stopMarkers) {
+async function readMonthlySheetRows(
+  sheets,
+  spreadsheetId,
+  title,
+  headerLength,
+  stopMarkers,
+  canonicalAppointments = []
+) {
   const values = await readSheetValues(
     sheets,
     spreadsheetId,
     title,
     `A2:${columnNumberToLabel(headerLength)}1000`
   );
-  const rows = [];
-
-  for (const row of values) {
-    const normalizedRow = normalizeRowValues(row, headerLength);
-    const appointment = normalizeAppointmentLabel(normalizedRow[0]);
-
-    if (!appointment) {
-      continue;
-    }
-
-    if (isStopMarker(appointment, stopMarkers)) {
-      break;
-    }
-
-    rows.push(normalizedRow);
-  }
-
-  return rows;
+  return buildLiveManagedMonthlyRows(
+    [["Appointment"], ...values],
+    headerLength,
+    stopMarkers,
+    canonicalAppointments
+  ).map((entry) => entry.row);
 }
 
 async function writeMonthlySheetRows(
@@ -483,17 +969,16 @@ async function writeMonthlySheetRows(
         };
     });
 
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        requests
-      }
-    });
+    await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${title}:rows`, () =>
+      sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          requests
+        }
+      })
+    );
   }
 
-  const rowByAppointment = new Map(
-    existingRows.map((row) => [normalizeAppointmentLabel(row[0]), row])
-  );
   const changedData = [];
   const managedColumnIndices = [0, ...buildDateColumnMap(
     headerRow,
@@ -504,8 +989,7 @@ async function writeMonthlySheetRows(
 
   for (let index = 0; index < rows.length; index += 1) {
     const nextRow = rows[index];
-    const appointment = normalizeAppointmentLabel(nextRow[0]);
-    const existingRow = rowByAppointment.get(appointment);
+    const existingRow = normalizeRowValues(existingRows[index] ?? [], headerLength);
 
     for (const group of managedGroups) {
       const groupChanged = group.some((columnIndex) =>
@@ -526,25 +1010,29 @@ async function writeMonthlySheetRows(
   }
 
   if (changedData.length > 0) {
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        valueInputOption: "USER_ENTERED",
-        data: changedData
-      }
-    });
+    await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${title}:managedRows`, () =>
+      sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          valueInputOption: "USER_ENTERED",
+          data: changedData
+        }
+      })
+    );
   }
 }
 
 async function writeHeaderRow(sheets, spreadsheetId, title, header) {
-  await sheets.spreadsheets.values.update({
-    spreadsheetId,
-    range: `'${title}'!A1:${columnNumberToLabel(header.length)}1`,
-    valueInputOption: "USER_ENTERED",
-    requestBody: {
-      values: [header]
-    }
-  });
+  await runGoogleSheetsRequest(`spreadsheets.values.update:${title}:header`, () =>
+    sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: `'${title}'!A1:${columnNumberToLabel(header.length)}1`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: {
+        values: [header]
+      }
+    })
+  );
 }
 
 function buildHeaderUpdateRequest(sheetId, header) {
@@ -569,8 +1057,8 @@ function buildHeaderUpdateRequest(sheetId, header) {
   };
 }
 
-async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarkers = []) {
-  const sheet = await getSheetByTitle(sheets, spreadsheetId, title);
+async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarkers = [], options = {}) {
+  const sheet = await getSheetByTitle(sheets, spreadsheetId, title, options);
   const values = await readSheetValues(sheets, spreadsheetId, title, "A1:B1000");
   const parsed = parseOnboardingManagedRows(values, stopMarkers);
   const currentCount = parsed.appointments.length;
@@ -579,35 +1067,37 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
   const boundaryRowNumber = parsed.boundaryRowNumber;
 
   if (rowDelta !== 0) {
-    await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        requests: [
-          rowDelta > 0
-            ? {
-              insertDimension: {
-                range: {
-                  sheetId: sheet.properties.sheetId,
-                  dimension: "ROWS",
-                  startIndex: boundaryRowNumber - 1,
-                  endIndex: boundaryRowNumber - 1 + rowDelta
-                },
-                inheritFromBefore: boundaryRowNumber > 2
-              }
-            }
-            : {
-              deleteDimension: {
-                range: {
-                  sheetId: sheet.properties.sheetId,
-                  dimension: "ROWS",
-                  startIndex: nextCount + 1,
-                  endIndex: currentCount + 1
+    await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${title}:onboardingRows`, () =>
+      sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+          requests: [
+            rowDelta > 0
+              ? {
+                insertDimension: {
+                  range: {
+                    sheetId: sheet.properties.sheetId,
+                    dimension: "ROWS",
+                    startIndex: boundaryRowNumber - 1,
+                    endIndex: boundaryRowNumber - 1 + rowDelta
+                  },
+                  inheritFromBefore: boundaryRowNumber > 2
                 }
               }
-            }
-        ]
-      }
-    });
+              : {
+                deleteDimension: {
+                  range: {
+                    sheetId: sheet.properties.sheetId,
+                    dimension: "ROWS",
+                    startIndex: nextCount + 1,
+                    endIndex: currentCount + 1
+                  }
+                }
+              }
+          ]
+        }
+      })
+    );
   }
 
   const stopMarker = getPrimaryStopMarker(stopMarkers);
@@ -630,18 +1120,22 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
     }
   }
 
-  data.push({
-    range: `'${title}'!A${rows.length + 2}:A${rows.length + 2}`,
-    values: [[stopMarker]]
-  });
+  if (stopMarker) {
+    data.push({
+      range: `'${title}'!A${rows.length + 2}:A${rows.length + 2}`,
+      values: [[stopMarker]]
+    });
+  }
 
-  await sheets.spreadsheets.values.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      valueInputOption: "USER_ENTERED",
-      data
-    }
-  });
+  await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${title}:onboardingRows`, () =>
+    sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        valueInputOption: "USER_ENTERED",
+        data
+      }
+    })
+  );
 }
 
 function buildAttendanceValidationRequest(sheetId, headerLength, options) {
@@ -723,12 +1217,14 @@ async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, hea
     ...(await buildDisabledDayFormattingRequests(sheetId, date, timezone))
   ];
 
-  await sheets.spreadsheets.batchUpdate({
-    spreadsheetId,
-    requestBody: {
-      requests
-    }
-  });
+  await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${sheetId}:layout`, () =>
+    sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests
+      }
+    })
+  );
 }
 
 async function ensureHeaderRowIfBlank(sheets, spreadsheetId, title, header) {
@@ -741,8 +1237,12 @@ async function ensureHeaderRowIfBlank(sheets, spreadsheetId, title, header) {
   }
 }
 
-async function readCanonicalOnboardingAppointments(sheets, config) {
-  const onboarding = await refreshOnboardingSlice(sheets, config, { force: false });
+async function readCanonicalOnboardingAppointments(sheets, config, options = {}) {
+  const onboarding = await refreshOnboardingSlice(sheets, config, {
+    cache: options.cache,
+    force: options.force === true,
+    persist: options.persist
+  });
   return onboarding.appointments;
 }
 
@@ -755,21 +1255,21 @@ function buildManagedMonthlyRows({
   mode
 }) {
   const rowByAppointment = new Map(
-    existingRows.map((row) => [normalizeAppointmentLabel(row[0]), row])
+    existingRows.map((row) => [normalizeAppointmentIdentity(row[0]), row])
   );
-  const nextAppointments =
-    mode === "replace"
-      ? preferredAppointments
-      : [
-          ...preferredAppointments,
-          ...requestedAppointments.filter((value) => !preferredAppointments.includes(value)),
-          ...existingAppointments.filter(
-            (value) => !preferredAppointments.includes(value) && !requestedAppointments.includes(value)
-          )
-        ];
+  const nextAppointments = preferredAppointments.length > 0
+    ? preferredAppointments
+    : (
+      mode === "replace"
+        ? requestedAppointments
+        : [
+            ...requestedAppointments,
+            ...existingAppointments.filter((value) => !requestedAppointments.includes(value))
+          ]
+    );
 
   const nextRows = nextAppointments.map((appointment) => {
-    const existingRow = rowByAppointment.get(normalizeAppointmentLabel(appointment));
+    const existingRow = rowByAppointment.get(normalizeAppointmentIdentity(appointment));
 
     if (existingRow) {
       const nextRow = [...existingRow];
@@ -788,9 +1288,11 @@ function buildManagedMonthlyRows({
   };
 }
 
-async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, mode) {
+async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, mode, options = {}) {
   const { title } = getMonthParts(date, config.timezone);
-  const ensuredSheet = await ensureSheet(sheets, config.spreadsheetId, title);
+  const ensuredSheet = await ensureSheet(sheets, config.spreadsheetId, title, {
+    cache: options.cache
+  });
   const sheet = ensuredSheet.sheet;
   const defaultHeader = getDefaultHeaderRow(date, config.timezone);
 
@@ -820,19 +1322,43 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     title,
     config.rosterStopMarkers
   );
-  const existingRows = await readMonthlySheetRows(
-    sheets,
-    config.spreadsheetId,
-    title,
-    header.length,
-    config.rosterStopMarkers
-  );
-  const onboardingAppointments = await readCanonicalOnboardingAppointments(sheets, config);
+  const onboardingAppointments = await readCanonicalOnboardingAppointments(sheets, config, {
+    cache: options.cache,
+    force: options.forceOnboarding === true,
+    persist: false
+  });
   // ONBOARDING is the canonical row order for monthly sheets. Interactive writes may
   // only mention one appointment, but we still rebuild against the full roster order.
   const preferredAppointments = onboardingAppointments.length > 0
     ? onboardingAppointments
     : appointments;
+  const existingRows = await readMonthlySheetRows(
+    sheets,
+    config.spreadsheetId,
+    title,
+    header.length,
+    config.rosterStopMarkers,
+    preferredAppointments
+  );
+  const liveSlice = createMonthSliceFromValues(
+    date,
+    await readSheetValues(sheets, config.spreadsheetId, title, "A1:ZZ1000"),
+    config,
+    preferredAppointments
+  );
+
+  if ((liveSlice.unexpectedAppointments?.length ?? 0) > 0 || (liveSlice.duplicateAppointments?.length ?? 0) > 0) {
+    return {
+      title,
+      appointments: preferredAppointments,
+      blockedByDrift: true,
+      driftReasons: {
+        unexpectedAppointments: liveSlice.unexpectedAppointments,
+        duplicateAppointments: liveSlice.duplicateAppointments
+      }
+    };
+  }
+
   const { nextAppointments, nextRows } = buildManagedMonthlyRows({
     preferredAppointments,
     requestedAppointments: appointments,
@@ -862,10 +1388,13 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
 }
 
 async function readSheetColumnValues(sheets, spreadsheetId, title, columnLabel) {
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${title}'!${columnLabel}2:${columnLabel}1000`
-  });
+  const response = await runGoogleSheetsRequest(
+    `spreadsheets.values.get:${title}:${columnLabel}`,
+    () => sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${title}'!${columnLabel}2:${columnLabel}1000`
+    })
+  );
 
   return (response.data.values ?? []).map(([value]) => String(value ?? "").trim());
 }
@@ -888,54 +1417,55 @@ function buildSummaryCounts(values) {
     total,
     present: countStatuses(activeValues, [
       "PRESENT",
-      "CNB (AM)",
-      "CNB (PM)",
-      "CNB",
       "DUTY",
-      "D1",
-      "D2",
-      "D3",
-      "POOD (DAY)",
-      "U/S",
-      "OOD"
     ]),
-    tnb: countStatuses(activeValues, ["TNB"]),
     accountedAttendance,
     unaccounted: total - accountedAttendance,
-    os: countStatuses(activeValues, ["OS"]),
+    ph: countStatuses(activeValues, ["PH"]),
     osd: countStatuses(activeValues, ["OSD"]),
-    ippt: countStatuses(activeValues, ["IPPT"]),
-    orca: countStatuses(activeValues, ["ORCA"]),
-    fmss: countStatuses(activeValues, ["FMSS"]),
     oe: countStatuses(activeValues, ["OE"]),
-    ll: countStatuses(activeValues, ["LL", "AM LEAVE", "PM LEAVE"]),
-    ol: countStatuses(activeValues, ["OL"]),
-    oc: countStatuses(activeValues, ["OC"]),
-    ao: countStatuses(activeValues, ["AO", "68", "69", "70", "71", "73"]),
-    rsoRsi: countStatuses(activeValues, ["RSO", "RSI"]),
-    mcOml: countStatuses(activeValues, ["MC", "OML"]),
-    ccl: countStatuses(activeValues, ["CCL", "CCL (AM)", "CCL (PM)"]),
-    csl: countStatuses(activeValues, ["CSL", "CSL (AM)", "CSL (PM)"]),
-    ptl: countStatuses(activeValues, ["PTL"]),
-    pcl: countStatuses(activeValues, ["PCL", "PCL (AM)", "PCL (PM)"]),
-    rr: countStatuses(activeValues, ["RR"]),
-    sr: countStatuses(activeValues, ["SR"]),
-    ma: countStatuses(activeValues, ["MA"]),
     wfh: countStatuses(activeValues, ["WFH"]),
-    offOil: countStatuses(activeValues, [
+    fishing: countStatuses(activeValues, ["FISHING"]),
+    off: countStatuses(activeValues, [
       "OFF",
       "OIL",
       "OFF (AM)",
       "OFF (PM)",
       "DISEMBARK OFF",
-      "EMBARK OFF"
+      "EMBARK OFF",
+      "RR",
+      "SR"
     ]),
-    compassionate: countStatuses(activeValues, ["COMPASSIONATE"]),
-    hl: countStatuses(activeValues, ["HL"]),
-    ph: countStatuses(activeValues, ["PH"]),
-    shro: countStatuses(activeValues, ["SHRO"]),
-    yard: countStatuses(activeValues, ["YARD", "YARD (AM)", "YARD (PM)"]),
-    fishing: countStatuses(activeValues, ["FISHING"])
+    outstationed: countStatuses(activeValues, [
+      "OS",
+      "TNB",
+      "YARD",
+      "YARD (AM)",
+      "YARD (PM)",
+      "ORCA"
+    ]),
+    reportSick: countStatuses(activeValues, ["RSO", "MC", "OML", "MA", "HL", "RSI"]),
+    localLeave: countStatuses(activeValues, [
+      "LL",
+      "AM LEAVE",
+      "PM LEAVE",
+      "CCL",
+      "CCL (AM)",
+      "CCL (PM)",
+      "PCL",
+      "PCL (AM)",
+      "PCL (PM)",
+      "CSL",
+      "CSL (AM)",
+      "CSL (PM)",
+      "COMPASSIONATE",
+      "PTL"
+    ]),
+    overseasLeave: countStatuses(activeValues, ["OL"]),
+    attachedOut: countStatuses(activeValues, ["AO", "68", "69", "70", "71", "73"]),
+    onCourse: countStatuses(activeValues, ["OC"]),
+    postedOut: countStatuses(values, ["ORD", "POST OUT"]),
+    inBase: countStatuses(activeValues, ["IPPT", "FMSS", "CNB", "CST", "DCTC"])
   };
 }
 
@@ -1109,16 +1639,57 @@ function createMonthlySnapshotFromValues(date, values, config) {
 
 function createMonthSliceFromValues(date, values, config, appointments) {
   const headerRow = (values[0] ?? []).map((value) => String(value ?? "").trim());
-  const snapshot = alignSnapshotToAppointments(
-    createMonthlySnapshotFromValues(date, values, config),
-    appointments,
-    date,
-    config.timezone
+  const headerLength = Math.max(headerRow.length, 1);
+  const liveManagedRows = buildLiveManagedMonthlyRows(
+    values,
+    headerLength,
+    config.rosterStopMarkers,
+    appointments
   );
   const dateColumnMap = buildDateColumnMap(headerRow, date, config.timezone);
-  const rowNumbersByAppointment = Object.fromEntries(
-    appointments.map((appointment, index) => [appointment, index + 2])
+  const liveRowsByIdentity = new Map();
+
+  for (const liveRow of liveManagedRows) {
+    const identity = normalizeAppointmentIdentity(liveRow.appointment);
+
+    if (!liveRowsByIdentity.has(identity)) {
+      liveRowsByIdentity.set(identity, []);
+    }
+
+    liveRowsByIdentity.get(identity).push(liveRow);
+  }
+
+  const rowNumbersByAppointment = {};
+  const duplicateAppointments = [];
+  const missingAppointments = [];
+  const snapshot = createEmptyMonthlySnapshot(date, config.timezone, appointments);
+
+  for (const appointment of appointments) {
+    const matchingRows = liveRowsByIdentity.get(normalizeAppointmentIdentity(appointment)) ?? [];
+
+    if (matchingRows.length === 1) {
+      const liveRow = matchingRows[0];
+      rowNumbersByAppointment[appointment] = liveRow.rowNumber;
+      const appointmentIndex = snapshot.appointments.findIndex((value) => value === appointment);
+
+      for (let day = 1; day <= daysInMonth(date, config.timezone); day += 1) {
+        const columnIndex = dateColumnMap.get(day);
+        snapshot.statusesByDay.get(day)[appointmentIndex] =
+          columnIndex === undefined ? "" : String(liveRow.row[columnIndex] ?? "").trim();
+      }
+    } else if (matchingRows.length > 1) {
+      duplicateAppointments.push(appointment);
+    } else {
+      missingAppointments.push(appointment);
+    }
+  }
+
+  const canonicalIdentitySet = new Set(
+    appointments.map((appointment) => normalizeAppointmentIdentity(appointment))
   );
+  const unexpectedAppointments = liveManagedRows
+    .filter((liveRow) => !canonicalIdentitySet.has(normalizeAppointmentIdentity(liveRow.appointment)))
+    .map((liveRow) => liveRow.appointment);
 
   return {
     title: getMonthParts(date, config.timezone).title,
@@ -1128,6 +1699,10 @@ function createMonthSliceFromValues(date, values, config, appointments) {
     ),
     appointments,
     rowNumbersByAppointment,
+    liveAppointmentOrder: liveManagedRows.map((row) => row.appointment),
+    duplicateAppointments,
+    missingAppointments,
+    unexpectedAppointments,
     managedAreaHash: computeManagedAreaHash({
       appointments,
       recognizedDateColumns: Object.fromEntries(
@@ -1301,7 +1876,10 @@ async function updateSpreadsheetMetadataCache(sheets, config, cache, force = fal
     return cache.spreadsheetMetadata;
   }
 
-  const spreadsheet = await getSpreadsheet(sheets, config.spreadsheetId);
+  const spreadsheet = await getSpreadsheet(sheets, config.spreadsheetId, {
+    cache,
+    force
+  });
   const sheetIdsByTitle = Object.fromEntries(
     (spreadsheet.sheets ?? [])
       .map((entry) => [entry.properties?.title, entry.properties?.sheetId])
@@ -1331,20 +1909,28 @@ async function refreshOnboardingSlice(sheets, config, options = {}) {
   }
 
   const title = config.onboardingSheetTitle;
-  const ensuredSheet = await ensureSheet(sheets, config.spreadsheetId, title);
+  const ensuredSheet = await ensureSheet(sheets, config.spreadsheetId, title, { cache });
   const values = await readSheetValues(sheets, config.spreadsheetId, title, "A1:B1000");
   const headerRow = (values[0] ?? []).map((value) => String(value ?? "").trim());
   const parsed = parseOnboardingManagedRows(values, config.rosterStopMarkers);
   const stopMarker = getPrimaryStopMarker(config.rosterStopMarkers);
+  const codeByAppointment = new Map(
+    parsed.managedRows.map((row) => [row.appointment, row.secretCode])
+  );
 
   const slice = {
     title,
     sheetId: ensuredSheet.sheet.properties?.sheetId ?? null,
     headerRow: headerRow.length > 0 ? headerRow : ["Appointment", "Secret Code"],
+    sourceAppointments: parsed.appointments,
     appointments: parsed.appointments,
-    codeEntries: parsed.managedRows.map((row) => ({
-      appointment: row.appointment,
-      secretCode: row.secretCode
+    orderWasNormalized: false,
+    duplicateAppointments: parsed.duplicateAppointments,
+    hasBlankRowDrift: parsed.hasBlankRowDrift,
+    blankRowNumbers: parsed.blankRowNumbers,
+    codeEntries: parsed.appointments.map((appointment) => ({
+      appointment,
+      secretCode: codeByAppointment.get(appointment) ?? ""
     })),
     stopRowNumber: parsed.stopRowNumber,
     boundaryRowNumber: parsed.boundaryRowNumber,
@@ -1354,7 +1940,7 @@ async function refreshOnboardingSlice(sheets, config, options = {}) {
     hadInlineStopMarkerDrift: parsed.hadInlineStopMarkerDrift,
     managedAreaHash: computeManagedAreaHash({
       appointments: parsed.appointments,
-      codes: parsed.managedRows.map((row) => row.secretCode),
+      codes: parsed.appointments.map((appointment) => codeByAppointment.get(appointment) ?? ""),
       boundaryRowNumber: parsed.boundaryRowNumber
     }),
     fetchedAt: new Date().toISOString()
@@ -1513,6 +2099,7 @@ export function buildQueuedAttendanceEventMetadata(snapshotBundle, config, entry
 }
 
 async function restoreMonthlySheetFromSnapshot(sheets, config, date, snapshot) {
+  const cache = await readLocalSheetCache();
   const { title } = getMonthParts(date, config.timezone);
   const header = await readHeaderRow(
     sheets,
@@ -1520,7 +2107,10 @@ async function restoreMonthlySheetFromSnapshot(sheets, config, date, snapshot) {
     title,
     getDefaultHeaderRow(date, config.timezone)
   );
-  const canonicalAppointments = await readCanonicalOnboardingAppointments(sheets, config);
+  const canonicalAppointments = await readCanonicalOnboardingAppointments(sheets, config, {
+    cache,
+    persist: false
+  });
   const alignedSnapshot = alignSnapshotToAppointments(
     snapshot,
     canonicalAppointments,
@@ -1528,8 +2118,8 @@ async function restoreMonthlySheetFromSnapshot(sheets, config, date, snapshot) {
     config.timezone
   );
 
-  await ensureMonthlyAttendanceSheet(sheets, config, date, canonicalAppointments, "replace");
-  const restoredSheet = await getSheetByTitle(sheets, config.spreadsheetId, title);
+  await ensureMonthlyAttendanceSheet(sheets, config, date, canonicalAppointments, "replace", { cache });
+  const restoredSheet = await getSheetByTitle(sheets, config.spreadsheetId, title, { cache });
   const existingRows = await readMonthlySheetRows(
     sheets,
     config.spreadsheetId,
@@ -1584,7 +2174,10 @@ async function persistAttendanceEntriesToLocalCache(sheets, config, entries) {
   const cache = await readLocalSheetCache();
   const snapshots = { ...(cache.snapshots ?? {}) };
   const monthSlices = { ...(cache.monthSlices ?? {}) };
-  const canonicalAppointments = await readCanonicalOnboardingAppointments(sheets, config);
+  const canonicalAppointments = await readCanonicalOnboardingAppointments(sheets, config, {
+    cache,
+    persist: false
+  });
   const canonicalSet = new Set(canonicalAppointments);
 
   for (const entry of entries) {
@@ -1662,7 +2255,7 @@ async function refreshMonthSlice(sheets, config, input, options = {}) {
     force: options.force === true,
     persist: false
   });
-  await ensureMonthlyAttendanceSheet(sheets, config, date, onboardingSlice.appointments, "merge");
+  await ensureMonthlyAttendanceSheet(sheets, config, date, onboardingSlice.appointments, "merge", { cache });
   const values = await readSheetValues(sheets, config.spreadsheetId, title);
   const slice = createMonthSliceFromValues(date, values, config, onboardingSlice.appointments);
 
@@ -1704,16 +2297,21 @@ function buildSummaryPayload(date, sheetTitle, rosterValues) {
 }
 
 async function readSheetValues(sheets, spreadsheetId, title, range = "A1:ZZ1000") {
-  const response = await sheets.spreadsheets.values.get({
-    spreadsheetId,
-    range: `'${title}'!${range}`
-  });
+  const response = await runGoogleSheetsRequest(
+    `spreadsheets.values.get:${title}:${range}`,
+    () => sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${title}'!${range}`
+    })
+  );
 
   return response.data.values ?? [];
 }
 
-async function seedOnboardingSheet(sheets, config) {
-  const spreadsheet = await getSpreadsheet(sheets, config.spreadsheetId);
+async function seedOnboardingSheet(sheets, config, options = {}) {
+  const cache = options.cache ?? (await readLocalSheetCache());
+  await updateSpreadsheetMetadataCache(sheets, config, cache, false);
+  const spreadsheet = await getSpreadsheet(sheets, config.spreadsheetId, { cache });
   const currentMonthTitle = getMonthParts(new Date(), config.timezone).title;
   const currentSheet = spreadsheet.sheets?.find(
     (entry) => entry.properties?.title === currentMonthTitle
@@ -1744,7 +2342,7 @@ async function seedOnboardingSheet(sheets, config) {
     })[0];
 
   if (!latestMonthSheet) {
-    return [];
+    return [...DEFAULT_BOOTSTRAP_APPOINTMENTS];
   }
 
   return (
@@ -1757,9 +2355,13 @@ async function seedOnboardingSheet(sheets, config) {
   ).appointments;
 }
 
-async function readCurrentMonthAppointments(sheets, config) {
+async function readCurrentMonthAppointments(sheets, config, options = {}) {
   const currentMonthTitle = getMonthParts(new Date(), config.timezone).title;
-  const currentSheet = await getSheetByTitle(sheets, config.spreadsheetId, currentMonthTitle);
+  const cache = options.cache ?? (await readLocalSheetCache());
+  await updateSpreadsheetMetadataCache(sheets, config, cache, false);
+  const currentSheet = await getSheetByTitle(sheets, config.spreadsheetId, currentMonthTitle, {
+    cache
+  });
 
   if (!currentSheet) {
     return [];
@@ -1775,6 +2377,22 @@ async function readCurrentMonthAppointments(sheets, config) {
   ).appointments;
 }
 
+function getBootstrapAppointments(appointments) {
+  return appointments.length > 0
+    ? appointments
+    : [...DEFAULT_BOOTSTRAP_APPOINTMENTS];
+}
+
+function getRecentMonthTitles(baseDate, timezone, count) {
+  const titles = [];
+
+  for (let offset = 0; offset < count; offset += 1) {
+    titles.push(getMonthParts(shiftMonth(baseDate, timezone, -offset), timezone).title);
+  }
+
+  return titles;
+}
+
 export function createGoogleSheetsClient(config) {
   const auth = new google.auth.JWT({
     email: config.googleServiceAccountEmail,
@@ -1785,10 +2403,10 @@ export function createGoogleSheetsClient(config) {
   return google.sheets({ version: "v4", auth });
 }
 
-export async function syncOnboardingRoster(sheets, config) {
+export async function syncOnboardingRoster(sheets, config, options = {}) {
+  const cache = options.cache ?? (await readLocalSheetCache());
   const title = config.onboardingSheetTitle;
-  const ensuredSheet = await ensureSheet(sheets, config.spreadsheetId, title);
-  const onboardingSheetWasMissing = ensuredSheet.created;
+  await ensureSheet(sheets, config.spreadsheetId, title, { cache });
   await ensureHeaderRowIfBlank(
     sheets,
     config.spreadsheetId,
@@ -1796,49 +2414,77 @@ export async function syncOnboardingRoster(sheets, config) {
     ["Appointment", "Secret Code"]
   );
 
-  let onboardingSlice = await refreshOnboardingSlice(sheets, config, { force: true });
-
+  let onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+    cache,
+    force: true,
+    persist: false
+  });
   if (onboardingSlice.appointments.length === 0) {
-    const onboardingAppointments = onboardingSheetWasMissing
-      ? await readCurrentMonthAppointments(sheets, config)
-      : await seedOnboardingSheet(sheets, config);
     await writeAppointmentColumn(
       sheets,
       config.spreadsheetId,
       title,
-      onboardingAppointments,
-      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers }
+      getBootstrapAppointments(await seedOnboardingSheet(sheets, config, { cache })),
+      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
     );
-    onboardingSlice = await refreshOnboardingSlice(sheets, config, { force: true });
-  } else if (
-    onboardingSlice.stopMarkerMissing ||
-    onboardingSlice.hadInlineStopMarkerDrift
-  ) {
+    onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+      cache,
+      force: true,
+      persist: false
+    });
+  } else if (onboardingSlice.stopMarkerMissing) {
     await writeAppointmentColumn(
       sheets,
       config.spreadsheetId,
       title,
       onboardingSlice.appointments,
-      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers }
+      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
     );
-    onboardingSlice = await refreshOnboardingSlice(sheets, config, { force: true });
+    onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+      cache,
+      force: true,
+      persist: false
+    });
   }
   const onboardingAppointments = onboardingSlice.appointments;
+  const driftDetected =
+    onboardingSlice.hasBlankRowDrift ||
+    (onboardingSlice.duplicateAppointments?.length ?? 0) > 0 ||
+    onboardingSlice.hadInlineStopMarkerDrift;
+
+  if (driftDetected) {
+    return {
+      onboardingAppointments,
+      currentMonthTitle: getMonthParts(new Date(), config.timezone).title,
+      nextMonthTitle: getMonthParts(
+        shiftMonth(new Date(), config.timezone, 1),
+        config.timezone
+      ).title,
+      driftDetected: true
+    };
+  }
 
   const currentMonth = await ensureMonthlyAttendanceSheet(
     sheets,
     config,
     new Date(),
     onboardingAppointments,
-    "merge"
+    "merge",
+    { cache }
   );
   const nextMonth = await ensureMonthlyAttendanceSheet(
     sheets,
     config,
     shiftMonth(new Date(), config.timezone, 1),
     onboardingAppointments,
-    "replace"
+    "replace",
+    { cache }
   );
+
+  if (options.persist !== false) {
+    cache.updatedAt = new Date().toISOString();
+    await writeLocalSheetCache(cache);
+  }
 
   return {
     onboardingAppointments,
@@ -1848,8 +2494,9 @@ export async function syncOnboardingRoster(sheets, config) {
 }
 
 export async function syncOnboardingCodeColumn(sheets, config, codeEntries) {
+  const cache = await readLocalSheetCache();
   const title = config.onboardingSheetTitle;
-  await ensureSheet(sheets, config.spreadsheetId, title);
+  await ensureSheet(sheets, config.spreadsheetId, title, { cache });
   await ensureHeaderRowIfBlank(
     sheets,
     config.spreadsheetId,
@@ -1857,7 +2504,11 @@ export async function syncOnboardingCodeColumn(sheets, config, codeEntries) {
     ["Appointment", "Secret Code"]
   );
 
-  const onboardingSlice = await refreshOnboardingSlice(sheets, config, { force: true });
+  const onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+    cache,
+    force: true,
+    persist: false
+  });
   const codeMap = new Map(codeEntries.map((entry) => [entry.appointment, entry.secretCode]));
   const rows = onboardingSlice.appointments.map((appointment) => [
     appointment,
@@ -1868,13 +2519,15 @@ export async function syncOnboardingCodeColumn(sheets, config, codeEntries) {
     config.spreadsheetId,
     title,
     rows,
-    config.rosterStopMarkers
+    config.rosterStopMarkers,
+    { cache }
   );
-  await refreshOnboardingSlice(sheets, config, { force: true });
+  await refreshOnboardingSlice(sheets, config, { cache, force: true });
 }
 
 export async function addAppointmentToSheets(sheets, config, appointment) {
-  await ensureSheet(sheets, config.spreadsheetId, config.onboardingSheetTitle);
+  const cache = await readLocalSheetCache();
+  await ensureSheet(sheets, config.spreadsheetId, config.onboardingSheetTitle, { cache });
   await ensureHeaderRowIfBlank(
     sheets,
     config.spreadsheetId,
@@ -1887,34 +2540,39 @@ export async function addAppointmentToSheets(sheets, config, appointment) {
     config.onboardingSheetTitle,
     config.rosterStopMarkers
   );
-  const nextAppointments = [...onboarding.appointments, appointment];
+  const nextAppointments = [...onboarding.appointments];
+
+  if (!nextAppointments.some((entry) => normalizeAppointmentIdentity(entry) === normalizeAppointmentIdentity(appointment))) {
+    nextAppointments.push(appointment);
+  }
   await writeAppointmentColumn(
     sheets,
     config.spreadsheetId,
     config.onboardingSheetTitle,
     nextAppointments,
-    { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers }
+    { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
   );
-  await refreshOnboardingSlice(sheets, config, { force: true });
+  await refreshOnboardingSlice(sheets, config, { cache, force: true, persist: false });
 
-  await ensureMonthlyAttendanceSheet(sheets, config, new Date(), nextAppointments, "merge");
+  await ensureMonthlyAttendanceSheet(sheets, config, new Date(), nextAppointments, "merge", { cache });
   await ensureMonthlyAttendanceSheet(
     sheets,
     config,
     shiftMonth(new Date(), config.timezone, 1),
     nextAppointments,
-    "replace"
+    "replace",
+    { cache }
   );
 }
 
 export async function removeAppointmentFromSheets(sheets, config, appointment) {
-  await ensureSheet(sheets, config.spreadsheetId, config.onboardingSheetTitle);
-  const onboarding = await readAppointmentColumn(
-    sheets,
-    config.spreadsheetId,
-    config.onboardingSheetTitle,
-    config.rosterStopMarkers
-  );
+  const cache = await readLocalSheetCache();
+  await ensureSheet(sheets, config.spreadsheetId, config.onboardingSheetTitle, { cache });
+  const onboarding = await refreshOnboardingSlice(sheets, config, {
+    cache,
+    force: true,
+    persist: false
+  });
   const nextAppointments = onboarding.appointments.filter(
     (entry) => entry.toUpperCase() !== appointment.toUpperCase()
   );
@@ -1923,17 +2581,18 @@ export async function removeAppointmentFromSheets(sheets, config, appointment) {
     config.spreadsheetId,
     config.onboardingSheetTitle,
     nextAppointments,
-    { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers }
+    { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
   );
-  await refreshOnboardingSlice(sheets, config, { force: true });
+  await refreshOnboardingSlice(sheets, config, { cache, force: true, persist: false });
 
-  await ensureMonthlyAttendanceSheet(sheets, config, new Date(), nextAppointments, "replace");
+  await ensureMonthlyAttendanceSheet(sheets, config, new Date(), nextAppointments, "replace", { cache });
   await ensureMonthlyAttendanceSheet(
     sheets,
     config,
     shiftMonth(new Date(), config.timezone, 1),
     nextAppointments,
-    "replace"
+    "replace",
+    { cache }
   );
 }
 
@@ -1964,16 +2623,39 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
   const writtenEventIds = [];
   const skippedEvents = [];
   const conflictedEvents = [];
+  const cache = await readLocalSheetCache();
+
+  await updateSpreadsheetMetadataCache(sheets, config, cache, false);
+  await refreshOnboardingSlice(sheets, config, {
+    cache,
+    force: false,
+    persist: false
+  });
 
   for (const [sheetTitle, sheetEntries] of entriesBySheet.entries()) {
     const appointments = [...new Set(sheetEntries.map((entry) => entry.appointment))];
-    await ensureMonthlyAttendanceSheet(sheets, config, sheetEntries[0].date, appointments, "merge");
-    const liveSlice = await refreshMonthSlice(sheets, config, sheetEntries[0].date, { force: true });
+    await ensureMonthlyAttendanceSheet(sheets, config, sheetEntries[0].date, appointments, "merge", { cache });
+    const liveSlice = await refreshMonthSlice(sheets, config, sheetEntries[0].date, {
+      cache,
+      force: true,
+      persist: false
+    });
     const appointmentRows = new Map(
-      liveSlice.appointments.map((appointment, index) => [appointment, index + 2])
+      Object.entries(liveSlice.rowNumbersByAppointment ?? {})
     );
     const headerRow = liveSlice.headerRow;
     const data = [];
+
+    if ((liveSlice.unexpectedAppointments?.length ?? 0) > 0) {
+      conflictedEvents.push(
+        ...sheetEntries.map((entry) => ({
+          eventId: entry.id,
+          reason: "sheet_layout_changed",
+          error: `Unexpected managed rows found in ${sheetTitle}: ${liveSlice.unexpectedAppointments.join(", ")}`
+        }))
+      );
+      continue;
+    }
 
     for (const entry of sheetEntries) {
       const rowNumber = appointmentRows.get(entry.appointment);
@@ -1981,7 +2663,9 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
       if (!rowNumber) {
         conflictedEvents.push({
           eventId: entry.id,
-          reason: "appointment_missing",
+          reason: liveSlice.duplicateAppointments?.includes(entry.appointment)
+            ? "duplicate_appointment_row"
+            : "appointment_missing",
           error: `Appointment row not found for ${entry.appointment}`
         });
         continue;
@@ -2036,13 +2720,15 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
     }
 
     if (data.length > 0) {
-      await sheets.spreadsheets.values.batchUpdate({
-        spreadsheetId: config.spreadsheetId,
-        requestBody: {
-          valueInputOption: "USER_ENTERED",
-          data
-        }
-      });
+      await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${sheetTitle}:attendanceWrite`, () =>
+        sheets.spreadsheets.values.batchUpdate({
+          spreadsheetId: config.spreadsheetId,
+          requestBody: {
+            valueInputOption: "USER_ENTERED",
+            data
+          }
+        })
+      );
     }
   }
 
@@ -2113,6 +2799,21 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
       (entry) => (entry.targetSheetTitle ?? getMonthParts(entry.date, config.timezone).title) === title
     );
 
+    if ((remoteSlice.unexpectedAppointments?.length ?? 0) > 0) {
+      conflictedEvents.push(
+        ...monthEntries.map((entry) => ({
+          eventId: entry.id,
+          reason: "sheet_layout_changed",
+          error: `Unexpected managed rows found in ${title}: ${remoteSlice.unexpectedAppointments.join(", ")}`
+        }))
+      );
+      mergedSlices.set(title, {
+        ...remoteSlice,
+        snapshot: resolvedSnapshot
+      });
+      continue;
+    }
+
     for (const entry of monthEntries) {
       const day = dayOfMonth(entry.date, config.timezone);
       const columnIndex = Number(remoteSlice.recognizedDateColumns?.[String(day)] ?? -1);
@@ -2121,7 +2822,9 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
       if (!rowNumber) {
         conflictedEvents.push({
           eventId: entry.id,
-          reason: "appointment_missing",
+          reason: remoteSlice.duplicateAppointments?.includes(entry.appointment)
+            ? "duplicate_appointment_row"
+            : "appointment_missing",
           error: `Appointment row not found for ${entry.appointment}`
         });
         continue;
@@ -2187,13 +2890,15 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
   }
 
   if (data.length > 0) {
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId: config.spreadsheetId,
-      requestBody: {
-        valueInputOption: "USER_ENTERED",
-        data
-      }
-    });
+    await runGoogleSheetsRequest("spreadsheets.values.batchUpdate:reconcilePending", () =>
+      sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: config.spreadsheetId,
+        requestBody: {
+          valueInputOption: "USER_ENTERED",
+          data
+        }
+      })
+    );
   }
 
   for (const [title, slice] of mergedSlices.entries()) {
@@ -2208,7 +2913,8 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
 }
 
 export async function ensureNextMonthSheetExists(sheets, config) {
-  const roster = await syncOnboardingRoster(sheets, config);
+  const cache = await readLocalSheetCache();
+  const roster = await syncOnboardingRoster(sheets, config, { cache });
   return roster.nextMonthTitle;
 }
 
@@ -2283,13 +2989,19 @@ export async function summarizeStatuses(sheets, config, options = {}) {
 }
 
 export async function summarizeAttendanceOptionUsage(sheets, config) {
-  const spreadsheet = await getSpreadsheet(sheets, config.spreadsheetId);
+  const cache = await readLocalSheetCache();
+  await updateSpreadsheetMetadataCache(sheets, config, cache, false);
+  const spreadsheet = await getSpreadsheet(sheets, config.spreadsheetId, { cache });
+  const recentMonthTitleSet = new Set(
+    getRecentMonthTitles(new Date(), config.timezone, ATTENDANCE_OPTION_USAGE_MONTH_WINDOW)
+  );
   const monthTitles = (spreadsheet.sheets ?? [])
     .map((entry) => entry.properties?.title)
     .filter(Boolean)
     .map(parseMonthSheetTitle)
     .filter(Boolean)
-    .map((entry) => entry.title);
+    .map((entry) => entry.title)
+    .filter((title) => recentMonthTitleSet.has(title));
   const counts = new Map(config.attendanceOptions.map((option) => [option, 0]));
 
   for (const title of monthTitles) {
@@ -2331,11 +3043,21 @@ export async function summarizeAttendanceOptionUsage(sheets, config) {
 }
 
 export const __testing = {
+  DEFAULT_BOOTSTRAP_APPOINTMENTS,
+  ATTENDANCE_OPTION_USAGE_MONTH_WINDOW,
   buildQueuedAttendanceEventMetadata,
   buildManagedMonthlyRows,
+  buildLiveManagedMonthlyRows,
   buildDateColumnMap,
   buildHeaderUpdateRequest,
+  createMonthSliceFromValues,
+  getRecentMonthTitles,
+  getBootstrapAppointments,
+  isRetryableGoogleSheetsError,
+  orderAppointmentsCanonically,
+  parseAppointmentOrderingMetadata,
   parseOnboardingManagedRows,
+  runGoogleSheetsRequest,
   ensureHeaderRowIfBlank,
   getExpectedDateHeaderLabel,
   getMonthParts,

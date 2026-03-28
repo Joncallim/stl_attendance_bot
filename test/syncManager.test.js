@@ -22,8 +22,8 @@ test("sync manager serializes overlapping cycles and tracks timestamps", async (
   });
 
   await Promise.all([
-    syncManager.runCycle({ force: true }),
-    syncManager.runCycle({ force: true })
+    syncManager.runCycle({ force: true, reason: "five-minute" }),
+    syncManager.runCycle({ force: true, reason: "five-minute" })
   ]);
 
   assert.deepEqual(calls, ["flush", "onboarding", "cache", "months"]);
@@ -33,4 +33,5 @@ test("sync manager serializes overlapping cycles and tracks timestamps", async (
   assert.ok(status.lastQueueFlushAt > 0);
   assert.ok(status.lastOnboardingRefreshAt > 0);
   assert.ok(status.lastMonthRefreshAt > 0);
+  assert.ok(status.lastFiveMinuteReconcileAt > 0);
 });

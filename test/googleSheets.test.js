@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { __testing, reconcilePendingAttendanceWithSheets } from "../src/googleSheets.js";
+import {
+  __testing,
+  reconcilePendingAttendanceWithSheets,
+  summarizeAttendanceOptionUsage,
+  syncOnboardingRoster
+} from "../src/googleSheets.js";
 
 function createFakeSheets(columnValues) {
   const calls = {
@@ -52,6 +57,325 @@ function createFakeSheets(columnValues) {
   };
 }
 
+function createInMemorySheets(initialSheets = {}) {
+  let nextSheetId = Math.max(
+    0,
+    ...Object.values(initialSheets).map((sheet) => Number(sheet.sheetId) || 0)
+  ) + 1;
+  const sheetEntries = new Map(
+    Object.entries(initialSheets).map(([title, sheet]) => [
+      title,
+      {
+        sheetId: sheet.sheetId,
+        values: (sheet.values ?? []).map((row) => [...row])
+      }
+    ])
+  );
+  const calls = {
+    getSpreadsheet: 0,
+    addedSheets: [],
+    valueUpdates: [],
+    batchValueUpdates: [],
+    batchUpdateRequests: []
+  };
+
+  function parseColumnLabel(label) {
+    return label.split("").reduce((total, character) => (total * 26) + character.charCodeAt(0) - 64, 0) - 1;
+  }
+
+  function parseRange(range) {
+    const [, title, startLabel, startRowRaw, endLabel, endRowRaw] =
+      range.match(/^'(.+)'!([A-Z]+)(\d+)(?::([A-Z]+)(\d+)?)?$/) ?? [];
+
+    if (!title) {
+      throw new Error(`Unsupported range: ${range}`);
+    }
+
+    const startColumnIndex = parseColumnLabel(startLabel);
+    const endColumnIndex = parseColumnLabel(endLabel ?? startLabel);
+    const startRowIndex = Number(startRowRaw) - 1;
+    const endRowIndex = endRowRaw ? Number(endRowRaw) - 1 : null;
+
+    return {
+      title,
+      startColumnIndex,
+      endColumnIndex,
+      startRowIndex,
+      endRowIndex
+    };
+  }
+
+  function ensureSheetEntry(title) {
+    const existing = sheetEntries.get(title);
+
+    if (existing) {
+      return existing;
+    }
+
+    const created = {
+      sheetId: nextSheetId,
+      values: []
+    };
+    nextSheetId += 1;
+    sheetEntries.set(title, created);
+    return created;
+  }
+
+  function ensureCell(sheet, rowIndex, columnIndex) {
+    while (sheet.values.length <= rowIndex) {
+      sheet.values.push([]);
+    }
+
+    while (sheet.values[rowIndex].length <= columnIndex) {
+      sheet.values[rowIndex].push("");
+    }
+  }
+
+  function setCell(sheet, rowIndex, columnIndex, value) {
+    ensureCell(sheet, rowIndex, columnIndex);
+    sheet.values[rowIndex][columnIndex] = String(value ?? "");
+  }
+
+  function getRangeValues(sheet, parsedRange) {
+    const rows = [];
+    const lastRowIndex =
+      parsedRange.endRowIndex === null
+        ? Math.max(sheet.values.length - 1, parsedRange.startRowIndex)
+        : parsedRange.endRowIndex;
+
+    for (let rowIndex = parsedRange.startRowIndex; rowIndex <= lastRowIndex; rowIndex += 1) {
+      const sourceRow = sheet.values[rowIndex] ?? [];
+      const row = [];
+
+      for (
+        let columnIndex = parsedRange.startColumnIndex;
+        columnIndex <= parsedRange.endColumnIndex;
+        columnIndex += 1
+      ) {
+        row.push(String(sourceRow[columnIndex] ?? ""));
+      }
+
+      while (row.length > 0 && row[row.length - 1] === "") {
+        row.pop();
+      }
+
+      rows.push(row);
+    }
+
+    while (rows.length > 0 && rows[rows.length - 1].length === 0) {
+      rows.pop();
+    }
+
+    return rows;
+  }
+
+  function applyValues(range, values) {
+    const parsedRange = parseRange(range);
+    const sheet = ensureSheetEntry(parsedRange.title);
+
+    values.forEach((row, rowOffset) => {
+      row.forEach((value, columnOffset) => {
+        setCell(
+          sheet,
+          parsedRange.startRowIndex + rowOffset,
+          parsedRange.startColumnIndex + columnOffset,
+          value
+        );
+      });
+    });
+  }
+
+  function clearRange(range) {
+    const parsedRange = parseRange(range);
+    const sheet = ensureSheetEntry(parsedRange.title);
+    const lastRowIndex =
+      parsedRange.endRowIndex === null
+        ? Math.max(sheet.values.length - 1, parsedRange.startRowIndex)
+        : parsedRange.endRowIndex;
+
+    for (let rowIndex = parsedRange.startRowIndex; rowIndex <= lastRowIndex; rowIndex += 1) {
+      for (
+        let columnIndex = parsedRange.startColumnIndex;
+        columnIndex <= parsedRange.endColumnIndex;
+        columnIndex += 1
+      ) {
+        setCell(sheet, rowIndex, columnIndex, "");
+      }
+    }
+  }
+
+  function insertRows(sheetId, startIndex, count) {
+    const entry = [...sheetEntries.values()].find((sheet) => sheet.sheetId === sheetId);
+
+    if (!entry) {
+      return;
+    }
+
+    for (let index = 0; index < count; index += 1) {
+      entry.values.splice(startIndex, 0, []);
+    }
+  }
+
+  function deleteRows(sheetId, startIndex, count) {
+    const entry = [...sheetEntries.values()].find((sheet) => sheet.sheetId === sheetId);
+
+    if (!entry) {
+      return;
+    }
+
+    entry.values.splice(startIndex, count);
+  }
+
+  function moveRows(title, startIndex, count, destinationIndex) {
+    const entry = ensureSheetEntry(title);
+    const movedRows = entry.values.splice(startIndex, count);
+    const adjustedDestination = destinationIndex > startIndex
+      ? destinationIndex - count
+      : destinationIndex;
+    entry.values.splice(adjustedDestination, 0, ...movedRows);
+  }
+
+  function insertColumns(title, startIndex, count) {
+    const entry = ensureSheetEntry(title);
+
+    for (const row of entry.values) {
+      row.splice(startIndex, 0, ...Array.from({ length: count }, () => ""));
+    }
+  }
+
+  function deleteColumns(title, startIndex, count) {
+    const entry = ensureSheetEntry(title);
+
+    for (const row of entry.values) {
+      row.splice(startIndex, count);
+    }
+  }
+
+  return {
+    calls,
+    getSheetValues(title) {
+      return (sheetEntries.get(title)?.values ?? []).map((row) => [...row]);
+    },
+    moveRows,
+    insertColumns,
+    deleteColumns,
+    client: {
+      spreadsheets: {
+        get: async () => {
+          calls.getSpreadsheet += 1;
+          return {
+            data: {
+              sheets: [...sheetEntries.entries()].map(([title, sheet]) => ({
+                properties: {
+                  title,
+                  sheetId: sheet.sheetId
+                }
+              }))
+            }
+          };
+        },
+        batchUpdate: async (request) => {
+          const requests = request.requestBody.requests ?? [];
+          calls.batchUpdateRequests.push(requests);
+
+          const replies = [];
+
+          for (const operation of requests) {
+            if (operation.addSheet) {
+              const title = operation.addSheet.properties.title;
+              const sheet = ensureSheetEntry(title);
+              calls.addedSheets.push(title);
+              replies.push({
+                addSheet: {
+                  properties: {
+                    title,
+                    sheetId: sheet.sheetId
+                  }
+                }
+              });
+              continue;
+            }
+
+            if (operation.insertDimension?.range?.dimension === "ROWS") {
+              insertRows(
+                operation.insertDimension.range.sheetId,
+                operation.insertDimension.range.startIndex,
+                operation.insertDimension.range.endIndex - operation.insertDimension.range.startIndex
+              );
+              continue;
+            }
+
+            if (operation.deleteDimension?.range?.dimension === "ROWS") {
+              deleteRows(
+                operation.deleteDimension.range.sheetId,
+                operation.deleteDimension.range.startIndex,
+                operation.deleteDimension.range.endIndex - operation.deleteDimension.range.startIndex
+              );
+              continue;
+            }
+
+            if (operation.updateCells) {
+              const target = [...sheetEntries.values()].find(
+                (sheet) => sheet.sheetId === operation.updateCells.start.sheetId
+              );
+              const title = [...sheetEntries.entries()].find(
+                ([, sheet]) => sheet.sheetId === operation.updateCells.start.sheetId
+              )?.[0];
+
+              operation.updateCells.rows.forEach((row, rowOffset) => {
+                row.values.forEach((cell, columnOffset) => {
+                  setCell(
+                    target,
+                    operation.updateCells.start.rowIndex + rowOffset,
+                    operation.updateCells.start.columnIndex + columnOffset,
+                    cell.userEnteredValue?.stringValue ?? ""
+                  );
+                });
+              });
+
+              if (title) {
+                calls.valueUpdates.push({ range: `'${title}'!A1`, values: target.values[0] });
+              }
+            }
+          }
+
+          return { data: { replies } };
+        },
+        values: {
+          get: async (request) => {
+            const parsedRange = parseRange(request.range);
+            const sheet = ensureSheetEntry(parsedRange.title);
+            return {
+              data: {
+                values: getRangeValues(sheet, parsedRange)
+              }
+            };
+          },
+          update: async (request) => {
+            calls.valueUpdates.push({
+              range: request.range,
+              values: request.requestBody.values
+            });
+            applyValues(request.range, request.requestBody.values);
+            return {};
+          },
+          clear: async (request) => {
+            clearRange(request.range);
+            return {};
+          },
+          batchUpdate: async (request) => {
+            calls.batchValueUpdates.push(request.requestBody.data);
+            for (const item of request.requestBody.data ?? []) {
+              applyValues(item.range, item.values);
+            }
+            return {};
+          }
+        }
+      }
+    }
+  };
+}
+
 async function withTempDataDir(run) {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "attendance-sheet-cache-"));
   process.env.ATTENDANCE_BOT_DATA_DIR = tempDir;
@@ -61,6 +385,20 @@ async function withTempDataDir(run) {
   } finally {
     delete process.env.ATTENDANCE_BOT_DATA_DIR;
     await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function withMockedFetch(jsonPayload, run) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => jsonPayload
+  });
+
+  try {
+    await run();
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 }
 
@@ -98,11 +436,134 @@ test("managed monthly rows follow onboarding order while preserving existing row
     mode: "merge"
   });
 
-  assert.deepEqual(result.nextAppointments, ["BRAVO", "ALPHA", "CHARLIE"]);
+  assert.deepEqual(result.nextAppointments, ["BRAVO", "ALPHA"]);
   assert.deepEqual(result.nextRows, [
     ["BRAVO", "", ""],
-    ["ALPHA", "PRESENT", ""],
-    ["CHARLIE", "WFH", ""]
+    ["ALPHA", "PRESENT", ""]
+  ]);
+});
+
+test("canonical appointment ordering keeps top block, departments, and variants grouped", () => {
+  const ordered = __testing.orderAppointmentsCanonically([
+    "WS 2",
+    "SCSE (OUT)",
+    "COXN",
+    "ANO 2",
+    "CC2",
+    "CO",
+    "SCSE",
+    "OPS 2",
+    "OPS 1 (B)",
+    "OPS 1",
+    "MS WPL (69)-1",
+    "MS 1",
+    "MS Sup 2",
+    "Chef 1",
+    "CCHEF",
+    "ANO",
+    "XO"
+  ]);
+
+  assert.deepEqual(ordered, [
+    "CO",
+    "XO",
+    "OPS 1",
+    "OPS 1 (B)",
+    "OPS 2",
+    "SCSE",
+    "SCSE (OUT)",
+    "COXN",
+    "ANO",
+    "ANO 2",
+    "CC2",
+    "WS 2",
+    "MS Sup 2",
+    "MS 1",
+    "MS WPL (69)-1",
+    "CCHEF",
+    "Chef 1"
+  ]);
+});
+
+test("comms specialist stays distinct from comms in canonical ordering", () => {
+  const ordered = __testing.orderAppointmentsCanonically([
+    "Comms Specialist 1",
+    "Comms 2",
+    "Chief Comms Specialist",
+    "CComms",
+    "Comms Sup",
+    "Comms Specialist Sup"
+  ]);
+
+  assert.deepEqual(ordered, [
+    "CComms",
+    "Comms Sup",
+    "Comms 2",
+    "Chief Comms Specialist",
+    "Comms Specialist Sup",
+    "Comms Specialist 1"
+  ]);
+});
+
+test("month slice maps row numbers by live appointment labels instead of row index", () => {
+  const slice = __testing.createMonthSliceFromValues(
+    new Date("2026-03-01T12:00:00.000Z"),
+    [
+      ["Appointment", "1 Mar"],
+      ["BRAVO", "WFH"],
+      ["ALPHA", "PRESENT"],
+      ["Remarks", ""]
+    ],
+    {
+      timezone: "Asia/Singapore",
+      rosterStopMarkers: ["Remarks"]
+    },
+    ["ALPHA", "BRAVO"]
+  );
+
+  assert.deepEqual(slice.rowNumbersByAppointment, {
+    ALPHA: 3,
+    BRAVO: 2
+  });
+  assert.equal(slice.snapshot.statusesByDay.get(1)[0], "PRESENT");
+  assert.equal(slice.snapshot.statusesByDay.get(1)[1], "WFH");
+});
+
+test("pure row reordering is repaired by rewriting the managed rows in canonical order", async () => {
+  const fake = createInMemorySheets({
+    "Mar 26": {
+      sheetId: 1,
+      values: [
+        ["Appointment", "1 Mar"],
+        ["BRAVO", "WFH"],
+        ["ALPHA", "PRESENT"],
+        ["Remarks", ""]
+      ]
+    }
+  });
+
+  await __testing.writeMonthlySheetRows(
+    fake.client,
+    "spreadsheet-id",
+    1,
+    "Mar 26",
+    2,
+    ["Appointment", "1 Mar"],
+    "Asia/Singapore",
+    [
+      ["BRAVO", "WFH"],
+      ["ALPHA", "PRESENT"]
+    ],
+    [
+      ["ALPHA", "PRESENT"],
+      ["BRAVO", "WFH"]
+    ],
+    ["Remarks"]
+  );
+
+  assert.deepEqual(fake.getSheetValues("Mar 26").slice(1, 3), [
+    ["ALPHA", "PRESENT"],
+    ["BRAVO", "WFH"]
   ]);
 });
 
@@ -173,7 +634,379 @@ test("onboarding parsing keeps unmanaged rows below the terminal stop marker", (
   assert.deepEqual(parsed.appointments, ["ALPHA", "BRAVO"]);
   assert.equal(parsed.stopRowNumber, 4);
   assert.equal(parsed.stopMarkerMissing, false);
-  assert.equal(parsed.hadInlineStopMarkerDrift, false);
+  assert.equal(parsed.hadInlineStopMarkerDrift, true);
+});
+
+test("onboarding parsing treats blank rows inside the managed block as drift without truncating trailing appointments", () => {
+  const parsed = __testing.parseOnboardingManagedRows([
+    ["Appointment", "Secret Code"],
+    ["ALPHA", "A1"],
+    ["", ""],
+    ["BRAVO", "B1"],
+    ["Remarks", ""]
+  ], ["Remarks"]);
+
+  assert.deepEqual(parsed.appointments, ["ALPHA", "BRAVO"]);
+  assert.equal(parsed.hasBlankRowDrift, true);
+  assert.deepEqual(parsed.blankRowNumbers, [3]);
+  assert.equal(parsed.stopRowNumber, 5);
+});
+
+test("onboarding parsing reports duplicates instead of synthesizing new appointment identities", () => {
+  const parsed = __testing.parseOnboardingManagedRows([
+    ["Appointment", "Secret Code"],
+    ["ALPHA", "A1"],
+    ["ALPHA", "A2"],
+    ["BRAVO", "B1"],
+    ["Remarks", ""]
+  ], ["Remarks"]);
+
+  assert.deepEqual(parsed.appointments, ["ALPHA", "BRAVO"]);
+  assert.deepEqual(parsed.duplicateAppointments, ["ALPHA"]);
+  assert.ok(!parsed.appointments.some((appointment) => appointment.includes("-")));
+});
+
+test("blank bootstrap falls back to USER1, USER2, and USER3", () => {
+  assert.deepEqual(
+    __testing.getBootstrapAppointments([]),
+    __testing.DEFAULT_BOOTSTRAP_APPOINTMENTS
+  );
+  assert.deepEqual(
+    __testing.getBootstrapAppointments(["ALPHA", "BRAVO"]),
+    ["ALPHA", "BRAVO"]
+  );
+});
+
+test("syncOnboardingRoster bootstraps a blank spreadsheet with onboarding and two month sheets", async () => {
+  await withMockedFetch([], async () => {
+    await withTempDataDir(async () => {
+      const fake = createInMemorySheets();
+      const currentMonthTitle = __testing.getMonthParts(new Date(), "Asia/Singapore").title;
+      const nextMonthTitle = __testing.getMonthParts(
+        __testing.shiftMonth(new Date(), "Asia/Singapore", 1),
+        "Asia/Singapore"
+      ).title;
+
+      const result = await syncOnboardingRoster(fake.client, {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      });
+
+      assert.deepEqual(result.onboardingAppointments, ["USER1", "USER2", "USER3"]);
+      assert.equal(result.currentMonthTitle, currentMonthTitle);
+      assert.equal(result.nextMonthTitle, nextMonthTitle);
+      assert.deepEqual(
+        fake.getSheetValues("ONBOARDING").slice(0, 5),
+        [
+          ["Appointment", "Secret Code"],
+          ["USER1", ""],
+          ["USER2", ""],
+          ["USER3", ""],
+          ["Remarks"]
+        ]
+      );
+      assert.equal(fake.getSheetValues(currentMonthTitle)[0][0], "Appointment");
+      assert.equal(fake.getSheetValues(currentMonthTitle)[1][0], "USER1");
+      assert.equal(fake.getSheetValues(nextMonthTitle)[1][0], "USER1");
+    });
+  });
+});
+
+test("syncOnboardingRoster restores onboarding from the latest existing month sheet before using placeholders", async () => {
+  await withMockedFetch([], async () => {
+    await withTempDataDir(async () => {
+      const previousMonthDate = __testing.shiftMonth(new Date(), "Asia/Singapore", -1);
+      const previousMonthTitle = __testing.getMonthParts(previousMonthDate, "Asia/Singapore").title;
+      const currentMonthTitle = __testing.getMonthParts(new Date(), "Asia/Singapore").title;
+      const nextMonthTitle = __testing.getMonthParts(
+        __testing.shiftMonth(new Date(), "Asia/Singapore", 1),
+        "Asia/Singapore"
+      ).title;
+      const previousMonthHeader = ["Appointment"];
+      const previousMonthParts = __testing.getMonthParts(previousMonthDate, "Asia/Singapore");
+
+      for (let day = 1; day <= 2; day += 1) {
+        previousMonthHeader.push(`${day} ${previousMonthParts.month}`);
+      }
+
+      const fake = createInMemorySheets({
+        [previousMonthTitle]: {
+          sheetId: 1,
+          values: [
+            previousMonthHeader,
+            ["ALPHA", "PRESENT", ""],
+            ["BRAVO", "", "WFH"],
+            ["Remarks"]
+          ]
+        }
+      });
+
+      const result = await syncOnboardingRoster(fake.client, {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      });
+
+      assert.deepEqual(result.onboardingAppointments, ["ALPHA", "BRAVO"]);
+      assert.deepEqual(
+        fake.getSheetValues("ONBOARDING").slice(0, 4),
+        [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", ""],
+          ["BRAVO", ""],
+          ["Remarks"]
+        ]
+      );
+      assert.equal(fake.getSheetValues(currentMonthTitle)[1][0], "ALPHA");
+      assert.equal(fake.getSheetValues(nextMonthTitle)[2][0], "BRAVO");
+      assert.ok(!fake.getSheetValues("ONBOARDING").some((row) => row[0] === "USER1"));
+    });
+  });
+});
+
+test("syncOnboardingRoster reuses spreadsheet metadata within one operation", async () => {
+  await withMockedFetch([], async () => {
+    await withTempDataDir(async () => {
+      const fake = createInMemorySheets();
+
+      await syncOnboardingRoster(fake.client, {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      });
+
+      assert.ok(fake.calls.getSpreadsheet <= 2);
+    });
+  });
+});
+
+test("syncOnboardingRoster preserves visible onboarding order as canonical row order", async () => {
+  await withMockedFetch([], async () => {
+    await withTempDataDir(async () => {
+      const currentMonthTitle = __testing.getMonthParts(new Date(), "Asia/Singapore").title;
+      const fake = createInMemorySheets({
+        ONBOARDING: {
+          sheetId: 1,
+          values: [
+            ["Appointment", "Secret Code"],
+            ["BRAVO", "B1"],
+            ["ALPHA", "A1"],
+            ["Remarks", ""]
+          ]
+        }
+      });
+
+      const result = await syncOnboardingRoster(fake.client, {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      });
+
+      assert.deepEqual(result.onboardingAppointments, ["BRAVO", "ALPHA"]);
+      assert.deepEqual(fake.getSheetValues(currentMonthTitle).slice(1, 3).map((row) => row[0]), [
+        "BRAVO",
+        "ALPHA"
+      ]);
+    });
+  });
+});
+
+test("syncOnboardingRoster blocks month repair when unexpected rows exist inside the managed block", async () => {
+  await withMockedFetch([], async () => {
+    await withTempDataDir(async () => {
+      const currentMonthTitle = __testing.getMonthParts(new Date(), "Asia/Singapore").title;
+      const nextMonthTitle = __testing.getMonthParts(
+        __testing.shiftMonth(new Date(), "Asia/Singapore", 1),
+        "Asia/Singapore"
+      ).title;
+      const fake = createInMemorySheets({
+        ONBOARDING: {
+          sheetId: 1,
+          values: [
+            ["Appointment", "Secret Code"],
+            ["ALPHA", "A1"],
+            ["Remarks", ""]
+          ]
+        },
+        [currentMonthTitle]: {
+          sheetId: 2,
+          values: [
+            ["Appointment", `1 ${__testing.getMonthParts(new Date(), "Asia/Singapore").month}`],
+            ["ALPHA", "PRESENT"],
+            ["Manual note", "leave me alone"],
+            ["Remarks", ""]
+          ]
+        },
+        [nextMonthTitle]: {
+          sheetId: 3,
+          values: [
+            ["Appointment", `1 ${__testing.getMonthParts(__testing.shiftMonth(new Date(), "Asia/Singapore", 1), "Asia/Singapore").month}`],
+            ["ALPHA", ""],
+            ["Remarks", ""]
+          ]
+        }
+      });
+
+      await syncOnboardingRoster(fake.client, {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      });
+
+      assert.deepEqual(fake.getSheetValues(currentMonthTitle).slice(1, 4), [
+        ["ALPHA", "PRESENT"],
+        ["Manual note", "leave me alone"],
+        ["Remarks", ""]
+      ]);
+    });
+  });
+});
+
+test("attendance option usage only scans the latest 3 month sheets", async () => {
+  const baseDate = new Date();
+  const recentTitles = __testing.getRecentMonthTitles(baseDate, "Asia/Singapore", 3);
+  const olderTitle = __testing.getMonthParts(
+    __testing.shiftMonth(baseDate, "Asia/Singapore", -3),
+    "Asia/Singapore"
+  ).title;
+  const requestedRanges = [];
+  const sheets = {
+    spreadsheets: {
+      get: async () => ({
+        data: {
+          sheets: [
+            { properties: { title: recentTitles[2], sheetId: 1 } },
+            { properties: { title: recentTitles[1], sheetId: 2 } },
+            { properties: { title: recentTitles[0], sheetId: 3 } },
+            { properties: { title: olderTitle, sheetId: 4 } }
+          ]
+        }
+      }),
+      values: {
+        get: async (request) => {
+          requestedRanges.push(request.range);
+
+          if (request.range.startsWith(`'${recentTitles[0]}'`)) {
+            return { data: { values: [["Appointment", "Day"], ["ALPHA", "PRESENT"], ["Remarks", ""]] } };
+          }
+
+          if (request.range.startsWith(`'${recentTitles[1]}'`)) {
+            return { data: { values: [["Appointment", "Day"], ["ALPHA", "WFH"], ["Remarks", ""]] } };
+          }
+
+          if (request.range.startsWith(`'${recentTitles[2]}'`)) {
+            return { data: { values: [["Appointment", "Day"], ["ALPHA", "OS"], ["Remarks", ""]] } };
+          }
+
+          return { data: { values: [["Appointment", "Day"], ["ALPHA", "MC"], ["Remarks", ""]] } };
+        }
+      }
+    }
+  };
+
+  const counts = await summarizeAttendanceOptionUsage(sheets, {
+    spreadsheetId: "spreadsheet-id",
+    timezone: "Asia/Singapore",
+    rosterStopMarkers: ["Remarks"],
+    attendanceOptions: ["PRESENT", "WFH", "OS", "MC"]
+  });
+
+  assert.equal(counts.PRESENT, 1);
+  assert.equal(counts.WFH, 1);
+  assert.equal(counts.OS, 1);
+  assert.equal(counts.MC, 0);
+  assert.ok(requestedRanges.some((range) => range.startsWith(`'${recentTitles[0]}'`)));
+  assert.ok(requestedRanges.some((range) => range.startsWith(`'${recentTitles[1]}'`)));
+  assert.ok(requestedRanges.some((range) => range.startsWith(`'${recentTitles[2]}'`)));
+  assert.ok(!requestedRanges.some((range) => range.startsWith(`'${olderTitle}'`)));
+});
+
+test("retry wrapper succeeds after retryable 429 errors", async () => {
+  const delays = [];
+  let attempts = 0;
+
+  const result = await __testing.runGoogleSheetsRequest(
+    "retryable-test",
+    async () => {
+      attempts += 1;
+
+      if (attempts < 3) {
+        const error = new Error("Too many requests");
+        error.status = 429;
+        throw error;
+      }
+
+      return "ok";
+    },
+    {
+      sleepFn: async (delayMs) => delays.push(delayMs),
+      randomFn: () => 0,
+      logFn: () => {}
+    }
+  );
+
+  assert.equal(result, "ok");
+  assert.equal(attempts, 3);
+  assert.deepEqual(delays, [0, 0]);
+});
+
+test("retry wrapper stops immediately for non-retryable errors", async () => {
+  let attempts = 0;
+
+  await assert.rejects(
+    __testing.runGoogleSheetsRequest(
+      "non-retryable-test",
+      async () => {
+        attempts += 1;
+        const error = new Error("Bad request");
+        error.status = 400;
+        throw error;
+      },
+      {
+        sleepFn: async () => {},
+        logFn: () => {}
+      }
+    ),
+    /Bad request/
+  );
+
+  assert.equal(attempts, 1);
+});
+
+test("retry wrapper fails after max retry attempts", async () => {
+  let attempts = 0;
+
+  await assert.rejects(
+    __testing.runGoogleSheetsRequest(
+      "exhausted-test",
+      async () => {
+        attempts += 1;
+        const error = new Error("Quota exceeded");
+        error.status = 429;
+        throw error;
+      },
+      {
+        maxAttempts: 3,
+        sleepFn: async () => {},
+        randomFn: () => 0,
+        logFn: () => {}
+      }
+    ),
+    /Quota exceeded/
+  );
+
+  assert.equal(attempts, 3);
 });
 
 test("pending attendance overlays replace the snapshot value seen by the bot", async () => {
@@ -236,6 +1069,51 @@ test("cached summary remains stable when month slices are rebuilt from deseriali
 
   assert.equal(summary.summary.present, 1);
   assert.equal(summary.summary.total, 1);
+});
+
+test("summary groups statuses into the requested major buckets", async () => {
+  const { summarizeStatusesFromSnapshot } = await import("../src/googleSheets.js");
+  const snapshotBundle = {
+    synchronizedAt: new Date().toISOString(),
+    snapshots: new Map([["Mar 26", {
+      title: "Mar 26",
+      appointments: ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"],
+      statusesByDay: new Map([[24, [
+        "PRESENT",
+        "PH",
+        "OSD",
+        "WFH",
+        "RR",
+        "OS",
+        "MC",
+        "LL",
+        "OL",
+        "68",
+        "OC",
+        "IPPT"
+      ]]]),
+      synchronizedAt: new Date().toISOString()
+    }]])
+  };
+
+  const summary = summarizeStatusesFromSnapshot(
+    snapshotBundle,
+    { timezone: "Asia/Singapore" },
+    { date: new Date("2026-03-24T12:00:00.000Z") }
+  );
+
+  assert.equal(summary.summary.present, 1);
+  assert.equal(summary.summary.ph, 1);
+  assert.equal(summary.summary.osd, 1);
+  assert.equal(summary.summary.wfh, 1);
+  assert.equal(summary.summary.off, 1);
+  assert.equal(summary.summary.outstationed, 1);
+  assert.equal(summary.summary.reportSick, 1);
+  assert.equal(summary.summary.localLeave, 1);
+  assert.equal(summary.summary.overseasLeave, 1);
+  assert.equal(summary.summary.attachedOut, 1);
+  assert.equal(summary.summary.onCourse, 1);
+  assert.equal(summary.summary.inBase, 1);
 });
 
 test("managed area grows by inserting a row instead of clearing and rewriting the block", async () => {
@@ -405,5 +1283,389 @@ test("five-minute reconciliation prefers direct sheet edits over queued bot chan
     assert.deepEqual(result.writtenEventIds, []);
     assert.equal(result.conflictedEvents.length, 1);
     assert.equal(result.conflictedEvents[0].reason, "cell_value_changed_by_human");
+  });
+});
+
+test("reconciliation blocks writes when a month sheet contains duplicate appointment rows", async () => {
+  await withTempDataDir(async (tempDir) => {
+    await writeFile(
+      path.join(tempDir, "sheet-cache.json"),
+      JSON.stringify({
+        updatedAt: "2026-03-24T00:00:00.000Z",
+        spreadsheetMetadata: {
+          fetchedAt: "2026-03-24T00:00:00.000Z",
+          sheetIdsByTitle: { ONBOARDING: 1, "Mar 26": 2 }
+        },
+        onboardingSlice: null,
+        monthSlices: {
+          "Mar 26": {
+            title: "Mar 26",
+            headerRow: ["Appointment", "24 Mar"],
+            recognizedDateColumns: { "24": 1 },
+            appointments: ["ALPHA"],
+            rowNumbersByAppointment: { ALPHA: 2 },
+            managedAreaHash: "baseline",
+            fetchedAt: "2026-03-24T00:00:00.000Z",
+            snapshot: {
+              title: "Mar 26",
+              appointments: ["ALPHA"],
+              statusesByDay: { "24": ["PRESENT"] },
+              synchronizedAt: "2026-03-24T00:00:00.000Z"
+            }
+          }
+        },
+        snapshots: {}
+      })
+    );
+
+    const fake = createInMemorySheets({
+      ONBOARDING: {
+        sheetId: 1,
+        values: [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", "CODE"],
+          ["Remarks", ""]
+        ]
+      },
+      "Mar 26": {
+        sheetId: 2,
+        values: [
+          ["Appointment", "24 Mar"],
+          ["ALPHA", "PRESENT"],
+          ["ALPHA", "WFH"],
+          ["Remarks", ""]
+        ]
+      }
+    });
+
+    const result = await reconcilePendingAttendanceWithSheets(
+      fake.client,
+      {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      },
+      [{
+        id: "event-dup",
+        appointment: "ALPHA",
+        status: "OS",
+        date: new Date("2026-03-24T12:00:00.000Z"),
+        targetSheetTitle: "Mar 26"
+      }],
+      { force: true }
+    );
+
+    assert.deepEqual(result.writtenEventIds, []);
+    assert.equal(result.conflictedEvents[0].reason, "duplicate_appointment_row");
+    assert.equal(fake.calls.batchValueUpdates.length, 0);
+  });
+});
+
+test("reconciliation ignores legacy rows that appear after the full canonical onboarding roster", async () => {
+  await withTempDataDir(async (tempDir) => {
+    await writeFile(
+      path.join(tempDir, "sheet-cache.json"),
+      JSON.stringify({
+        updatedAt: "2026-03-24T00:00:00.000Z",
+        spreadsheetMetadata: {
+          fetchedAt: "2026-03-24T00:00:00.000Z",
+          sheetIdsByTitle: { ONBOARDING: 1, "Mar 26": 2 }
+        },
+        onboardingSlice: null,
+        monthSlices: {},
+        snapshots: {}
+      })
+    );
+
+    const fake = createInMemorySheets({
+      ONBOARDING: {
+        sheetId: 1,
+        values: [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", "CODE"],
+          ["Remarks", ""]
+        ]
+      },
+      "Mar 26": {
+        sheetId: 2,
+        values: [
+          ["Appointment", "24 Mar"],
+          ["ALPHA", "PRESENT"],
+          ["Manual note", "leave me alone"],
+          ["Remarks", ""]
+        ]
+      }
+    });
+
+    const result = await reconcilePendingAttendanceWithSheets(
+      fake.client,
+      {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      },
+      [{
+        id: "event-layout",
+        appointment: "ALPHA",
+        status: "OS",
+        date: new Date("2026-03-24T12:00:00.000Z"),
+        targetSheetTitle: "Mar 26"
+      }],
+      { force: true }
+    );
+
+    assert.deepEqual(result.writtenEventIds, ["event-layout"]);
+    assert.deepEqual(result.conflictedEvents, []);
+    assert.deepEqual(fake.getSheetValues("Mar 26").slice(1, 4), [
+      ["ALPHA", "OS"],
+      ["Manual note", "leave me alone"],
+      ["Remarks", ""]
+    ]);
+  });
+});
+
+test("reconciliation fails safely when a managed appointment row has been deleted", async () => {
+  await withTempDataDir(async (tempDir) => {
+    await writeFile(
+      path.join(tempDir, "sheet-cache.json"),
+      JSON.stringify({
+        updatedAt: "2026-03-24T00:00:00.000Z",
+        spreadsheetMetadata: {
+          fetchedAt: "2026-03-24T00:00:00.000Z",
+          sheetIdsByTitle: { ONBOARDING: 1, "Mar 26": 2 }
+        },
+        onboardingSlice: null,
+        monthSlices: {
+          "Mar 26": {
+            title: "Mar 26",
+            headerRow: ["Appointment", "24 Mar"],
+            recognizedDateColumns: { "24": 1 },
+            appointments: ["ALPHA", "BRAVO"],
+            rowNumbersByAppointment: { ALPHA: 2, BRAVO: 3 },
+            managedAreaHash: "baseline",
+            fetchedAt: "2026-03-24T00:00:00.000Z",
+            snapshot: {
+              title: "Mar 26",
+              appointments: ["ALPHA", "BRAVO"],
+              statusesByDay: { "24": ["PRESENT", "WFH"] },
+              synchronizedAt: "2026-03-24T00:00:00.000Z"
+            }
+          }
+        },
+        snapshots: {}
+      })
+    );
+
+    const fake = createInMemorySheets({
+      ONBOARDING: {
+        sheetId: 1,
+        values: [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", "CODE1"],
+          ["BRAVO", "CODE2"],
+          ["Remarks", ""]
+        ]
+      },
+      "Mar 26": {
+        sheetId: 2,
+        values: [
+          ["Appointment", "24 Mar"],
+          ["BRAVO", "WFH"],
+          ["Remarks", ""]
+        ]
+      }
+    });
+
+    const result = await reconcilePendingAttendanceWithSheets(
+      fake.client,
+      {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      },
+      [{
+        id: "event-missing",
+        appointment: "ALPHA",
+        status: "OS",
+        date: new Date("2026-03-24T12:00:00.000Z"),
+        targetSheetTitle: "Mar 26"
+      }],
+      { force: true }
+    );
+
+    assert.deepEqual(result.writtenEventIds, []);
+    assert.equal(result.conflictedEvents[0].reason, "cell_value_changed_by_human");
+    assert.deepEqual(fake.getSheetValues("Mar 26").slice(1, 3), [
+      ["ALPHA", ""],
+      ["BRAVO", "WFH"]
+    ]);
+  });
+});
+
+test("reconciliation resolves moved rows by appointment identity instead of stale row number", async () => {
+  await withTempDataDir(async (tempDir) => {
+    await writeFile(
+      path.join(tempDir, "sheet-cache.json"),
+      JSON.stringify({
+        updatedAt: "2026-03-24T00:00:00.000Z",
+        spreadsheetMetadata: {
+          fetchedAt: "2026-03-24T00:00:00.000Z",
+          sheetIdsByTitle: { ONBOARDING: 1, "Mar 26": 2 }
+        },
+        onboardingSlice: null,
+        monthSlices: {
+          "Mar 26": {
+            title: "Mar 26",
+            headerRow: ["Appointment", "24 Mar"],
+            recognizedDateColumns: { "24": 1 },
+            appointments: ["ALPHA", "BRAVO"],
+            rowNumbersByAppointment: { ALPHA: 2, BRAVO: 3 },
+            managedAreaHash: "baseline",
+            fetchedAt: "2026-03-24T00:00:00.000Z",
+            snapshot: {
+              title: "Mar 26",
+              appointments: ["ALPHA", "BRAVO"],
+              statusesByDay: { "24": ["PRESENT", "WFH"] },
+              synchronizedAt: "2026-03-24T00:00:00.000Z"
+            }
+          }
+        },
+        snapshots: {}
+      })
+    );
+
+    const fake = createInMemorySheets({
+      ONBOARDING: {
+        sheetId: 1,
+        values: [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", "CODE1"],
+          ["BRAVO", "CODE2"],
+          ["Remarks", ""]
+        ]
+      },
+      "Mar 26": {
+        sheetId: 2,
+        values: [
+          ["Appointment", "24 Mar"],
+          ["ALPHA", "PRESENT"],
+          ["BRAVO", "WFH"],
+          ["Remarks", ""]
+        ]
+      }
+    });
+    fake.moveRows("Mar 26", 2, 1, 1);
+
+    const result = await reconcilePendingAttendanceWithSheets(
+      fake.client,
+      {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      },
+      [{
+        id: "event-move",
+        appointment: "ALPHA",
+        status: "OS",
+        date: new Date("2026-03-24T12:00:00.000Z"),
+        targetSheetTitle: "Mar 26"
+      }],
+      { force: true }
+    );
+
+    assert.deepEqual(result.writtenEventIds, ["event-move"]);
+    assert.deepEqual(fake.calls.batchValueUpdates.at(-1), [{
+      range: "'Mar 26'!B2",
+      values: [["OS"]]
+    }]);
+    assert.deepEqual(fake.getSheetValues("Mar 26").slice(1, 4), [
+      ["ALPHA", "OS"],
+      ["BRAVO", "WFH"],
+      ["Remarks", ""]
+    ]);
+  });
+});
+
+test("reconciliation fails closed when the live date header no longer matches the expected label", async () => {
+  await withTempDataDir(async (tempDir) => {
+    await writeFile(
+      path.join(tempDir, "sheet-cache.json"),
+      JSON.stringify({
+        updatedAt: "2026-03-24T00:00:00.000Z",
+        spreadsheetMetadata: {
+          fetchedAt: "2026-03-24T00:00:00.000Z",
+          sheetIdsByTitle: { ONBOARDING: 1, "Mar 26": 2 }
+        },
+        onboardingSlice: null,
+        monthSlices: {
+          "Mar 26": {
+            title: "Mar 26",
+            headerRow: ["Appointment", "24 Mar"],
+            recognizedDateColumns: { "24": 1 },
+            appointments: ["ALPHA"],
+            rowNumbersByAppointment: { ALPHA: 2 },
+            managedAreaHash: "baseline",
+            fetchedAt: "2026-03-24T00:00:00.000Z",
+            snapshot: {
+              title: "Mar 26",
+              appointments: ["ALPHA"],
+              statusesByDay: { "24": ["PRESENT"] },
+              synchronizedAt: "2026-03-24T00:00:00.000Z"
+            }
+          }
+        },
+        snapshots: {}
+      })
+    );
+
+    const fake = createInMemorySheets({
+      ONBOARDING: {
+        sheetId: 1,
+        values: [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", "CODE"],
+          ["Remarks", ""]
+        ]
+      },
+      "Mar 26": {
+        sheetId: 2,
+        values: [
+          ["Appointment", "24-Mar"],
+          ["ALPHA", "PRESENT"],
+          ["Remarks", ""]
+        ]
+      }
+    });
+
+    const result = await reconcilePendingAttendanceWithSheets(
+      fake.client,
+      {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: ["Remarks"],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH", "OS"]
+      },
+      [{
+        id: "event-header",
+        appointment: "ALPHA",
+        status: "OS",
+        date: new Date("2026-03-24T12:00:00.000Z"),
+        targetSheetTitle: "Mar 26"
+      }],
+      { force: true }
+    );
+
+    assert.deepEqual(result.writtenEventIds, []);
+    assert.equal(result.conflictedEvents[0].reason, "date_column_changed");
+    assert.equal(fake.calls.batchValueUpdates.length, 0);
   });
 });

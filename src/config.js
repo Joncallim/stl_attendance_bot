@@ -69,7 +69,7 @@ export const defaultAttendanceOptions = [
 const ATTENDANCE_OPTION_SCHEMA_VERSION = 2;
 
 const privateKey = requireEnv("GOOGLE_PRIVATE_KEY").replace(/\\n/g, "\n");
-const attendanceOptions =
+export const onboardingAttendanceOptions =
   parseList(process.env.ATTENDANCE_OPTIONS).length > 0
     ? parseList(process.env.ATTENDANCE_OPTIONS)
     : defaultAttendanceOptions;
@@ -83,8 +83,9 @@ export const config = {
   firstReminderTime: process.env.FIRST_REMINDER_TIME || "07:00",
   secondReminderTime: process.env.SECOND_REMINDER_TIME || "08:00",
   onboardingSheetTitle: process.env.ONBOARDING_SHEET_TITLE || "ONBOARDING",
-  attendanceOptions,
-  rosterStopMarkers: parseList(process.env.ROSTER_STOP_MARKERS || "Remarks"),
+  attendanceOptions: [...onboardingAttendanceOptions],
+  onboardingAttendanceOptions: [...onboardingAttendanceOptions],
+  rosterStopMarkers: parseList(process.env.ROSTER_STOP_MARKERS || ""),
   defaultAdminAppointments: parseList(
     process.env.DEFAULT_ADMIN_APPOINTMENTS || "SCSE,Coxn,CO,XO,OPS 1"
   )
@@ -100,7 +101,7 @@ export async function applyStoredConfigOverrides() {
   ) {
     config.attendanceOptions = settings.attendanceOptions;
   } else {
-    config.attendanceOptions = [...defaultAttendanceOptions];
+    config.attendanceOptions = [...config.onboardingAttendanceOptions];
   }
 
   return config;
