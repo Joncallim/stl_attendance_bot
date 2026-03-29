@@ -1,11 +1,40 @@
 const SINGAPORE_PUBLIC_HOLIDAY_COLLECTION_ID = "691";
+const PUBLIC_HOLIDAY_FETCH_TIMEOUT_MS = 10000;
 const publicHolidayCache = {
   years: new Map(),
   loadingPromise: null
 };
 
-async function fetchJson(url) {
-  const response = await fetch(url);
+function createPublicHolidayTimeoutError(url, timeoutMs) {
+  const error = new Error(
+    `Public holiday request timed out after ${timeoutMs}ms for ${url}`
+  );
+  error.name = "PublicHolidayTimeoutError";
+  error.code = "ETIMEDOUT";
+  error.status = 504;
+  return error;
+}
+
+async function fetchJson(url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? PUBLIC_HOLIDAY_FETCH_TIMEOUT_MS;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  let response;
+
+  try {
+    response = await fetch(url, { signal: controller.signal });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw createPublicHolidayTimeoutError(url, timeoutMs);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 
   if (!response.ok) {
     throw new Error(`Request failed: ${response.status} ${response.statusText}`);
@@ -61,7 +90,12 @@ export async function loadSingaporePublicHolidayCache() {
 
 export async function getSingaporePublicHolidaySet(year) {
   if (!publicHolidayCache.years.has(year)) {
-    await loadSingaporePublicHolidayCache();
+    try {
+      await loadSingaporePublicHolidayCache();
+    } catch (error) {
+      console.error("Failed to load Singapore public holiday cache:", error.message);
+      return new Set();
+    }
   }
 
   return publicHolidayCache.years.get(year) ?? new Set();

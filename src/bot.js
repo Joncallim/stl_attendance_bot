@@ -4,7 +4,9 @@ import {
   applyAttendanceEntriesToSnapshotBundle,
   addAppointmentToSheets,
   buildQueuedAttendanceEventMetadata,
+  classifyAppointmentDepartment,
   createGoogleSheetsClient,
+  DEPARTMENT_BUCKETS,
   ensureNextMonthSheetExists,
   loadAttendanceSnapshotsFromLocalCache,
   preloadAttendanceSnapshots,
@@ -59,6 +61,8 @@ const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointmen
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
+const DEPARTMENT_MEMBER_PAGE_SIZE = 6;
+const DEPARTMENT_WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 const ATTENDANCE_OPTION_DISPLAY_ORDER = [
   "PRESENT",
   "DUTY",
@@ -554,24 +558,27 @@ function buildAdminRosterMenu() {
 }
 
 function buildHomeMenu(isAdminUser, timezone) {
-  const weekButtons = getHomeWeekButtons(timezone);
-  const rows = [
-    [Markup.button.callback("📝 Today's Attendance", "home:attendance")],
-    weekButtons,
-    [
-      Markup.button.callback("⚠️ Deregister", "home:deregister"),
-      Markup.button.callback("📊 Summary", "home:summary")
-    ],
-    [
-      Markup.button.callback("❓ Help", "home:help"),
-      Markup.button.callback("❌ Close", "home:close")
-    ]
+  const buttons = [
+    Markup.button.callback("📝 Today's Attendance", "home:attendance"),
+    ...getHomeWeekButtons(timezone),
+    Markup.button.callback("🏢 My Department", "home:department")
   ];
 
   if (isAdminUser) {
-    rows.splice(1, 0, [
-      Markup.button.callback("🛠️ Admin Menu", "home:admin")
-    ]);
+    buttons.push(Markup.button.callback("🛠️ Admin Menu", "home:admin"));
+  }
+
+  buttons.push(
+    Markup.button.callback("⚠️ Deregister", "home:deregister"),
+    Markup.button.callback("📊 Summary", "home:summary"),
+    Markup.button.callback("❓ Help", "home:help"),
+    Markup.button.callback("❌ Close", "home:close")
+  );
+
+  const rows = [];
+
+  for (let index = 0; index < buttons.length; index += 2) {
+    rows.push(buttons.slice(index, index + 2));
   }
 
   return Markup.inlineKeyboard(rows);
@@ -1118,6 +1125,236 @@ function getCachedAttendanceStatus(cache, config, appointment, date) {
   return String(snapshot.statusesByDay.get(day)?.[appointmentIndex] ?? "").trim();
 }
 
+function normalizeDepartmentKey(value) {
+  return String(value ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "_");
+}
+
+function getDepartmentOptions() {
+  return DEPARTMENT_BUCKETS.map((entry) => ({
+    key: entry.key,
+    label: entry.label
+  }));
+}
+
+function getDepartmentLabelByKey(departmentKey) {
+  return getDepartmentOptions().find((entry) => entry.key === departmentKey)?.label ?? null;
+}
+
+function getDepartmentKeyForAppointment(appointment) {
+  const label = classifyAppointmentDepartment(appointment);
+
+  if (!label) {
+    return null;
+  }
+
+  return normalizeDepartmentKey(label);
+}
+
+function formatDepartmentStatus(status) {
+  return String(status ?? "").trim() || "-";
+}
+
+function formatDepartmentWeekLabel(dates, timezone) {
+  if (!Array.isArray(dates) || dates.length === 0) {
+    return "No dates available";
+  }
+
+  const first = dates[0];
+  const last = dates[dates.length - 1];
+  const firstLabel = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    day: "numeric",
+    month: "short"
+  }).format(first);
+  const lastLabel = new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    day: "numeric",
+    month: "short",
+    year: "2-digit"
+  }).format(last);
+
+  return `${firstLabel} to ${lastLabel}`;
+}
+
+function buildDepartmentWorkweekViewModel(cache, config, viewer, options = {}) {
+  if (!viewer?.appointment) {
+    return { ok: false, reason: "not_bound" };
+  }
+
+  const viewerDepartmentKey = getDepartmentKeyForAppointment(viewer.appointment);
+
+  if (!viewerDepartmentKey) {
+    return { ok: false, reason: "unclassified" };
+  }
+
+  const canSwitchDepartments = options.isAdminUser === true;
+  const requestedKey = normalizeDepartmentKey(options.departmentKey || viewerDepartmentKey);
+  const departmentKey = canSwitchDepartments ? requestedKey : viewerDepartmentKey;
+  const departmentLabel = getDepartmentLabelByKey(departmentKey);
+
+  if (!departmentLabel) {
+    return { ok: false, reason: "unknown_department" };
+  }
+
+  const weekOffset = Number(options.weekOffset ?? 0);
+  const weekDates = getWorkweekDates(config.timezone, weekOffset).map(
+    (value) => new Date(value)
+  );
+  const activeAppointments = (cache.activeCodes ?? [])
+    .map((entry) => entry.appointment)
+    .filter(Boolean);
+  const appointments = activeAppointments.filter(
+    (appointment) => getDepartmentKeyForAppointment(appointment) === departmentKey
+  );
+  const page = Math.max(0, Number(options.page ?? 0));
+  const totalPages = Math.max(1, Math.ceil(appointments.length / DEPARTMENT_MEMBER_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages - 1);
+  const startIndex = safePage * DEPARTMENT_MEMBER_PAGE_SIZE;
+  const pageAppointments = appointments.slice(startIndex, startIndex + DEPARTMENT_MEMBER_PAGE_SIZE);
+  const members = pageAppointments.map((appointment, index) => ({
+    appointment,
+    absoluteIndex: startIndex + index,
+    rowNumber: startIndex + index + 1,
+    statuses: weekDates.map((date) => getCachedAttendanceStatus(cache, config, appointment, date))
+  }));
+
+  return {
+    ok: true,
+    departmentKey,
+    departmentLabel,
+    viewerDepartmentKey,
+    canSwitchDepartments,
+    weekOffset,
+    weekDates,
+    weekLabel: formatDepartmentWeekLabel(weekDates, config.timezone),
+    page: safePage,
+    totalPages,
+    members,
+    totalMembers: appointments.length,
+    allDepartmentOptions: getDepartmentOptions()
+  };
+}
+
+function buildDepartmentMenu(viewModel) {
+  const rows = [];
+
+  for (const member of viewModel.members) {
+    rows.push(
+      DEPARTMENT_WEEKDAY_LABELS.map((weekday, dayIndex) =>
+        Markup.button.callback(
+          `${member.rowNumber} ${weekday}`,
+          `home:department:edit:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}:${member.absoluteIndex}:${dayIndex}`
+        )
+      )
+    );
+  }
+
+  const pageNavRow = [];
+
+  if (viewModel.page > 0) {
+    pageNavRow.push(
+      Markup.button.callback(
+        "⬆️ Prev Members",
+        `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page - 1}`
+      )
+    );
+  }
+
+  if (viewModel.page < viewModel.totalPages - 1) {
+    pageNavRow.push(
+      Markup.button.callback(
+        "⬇️ Next Members",
+        `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page + 1}`
+      )
+    );
+  }
+
+  if (pageNavRow.length > 0) {
+    rows.push(pageNavRow);
+  }
+
+  rows.push([
+    Markup.button.callback(
+      "⬅️ Previous Week",
+      `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset - 1}:0`
+    ),
+    Markup.button.callback(
+      "Next Week ➡️",
+      `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset + 1}:0`
+    )
+  ]);
+
+  if (viewModel.canSwitchDepartments) {
+    rows.push([
+      Markup.button.callback(
+        "🔄 Switch Department",
+        `home:department:switch:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}`
+      )
+    ]);
+  }
+
+  rows.push([
+    Markup.button.callback("🔙 Back", "home:main"),
+    Markup.button.callback("❌", "home:close")
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
+function formatDepartmentViewMessage(viewModel, timezone) {
+  const lines = [
+    `<b><u>My Department</u></b>`,
+    `<b>${escapeHtml(viewModel.departmentLabel)}</b>`,
+    `Workweek: ${escapeHtml(viewModel.weekLabel)}`,
+    ""
+  ];
+
+  if (viewModel.totalMembers === 0) {
+    lines.push("No appointments are currently assigned to this department.");
+  } else {
+    lines.push("Tap the matching weekday button for the numbered row below.");
+    lines.push("");
+
+    for (const member of viewModel.members) {
+      lines.push(`<b>${member.rowNumber}. ${escapeHtml(member.appointment)}</b>`);
+      lines.push(
+        member.statuses
+          .map((status, index) => `${DEPARTMENT_WEEKDAY_LABELS[index]}: ${escapeHtml(formatDepartmentStatus(status))}`)
+          .join(" | ")
+      );
+      lines.push("");
+    }
+
+    lines.push(
+      `Showing ${viewModel.members.length === 0 ? 0 : viewModel.members[0].rowNumber}-${viewModel.members.at(-1)?.rowNumber ?? 0} of ${viewModel.totalMembers}`
+    );
+  }
+
+  return lines.join("\n").trim();
+}
+
+function buildDepartmentPickerMenu(departmentOptions, weekOffset, backDepartmentKey, backPage) {
+  const rows = departmentOptions.map((option) => [
+    Markup.button.callback(
+      option.label,
+      `home:department:select:${option.key}:${weekOffset}`
+    )
+  ]);
+
+  rows.push([
+    Markup.button.callback(
+      "🔙 Back",
+      `home:department:view:${backDepartmentKey}:${weekOffset}:${backPage}`
+    ),
+    Markup.button.callback("❌", "home:close")
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
 
 function formatSyncStatusTimestamp(timestamp, timezone) {
   if (!timestamp) {
@@ -1167,6 +1404,7 @@ function buildHomeMenuText({ greeting, name, isAdminUser, timezone, syncStatus }
   const descriptions = [
     "📝 Today's Attendance: Submit or update your attendance for today.",
     ...getHomeWeekDescriptions(timezone),
+    "🏢 My Department: View and edit your department's workweek attendance.",
     "⚠️ Deregister: Remove your Telegram binding and rotate your code.",
     "📊 Summary: View the attendance summary for the selected day.",
     "❓ Help: Show the command and usage guide.",
@@ -1951,6 +2189,68 @@ async function renderHomeMenu(ctx, config, options = {}) {
   });
 
   await sendOrUpdateAdminMessage(ctx, text, buildHomeMenu(isAdminUser, config.timezone));
+}
+
+async function renderDepartmentView(ctx, config, cache, viewer, options = {}) {
+  const viewModel = buildDepartmentWorkweekViewModel(cache, config, viewer, options);
+
+  if (!viewModel.ok) {
+    const messages = {
+      not_bound: "You are not currently bound to an appointment.",
+      unclassified: "Your appointment is not currently mapped to a department.",
+      unknown_department: "That department is not available."
+    };
+    await sendOrUpdateAdminMessage(
+      ctx,
+      messages[viewModel.reason] || "Unable to open the department view.",
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("🔙 Back", "home:main"),
+          Markup.button.callback("❌", "home:close")
+        ]
+      ])
+    );
+    return null;
+  }
+
+  await sendOrUpdateAdminMessage(
+    ctx,
+    [
+      options.banner ? `<i>${escapeHtml(options.banner)}</i>` : null,
+      formatDepartmentViewMessage(viewModel, config.timezone)
+    ].filter(Boolean).join("\n\n"),
+    buildDepartmentMenu(viewModel),
+    { parse_mode: "HTML" }
+  );
+  return viewModel;
+}
+
+async function queueAttendanceSelection(cache, config, appointment, status, date, source) {
+  const queuedEntry = {
+    appointment,
+    status,
+    date,
+    source,
+    ...buildQueuedAttendanceEventMetadata(cache.sheetSnapshots, config, {
+      appointment,
+      status,
+      date
+    })
+  };
+
+  await enqueueAttendanceEvent(config, queuedEntry);
+
+  if (cache.sheetSnapshots) {
+    cache.sheetSnapshots = applyAttendanceEntriesToSnapshotBundle(
+      cache.sheetSnapshots,
+      config,
+      [queuedEntry]
+    );
+    cache.summaryMemo.clear();
+    cache.summaryMemoVersion = cache.sheetSnapshots?.synchronizedAt ?? null;
+  }
+
+  return queuedEntry;
 }
 
 async function syncRosterState(sheets, config) {
@@ -2759,7 +3059,10 @@ export function createAttendanceBot(config) {
       return true;
     }),
     refreshMonthSlices: async (options = {}) => withSheetOperation(async () => {
-      await preloadSheetSnapshots(sheets, config, adminCache, options);
+      await preloadSheetSnapshots(sheets, config, adminCache, {
+        ...options,
+        normalizeAliases: options.reason === "five-minute" || options.reason === "nightly"
+      });
       return true;
     }),
     refreshAdminCache: async () => {
@@ -2791,6 +3094,7 @@ export function createAttendanceBot(config) {
         awaitingSecretCode: false,
         awaitingAppointmentAdd: false,
         awaitingWeeklyAttendance: false,
+        departmentEditTarget: null,
         weeklyAttendanceDates: [],
         weeklyAttendanceIndex: 0,
         weeklyAttendanceResults: [],
@@ -3268,7 +3572,12 @@ export function createAttendanceBot(config) {
   bot.action(/home:(.+)/, async (ctx) => {
     const action = ctx.match[1];
 
-    if (!action.startsWith("pick:attendance:") && action !== "pick:week:skip" && !action.startsWith("pick:week:")) {
+    if (
+      !action.startsWith("pick:attendance:") &&
+      !action.startsWith("department:pickoption:") &&
+      action !== "pick:week:skip" &&
+      !action.startsWith("pick:week:")
+    ) {
       await ctx.answerCbQuery();
     }
 
@@ -3317,6 +3626,254 @@ export function createAttendanceBot(config) {
 
       const weekOffset = action === "week:next" ? 1 : 0;
       await startWeeklyAttendanceFlow(ctx, config, sheets, user, adminCache, weekOffset);
+      return;
+    }
+
+    if (action === "department") {
+      await ensureSheetReadiness(sheets, config, adminCache);
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      await renderDepartmentView(ctx, config, adminCache, user, {
+        isAdminUser: await isAdmin(ctx, config)
+      });
+      return;
+    }
+
+    if (action.startsWith("department:view:")) {
+      await ensureSheetReadiness(sheets, config, adminCache);
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      const [, , departmentKey, weekOffsetRaw, pageRaw] = action.split(":");
+      await renderDepartmentView(ctx, config, adminCache, user, {
+        departmentKey,
+        weekOffset: Number(weekOffsetRaw ?? 0),
+        page: Number(pageRaw ?? 0),
+        isAdminUser: await isAdmin(ctx, config)
+      });
+      return;
+    }
+
+    if (action.startsWith("department:switch:")) {
+      await ensureSheetReadiness(sheets, config, adminCache);
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      if (!(await isAdmin(ctx, config))) {
+        await renderDepartmentView(ctx, config, adminCache, user, { isAdminUser: false });
+        return;
+      }
+
+      const [, , departmentKey, weekOffsetRaw, pageRaw] = action.split(":");
+      const viewModel = buildDepartmentWorkweekViewModel(adminCache, config, user, {
+        departmentKey,
+        weekOffset: Number(weekOffsetRaw ?? 0),
+        page: Number(pageRaw ?? 0),
+        isAdminUser: true
+      });
+
+      await sendOrUpdateAdminMessage(
+        ctx,
+        [
+          "<b><u>Select Department</u></b>",
+          "Choose a department to view and edit."
+        ].join("\n\n"),
+        buildDepartmentPickerMenu(
+          viewModel.allDepartmentOptions,
+          viewModel.weekOffset,
+          viewModel.departmentKey,
+          viewModel.page
+        ),
+        { parse_mode: "HTML" }
+      );
+      return;
+    }
+
+    if (action.startsWith("department:select:")) {
+      await ensureSheetReadiness(sheets, config, adminCache);
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      await renderDepartmentView(ctx, config, adminCache, user, {
+        departmentKey: action.split(":")[2],
+        weekOffset: Number(action.split(":")[3] ?? 0),
+        isAdminUser: await isAdmin(ctx, config)
+      });
+      return;
+    }
+
+    if (action.startsWith("department:edit:")) {
+      await ensureSheetReadiness(sheets, config, adminCache);
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      const [, , departmentKey, weekOffsetRaw, pageRaw, absoluteIndexRaw, dayIndexRaw] = action.split(":");
+      const isAdminUser = await isAdmin(ctx, config);
+      const viewModel = buildDepartmentWorkweekViewModel(adminCache, config, user, {
+        departmentKey,
+        weekOffset: Number(weekOffsetRaw ?? 0),
+        page: Number(pageRaw ?? 0),
+        isAdminUser
+      });
+      const targetMember = viewModel.members.find(
+        (member) => member.absoluteIndex === Number(absoluteIndexRaw)
+      );
+      const dayIndex = Number(dayIndexRaw);
+      const targetDate = viewModel.weekDates[dayIndex];
+
+      if (!viewModel.ok || !targetMember || !targetDate) {
+        await renderDepartmentView(ctx, config, adminCache, user, {
+          departmentKey,
+          weekOffset: Number(weekOffsetRaw ?? 0),
+          page: Number(pageRaw ?? 0),
+          isAdminUser
+        });
+        return;
+      }
+
+      ctx.session.departmentEditTarget = {
+        appointment: targetMember.appointment,
+        date: targetDate.toISOString(),
+        departmentKey: viewModel.departmentKey,
+        weekOffset: viewModel.weekOffset,
+        page: viewModel.page
+      };
+      const currentStatus = getCachedAttendanceStatus(
+        adminCache,
+        config,
+        targetMember.appointment,
+        targetDate
+      );
+      const dateLabel = formatAttendanceDateLabel(targetDate, config.timezone);
+      const promptMessage = currentStatus
+        ? `Set ${targetMember.appointment}'s attendance for ${dateLabel}. Current: ${currentStatus}.`
+        : `Set ${targetMember.appointment}'s attendance for ${dateLabel}.`;
+
+      await sendOrUpdateAdminMessage(
+        ctx,
+        promptMessage,
+        buildInlineAttendanceMenu(
+          config.attendanceOptions,
+          0,
+          "home:department:pickoption",
+          "home:department:pickpage",
+          `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}`
+        )
+      );
+      return;
+    }
+
+    if (action.startsWith("department:pickpage:")) {
+      await ensureSheetReadiness(sheets, config, adminCache);
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      const target = ctx.session.departmentEditTarget;
+
+      if (!target) {
+        await renderDepartmentView(ctx, config, adminCache, user, {
+          isAdminUser: await isAdmin(ctx, config)
+        });
+        return;
+      }
+
+      const page = Number(action.split(":")[2] ?? 0);
+      const targetDate = new Date(target.date);
+      const currentStatus = getCachedAttendanceStatus(
+        adminCache,
+        config,
+        target.appointment,
+        targetDate
+      );
+      const dateLabel = formatAttendanceDateLabel(targetDate, config.timezone);
+      const promptMessage = currentStatus
+        ? `Set ${target.appointment}'s attendance for ${dateLabel}. Current: ${currentStatus}.`
+        : `Set ${target.appointment}'s attendance for ${dateLabel}.`;
+
+      await sendOrUpdateAdminMessage(
+        ctx,
+        promptMessage,
+        buildInlineAttendanceMenu(
+          config.attendanceOptions,
+          page,
+          "home:department:pickoption",
+          "home:department:pickpage",
+          `home:department:view:${target.departmentKey}:${target.weekOffset}:${target.page}`
+        )
+      );
+      return;
+    }
+
+    if (action.startsWith("department:pickoption:")) {
+      await ensureSheetReadiness(sheets, config, adminCache);
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      const target = ctx.session.departmentEditTarget;
+
+      if (!target) {
+        await renderDepartmentView(ctx, config, adminCache, user, {
+          isAdminUser: await isAdmin(ctx, config)
+        });
+        return;
+      }
+
+      const picked = config.attendanceOptions[Number(action.split(":")[2])];
+
+      if (!picked) {
+        await renderDepartmentView(ctx, config, adminCache, user, {
+          departmentKey: target.departmentKey,
+          weekOffset: target.weekOffset,
+          page: target.page,
+          isAdminUser: await isAdmin(ctx, config)
+        });
+        return;
+      }
+
+      const targetDate = new Date(target.date);
+      await queueAttendanceSelection(
+        adminCache,
+        config,
+        target.appointment,
+        picked,
+        targetDate,
+        "department"
+      );
+      ctx.session.departmentEditTarget = null;
+      await updateUserByChatId(ctx.chat.id, {
+        awaitingAttendance: false,
+        lastSubmittedAt: new Date().toISOString()
+      });
+      await ctx.answerCbQuery("Attendance updated");
+      await renderDepartmentView(ctx, config, adminCache, user, {
+        departmentKey: target.departmentKey,
+        weekOffset: target.weekOffset,
+        page: target.page,
+        isAdminUser: await isAdmin(ctx, config),
+        banner: `Updated ${target.appointment} to ${picked} for ${formatAttendanceDateLabel(targetDate, config.timezone)}.`
+      });
       return;
     }
 
@@ -3385,29 +3942,15 @@ export function createAttendanceBot(config) {
         return;
       }
 
-      const queuedEntry = {
-        appointment: user.appointment,
-        status: picked,
-        date: new Date(),
-        source: "daily",
-        ...buildQueuedAttendanceEventMetadata(adminCache.sheetSnapshots, config, {
-          appointment: user.appointment,
-          status: picked,
-          date: new Date()
-        })
-      };
-      await enqueueAttendanceEvent(config, queuedEntry);
-
-      if (adminCache.sheetSnapshots) {
-        adminCache.sheetSnapshots = applyAttendanceEntriesToSnapshotBundle(
-          adminCache.sheetSnapshots,
-          config,
-          [queuedEntry]
-        );
-        adminCache.summaryMemo.clear();
-        adminCache.summaryMemoVersion = adminCache.sheetSnapshots?.synchronizedAt ?? null;
-      }
       const recordedAt = new Date();
+      await queueAttendanceSelection(
+        adminCache,
+        config,
+        user.appointment,
+        picked,
+        recordedAt,
+        "daily"
+      );
       const confirmationLines = [
         `Attendance recorded as "${picked}" for ${user.appointment} for ${formatAttendanceDateLabel(recordedAt, config.timezone)} at ${formatMilitaryTime(recordedAt, config.timezone)} hrs.`,
         "Queued for Google Sheets sync.",
@@ -4050,14 +4593,18 @@ export function createAttendanceBot(config) {
 
 export const __testing = {
   buildAttendanceOptionsDescription,
+  buildHomeMenu,
+  buildDepartmentWorkweekViewModel,
   buildInvitationAdminDescription,
   buildInviteMessage,
   buildManageAdminsDescription,
   buildHomeMenuText,
+  formatDepartmentViewMessage,
   buildSummaryMenu,
   formatSummaryMessage,
   formatHomeSynchronizationTimestamp,
   getCanonicalAttendanceOptions,
+  getDepartmentKeyForAppointment,
   getLatestHomeSynchronizationTimestamp,
   handleInviteCommand,
   handleOnboardCommand,

@@ -23,6 +23,7 @@ test("admin home menu includes admin action and synchronization footer", () => {
   });
 
   assert.match(text, /🛠️ Admin Menu:/);
+  assert.match(text, /🏢 My Department:/);
   assert.match(text, /\n---\n/);
   assert.match(text, /Last Synchronisation: 184200 24 Mar 26/);
 });
@@ -69,5 +70,29 @@ test("non-admin home menu has no admin section or footer", () => {
   assert.doesNotMatch(text, /🛠️ Admin Menu:/);
   assert.doesNotMatch(text, /---/);
   assert.doesNotMatch(text, /Last Synchronisation:/);
+  assert.match(text, /🏢 My Department:/);
   assert.match(text, /❌ Close: Close this menu\.$/);
+});
+
+test("home inline menu includes My Department button for non-admins", () => {
+  const menu = __testing.buildHomeMenu(false, "Asia/Singapore");
+  const labels = menu.reply_markup.inline_keyboard.flat().map((button) => button.text);
+  const callbacks = menu.reply_markup.inline_keyboard.flat().map((button) => button.callback_data);
+  const rowLengths = menu.reply_markup.inline_keyboard.map((row) => row.length);
+
+  assert.ok(labels.includes("🏢 My Department"));
+  assert.ok(callbacks.includes("home:department"));
+  assert.ok(rowLengths.every((length) => length <= 2));
+});
+
+test("home inline menu includes My Department and Admin Menu for admins", () => {
+  const menu = __testing.buildHomeMenu(true, "Asia/Singapore");
+  const labels = menu.reply_markup.inline_keyboard.flat().map((button) => button.text);
+  const callbacks = menu.reply_markup.inline_keyboard.flat().map((button) => button.callback_data);
+  const rowLengths = menu.reply_markup.inline_keyboard.map((row) => row.length);
+
+  assert.ok(labels.includes("🏢 My Department"));
+  assert.ok(callbacks.includes("home:department"));
+  assert.ok(labels.includes("🛠️ Admin Menu"));
+  assert.ok(rowLengths.every((length) => length <= 2));
 });

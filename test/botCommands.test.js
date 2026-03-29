@@ -257,6 +257,80 @@ test("attendance options description uses canonical order and aligned labels", (
   assert.doesNotMatch(description, /sort the list back/i);
 });
 
+test("department workweek view uses the viewer's own department for non-admins", () => {
+  const cache = {
+    activeCodes: [
+      { appointment: "CO" },
+      { appointment: "SCSE (IN)" },
+      { appointment: "CComms" },
+      { appointment: "Comms 1" }
+    ],
+    sheetSnapshots: {
+      synchronizedAt: "2026-03-24T00:00:00.000Z",
+      snapshots: new Map([["Mar 26", {
+        appointments: ["CO", "SCSE (IN)", "CComms", "Comms 1"],
+        statusesByDay: new Map([
+          [24, ["PRESENT", "WFH", "DUTY", ""]],
+          [25, ["", "", "", "MC"]],
+          [26, ["", "", "", ""]],
+          [27, ["", "", "", ""]],
+          [28, ["", "", "", ""]]
+        ])
+      }]])
+    }
+  };
+
+  const viewModel = __testing.buildDepartmentWorkweekViewModel(
+    cache,
+    { timezone: "Asia/Singapore" },
+    { appointment: "Comms 1" },
+    { departmentKey: "OFFICERS", isAdminUser: false, weekOffset: 0 }
+  );
+
+  assert.equal(viewModel.ok, true);
+  assert.equal(viewModel.departmentKey, "COMMS");
+  assert.equal(viewModel.departmentLabel, "Comms");
+  assert.equal(viewModel.canSwitchDepartments, false);
+  assert.deepEqual(viewModel.members.map((member) => member.appointment), ["CComms", "Comms 1"]);
+});
+
+test("department workweek view lets admins switch and keeps department order fixed", () => {
+  const cache = {
+    activeCodes: [
+      { appointment: "CO" },
+      { appointment: "SCSE" },
+      { appointment: "Chief Comms Specialist" },
+      { appointment: "Comms Specialist 1" }
+    ],
+    sheetSnapshots: {
+      synchronizedAt: "2026-03-24T00:00:00.000Z",
+      snapshots: new Map([["Mar 26", {
+        appointments: ["CO", "SCSE", "Chief Comms Specialist", "Comms Specialist 1"],
+        statusesByDay: new Map([[24, ["PRESENT", "", "", ""]]])
+      }]])
+    }
+  };
+
+  const viewModel = __testing.buildDepartmentWorkweekViewModel(
+    cache,
+    { timezone: "Asia/Singapore" },
+    { appointment: "CO" },
+    { departmentKey: "COMMS_SPECIALIST", isAdminUser: true, weekOffset: 0 }
+  );
+
+  assert.equal(viewModel.ok, true);
+  assert.equal(viewModel.departmentLabel, "Comms Specialist");
+  assert.equal(viewModel.canSwitchDepartments, true);
+  assert.deepEqual(
+    viewModel.allDepartmentOptions.map((entry) => entry.label),
+    ["Officers", "C2", "WS", "WCS", "UW", "Nav", "Comms", "Electronic Specialist", "Comms Specialist", "MS", "ECS", "Chef"]
+  );
+  assert.deepEqual(
+    viewModel.members.map((member) => member.appointment),
+    ["Chief Comms Specialist", "Comms Specialist 1"]
+  );
+});
+
 test("invite message formats the secret code as HTML code with copy instructions", () => {
   const message = __testing.buildInviteMessage(
     { appointment: "ALPHA", secretCode: "ABCD1234" },

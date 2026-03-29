@@ -5,6 +5,7 @@ import path from "node:path";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import {
   __testing,
+  preloadAttendanceSnapshots,
   reconcilePendingAttendanceWithSheets,
   summarizeAttendanceOptionUsage,
   syncOnboardingRoster
@@ -67,6 +68,7 @@ function createInMemorySheets(initialSheets = {}) {
       title,
       {
         sheetId: sheet.sheetId,
+        protectedRanges: (sheet.protectedRanges ?? []).map((range) => ({ ...range })),
         values: (sheet.values ?? []).map((row) => [...row])
       }
     ])
@@ -114,6 +116,7 @@ function createInMemorySheets(initialSheets = {}) {
 
     const created = {
       sheetId: nextSheetId,
+      protectedRanges: [],
       values: []
     };
     nextSheetId += 1;
@@ -269,7 +272,8 @@ function createInMemorySheets(initialSheets = {}) {
                 properties: {
                   title,
                   sheetId: sheet.sheetId
-                }
+                },
+                protectedRanges: sheet.protectedRanges
               }))
             }
           };
@@ -293,6 +297,18 @@ function createInMemorySheets(initialSheets = {}) {
                   }
                 }
               });
+              continue;
+            }
+
+            if (operation.addProtectedRange?.protectedRange) {
+              const target = [...sheetEntries.values()].find(
+                (sheet) => sheet.sheetId === operation.addProtectedRange.protectedRange.range?.sheetId
+              );
+
+              if (target) {
+                target.protectedRanges.push({ ...operation.addProtectedRange.protectedRange });
+              }
+
               continue;
             }
 
@@ -505,6 +521,14 @@ test("comms specialist stays distinct from comms in canonical ordering", () => {
   ]);
 });
 
+test("department classifier maps officers and specialist departments correctly", () => {
+  assert.equal(__testing.classifyAppointmentDepartment("SCSE (OUT)"), "Officers");
+  assert.equal(__testing.classifyAppointmentDepartment("OPS 3"), "Officers");
+  assert.equal(__testing.classifyAppointmentDepartment("Chief Comms Specialist"), "Comms Specialist");
+  assert.equal(__testing.classifyAppointmentDepartment("Comms 2"), "Comms");
+  assert.equal(__testing.classifyAppointmentDepartment("Unknown Role"), null);
+});
+
 test("month slice maps row numbers by live appointment labels instead of row index", () => {
   const slice = __testing.createMonthSliceFromValues(
     new Date("2026-03-01T12:00:00.000Z"),
@@ -527,6 +551,37 @@ test("month slice maps row numbers by live appointment labels instead of row ind
   });
   assert.equal(slice.snapshot.statusesByDay.get(1)[0], "PRESENT");
   assert.equal(slice.snapshot.statusesByDay.get(1)[1], "WFH");
+});
+
+test("month slice canonicalizes common free-text attendance aliases", () => {
+  const slice = __testing.createMonthSliceFromValues(
+    new Date("2026-03-01T12:00:00.000Z"),
+    [
+      ["Appointment", "1 Mar", "2 Mar", "3 Mar"],
+      ["ALPHA", "On Course", "Public Holiday", "Work from Home"]
+    ],
+    {
+      timezone: "Asia/Singapore",
+      rosterStopMarkers: []
+    },
+    ["ALPHA"]
+  );
+
+  assert.equal(slice.snapshot.statusesByDay.get(1)[0], "OC");
+  assert.equal(slice.snapshot.statusesByDay.get(2)[0], "PH");
+  assert.equal(slice.snapshot.statusesByDay.get(3)[0], "WFH");
+  assert.deepEqual(
+    slice.aliasCorrections.map((entry) => ({
+      rowNumber: entry.rowNumber,
+      columnIndex: entry.columnIndex,
+      normalizedValue: entry.normalizedValue
+    })),
+    [
+      { rowNumber: 2, columnIndex: 1, normalizedValue: "OC" },
+      { rowNumber: 2, columnIndex: 2, normalizedValue: "PH" },
+      { rowNumber: 2, columnIndex: 3, normalizedValue: "WFH" }
+    ]
+  );
 });
 
 test("pure row reordering is repaired by rewriting the managed rows in canonical order", async () => {
@@ -593,6 +648,65 @@ test("existing human-managed headers are preserved when already populated", asyn
   );
 
   assert.equal(calls.length, 0);
+});
+
+test("existing monthly sheets get protections for the header row and appointment column", async () => {
+  const fake = createInMemorySheets({
+    ONBOARDING: {
+      sheetId: 1,
+      values: [
+        ["Appointment", "Secret Code"],
+        ["ALPHA", "CODE-1"]
+      ]
+    },
+    "Mar 26": {
+      sheetId: 2,
+      values: [
+        ["Appointment", "1 Mar"],
+        ["ALPHA", "PRESENT"]
+      ]
+    }
+  });
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({
+    ok: true,
+    json: async () => ({ data: { holidays: [] } })
+  });
+
+  try {
+    await syncOnboardingRoster(
+      fake.client,
+      {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: [],
+        onboardingSheetTitle: "ONBOARDING",
+        attendanceOptions: ["PRESENT", "WFH"],
+        googleServiceAccountEmail: "bot@example.com"
+      }
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  const protectionRequests = fake.calls.batchUpdateRequests
+    .flat()
+    .filter((request) => request.addProtectedRange);
+
+  assert.equal(protectionRequests.length, 4);
+  assert.deepEqual(
+    protectionRequests.map((request) => request.addProtectedRange.protectedRange.description),
+    [
+      "attendance-bot:protect-header-row",
+      "attendance-bot:protect-appointment-column",
+      "attendance-bot:protect-header-row",
+      "attendance-bot:protect-appointment-column"
+    ]
+  );
+  assert.deepEqual(
+    protectionRequests.map((request) => request.addProtectedRange.protectedRange.editors?.users ?? []),
+    [["bot@example.com"], ["bot@example.com"], ["bot@example.com"], ["bot@example.com"]]
+  );
 });
 
 test("date lookup follows the actual header row instead of fixed column offsets", () => {
@@ -1009,6 +1123,25 @@ test("retry wrapper fails after max retry attempts", async () => {
   assert.equal(attempts, 3);
 });
 
+test("retry wrapper times out stalled requests instead of hanging forever", async () => {
+  const startedAt = Date.now();
+
+  await assert.rejects(
+    __testing.runGoogleSheetsRequest(
+      "timeout-test",
+      async () => new Promise(() => {}),
+      {
+        maxAttempts: 1,
+        timeoutMs: 5,
+        logFn: () => {}
+      }
+    ),
+    /timed out/
+  );
+
+  assert.ok(Date.now() - startedAt < 250);
+});
+
 test("pending attendance overlays replace the snapshot value seen by the bot", async () => {
   const { applyAttendanceEntriesToSnapshotBundle } = await import("../src/googleSheets.js");
   const snapshotBundle = {
@@ -1283,6 +1416,51 @@ test("five-minute reconciliation prefers direct sheet edits over queued bot chan
     assert.deepEqual(result.writtenEventIds, []);
     assert.equal(result.conflictedEvents.length, 1);
     assert.equal(result.conflictedEvents[0].reason, "cell_value_changed_by_human");
+  });
+});
+
+test("forced snapshot preload rewrites common aliases back to canonical attendance codes", async () => {
+  await withTempDataDir(async (tempDir) => {
+    const fake = createInMemorySheets({
+      ONBOARDING: {
+        sheetId: 1,
+        values: [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", "CODE-1"]
+        ]
+      },
+      "Mar 26": {
+        sheetId: 2,
+        values: [
+          ["Appointment", "24 Mar", "25 Mar"],
+          ["ALPHA", "On Course", "Public Holiday"]
+        ]
+      }
+    });
+
+    process.env.ATTENDANCE_BOT_DATA_DIR = tempDir;
+
+    await preloadAttendanceSnapshots(
+      fake.client,
+      {
+        spreadsheetId: "spreadsheet-id",
+        timezone: "Asia/Singapore",
+        rosterStopMarkers: [],
+        onboardingSheetTitle: "ONBOARDING"
+      },
+      {
+        force: true,
+        normalizeAliases: true,
+        date: new Date("2026-03-24T12:00:00.000Z"),
+        targetDates: [new Date("2026-03-24T12:00:00.000Z")]
+      }
+    );
+
+    assert.deepEqual(fake.calls.batchValueUpdates.at(-1), [
+      { range: "'Mar 26'!B2", values: [["OC"]] },
+      { range: "'Mar 26'!C2", values: [["PH"]] }
+    ]);
+    assert.deepEqual(fake.getSheetValues("Mar 26").slice(1, 2), [["ALPHA", "OC", "PH"]]);
   });
 });
 
