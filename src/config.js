@@ -1,7 +1,18 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
 import dotenv from "dotenv";
+import YAML from "yaml";
 import { getSettings } from "./storage.js";
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const SETTINGS_SCHEMA_VERSION = 1;
+const SETTINGS_FILE_PATH = process.env.SETTINGS_FILE_PATH?.trim()
+  || path.resolve(process.cwd(), "settings.yaml");
 
 function requireEnv(name) {
   const value = process.env[name];
@@ -20,61 +31,320 @@ function parseList(value) {
     .filter(Boolean);
 }
 
-export const defaultAttendanceOptions = [
-  "PRESENT",
-  "DUTY",
-  "PH",
-  "OSD",
-  "OE",
-  "WFH",
-  "FISHING",
-  "OIL",
-  "EMBARK OFF",
-  "OFF",
-  "DISEMBARK OFF",
-  "RR",
-  "SR",
-  "OS",
-  "TNB",
-  "YARD",
-  "ORCA",
-  "RSO",
-  "MC",
-  "OML",
-  "MA",
-  "HL",
-  "RSI",
-  "LL",
-  "CCL",
-  "PCL",
-  "CSL",
-  "COMPASSIONATE",
-  "PTL",
-  "OL",
-  "AO",
-  "68",
-  "69",
-  "70",
-  "71",
-  "73",
-  "OC",
-  "ORD",
-  "POST OUT",
-  "IPPT",
-  "FMSS",
-  "CNB",
-  "CST",
-  "DCTC"
-];
+function normalizeKey(value) {
+  return String(value ?? "")
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, "_");
+}
+
+function normalizeAppointmentName(value) {
+  return String(value ?? "").trim().toUpperCase();
+}
+
+function ensureObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+
+  return value;
+}
+
+function ensureNonEmptyString(value, label) {
+  const normalized = String(value ?? "").trim();
+
+  if (!normalized) {
+    throw new Error(`${label} must be a non-empty string.`);
+  }
+
+  return normalized;
+}
+
+function sortNodes(left, right) {
+  const leftOrder = Number.isFinite(left.order) ? left.order : Number.MAX_SAFE_INTEGER;
+  const rightOrder = Number.isFinite(right.order) ? right.order : Number.MAX_SAFE_INTEGER;
+
+  if (leftOrder !== rightOrder) {
+    return leftOrder - rightOrder;
+  }
+
+  return left.name.localeCompare(right.name);
+}
+
+function buildHierarchyTraversal(nodesById, parentId = null, results = []) {
+  const children = [...nodesById.values()]
+    .filter((node) => (node.parentId ?? null) === parentId)
+    .sort(sortNodes);
+
+  for (const child of children) {
+    results.push(child);
+    buildHierarchyTraversal(nodesById, child.id, results);
+  }
+
+  return results;
+}
+
+function validateHierarchyCycle(nodesById, nodeId, active = new Set(), seen = new Set()) {
+  if (active.has(nodeId)) {
+    throw new Error(`Hierarchy contains a cycle at node '${nodeId}'.`);
+  }
+
+  if (seen.has(nodeId)) {
+    return;
+  }
+
+  active.add(nodeId);
+  seen.add(nodeId);
+
+  const node = nodesById.get(nodeId);
+  const children = [...nodesById.values()].filter((entry) => entry.parentId === node.id);
+
+  for (const child of children) {
+    validateHierarchyCycle(nodesById, child.id, active, seen);
+  }
+
+  active.delete(nodeId);
+}
+
+async function loadSettingsDocument() {
+  let rawText = "";
+
+  try {
+    rawText = await readFile(SETTINGS_FILE_PATH, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new Error(
+        `Missing required settings file at ${SETTINGS_FILE_PATH}. Set SETTINGS_FILE_PATH or add settings.yaml.`
+      );
+    }
+
+    throw error;
+  }
+
+  let parsed;
+
+  try {
+    parsed = YAML.parse(rawText);
+  } catch (error) {
+    throw new Error(`Unable to parse ${SETTINGS_FILE_PATH}: ${error.message}`);
+  }
+
+  const document = ensureObject(parsed, "settings.yaml");
+  const schemaVersion = Number(document.schemaVersion ?? document.version ?? 0);
+
+  if (schemaVersion !== SETTINGS_SCHEMA_VERSION) {
+    throw new Error(
+      `settings.yaml schemaVersion must be ${SETTINGS_SCHEMA_VERSION}. Received ${document.schemaVersion ?? document.version ?? "undefined"}.`
+    );
+  }
+
+  const unit = ensureObject(document.unit, "unit");
+  const unitName = ensureNonEmptyString(unit.name, "unit.name");
+  const unitId = String(unit.id ?? unitName)
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "default-unit";
+
+  const hierarchyEntries = Array.isArray(document.hierarchy) ? document.hierarchy : [];
+
+  if (hierarchyEntries.length === 0) {
+    throw new Error("hierarchy must contain at least one department or section node.");
+  }
+
+  const nodesById = new Map();
+
+  for (const [index, entry] of hierarchyEntries.entries()) {
+    const node = ensureObject(entry, `hierarchy[${index}]`);
+    const id = ensureNonEmptyString(node.id, `hierarchy[${index}].id`);
+
+    if (nodesById.has(id)) {
+      throw new Error(`Duplicate hierarchy node id '${id}'.`);
+    }
+
+    const type = ensureNonEmptyString(node.type, `hierarchy[${index}].type`).toLowerCase();
+
+    if (!["department", "section"].includes(type)) {
+      throw new Error(`hierarchy[${index}].type must be 'department' or 'section'.`);
+    }
+
+    nodesById.set(id, {
+      id,
+      key: normalizeKey(id),
+      name: ensureNonEmptyString(node.name, `hierarchy[${index}].name`),
+      type,
+      parentId: node.parentId ? ensureNonEmptyString(node.parentId, `hierarchy[${index}].parentId`) : null,
+      order: Number.isFinite(Number(node.order)) ? Number(node.order) : index
+    });
+  }
+
+  for (const node of nodesById.values()) {
+    if (node.parentId && !nodesById.has(node.parentId)) {
+      throw new Error(`Hierarchy node '${node.id}' references missing parent '${node.parentId}'.`);
+    }
+  }
+
+  for (const nodeId of nodesById.keys()) {
+    validateHierarchyCycle(nodesById, nodeId);
+  }
+
+  const orderedHierarchy = buildHierarchyTraversal(nodesById);
+  const hierarchyOptions = orderedHierarchy.map((node) => ({
+    key: node.key,
+    id: node.id,
+    label: node.name,
+    type: node.type,
+    parentId: node.parentId
+  }));
+  const hierarchyNodeByKey = new Map(hierarchyOptions.map((node) => [node.key, node]));
+
+  const appointmentEntries = Array.isArray(document.appointments) ? document.appointments : [];
+
+  if (appointmentEntries.length === 0) {
+    throw new Error("appointments must contain at least one configured appointment.");
+  }
+
+  const appointmentMetadataByName = new Map();
+  const defaultAdminAppointments = [];
+  const configuredAppointments = [];
+
+  for (const [index, entry] of appointmentEntries.entries()) {
+    const appointment = ensureObject(entry, `appointments[${index}]`);
+    const name = ensureNonEmptyString(appointment.name, `appointments[${index}].name`);
+    const normalizedName = normalizeAppointmentName(name);
+
+    if (appointmentMetadataByName.has(normalizedName)) {
+      throw new Error(`Duplicate appointment '${name}' in settings.yaml.`);
+    }
+
+    const hierarchyNodeId = appointment.hierarchyNodeId
+      ? ensureNonEmptyString(appointment.hierarchyNodeId, `appointments[${index}].hierarchyNodeId`)
+      : null;
+
+    if (hierarchyNodeId && !nodesById.has(hierarchyNodeId)) {
+      throw new Error(
+        `Appointment '${name}' references missing hierarchy node '${hierarchyNodeId}'.`
+      );
+    }
+
+    const meta = {
+      name,
+      normalizedName,
+      hierarchyNodeId,
+      hierarchyNodeKey: hierarchyNodeId ? normalizeKey(hierarchyNodeId) : null,
+      defaultAdmin: appointment.defaultAdmin === true,
+      order: Number.isFinite(Number(appointment.order)) ? Number(appointment.order) : index
+    };
+
+    appointmentMetadataByName.set(normalizedName, meta);
+    configuredAppointments.push(name);
+
+    if (meta.defaultAdmin) {
+      defaultAdminAppointments.push(name);
+    }
+  }
+
+  const attendance = ensureObject(document.attendance, "attendance");
+  const groups = Array.isArray(attendance.groups) ? attendance.groups : [];
+
+  if (groups.length === 0) {
+    throw new Error("attendance.groups must contain at least one group.");
+  }
+
+  const attendanceGroups = [];
+  const seenGroupIds = new Set();
+  const seenOptions = new Set();
+
+  for (const [index, entry] of groups.entries()) {
+    const group = ensureObject(entry, `attendance.groups[${index}]`);
+    const id = ensureNonEmptyString(group.id, `attendance.groups[${index}].id`);
+
+    if (seenGroupIds.has(id)) {
+      throw new Error(`Duplicate attendance group id '${id}'.`);
+    }
+
+    seenGroupIds.add(id);
+
+    const options = Array.isArray(group.options) ? group.options : [];
+
+    if (options.length === 0) {
+      throw new Error(`attendance.groups[${index}].options must contain at least one option.`);
+    }
+
+    const normalizedOptions = options.map((option, optionIndex) =>
+      ensureNonEmptyString(option, `attendance.groups[${index}].options[${optionIndex}]`).toUpperCase()
+    );
+
+    for (const option of normalizedOptions) {
+      if (seenOptions.has(option)) {
+        throw new Error(`Attendance option '${option}' appears in more than one group.`);
+      }
+
+      seenOptions.add(option);
+    }
+
+    attendanceGroups.push({
+      id,
+      key: normalizeKey(id),
+      label: ensureNonEmptyString(group.label, `attendance.groups[${index}].label`),
+      summaryLabel: String(group.summaryLabel ?? group.label).trim() || ensureNonEmptyString(group.label, `attendance.groups[${index}].label`),
+      options: normalizedOptions,
+      order: Number.isFinite(Number(group.order)) ? Number(group.order) : index
+    });
+  }
+
+  attendanceGroups.sort((left, right) => {
+    if (left.order !== right.order) {
+      return left.order - right.order;
+    }
+
+    return left.label.localeCompare(right.label);
+  });
+
+  const attendanceOptions = attendanceGroups.flatMap((group) => group.options);
+  const attendanceGroupByOption = new Map();
+
+  for (const group of attendanceGroups) {
+    for (const option of group.options) {
+      attendanceGroupByOption.set(option, group);
+    }
+  }
+
+  const appointmentOrderIndex = new Map(
+    [...appointmentMetadataByName.values()]
+      .sort((left, right) => {
+        if (left.order !== right.order) {
+          return left.order - right.order;
+        }
+
+        return left.name.localeCompare(right.name);
+      })
+      .map((entry, index) => [entry.normalizedName, index])
+  );
+
+  return {
+    schemaVersion,
+    unit: {
+      id: unitId,
+      name: unitName
+    },
+    hierarchy: hierarchyOptions,
+    hierarchyNodeByKey,
+    appointmentMetadataByName,
+    configuredAppointments,
+    defaultAdminAppointments,
+    attendanceGroups,
+    attendanceOptions,
+    attendanceGroupByOption,
+    appointmentOrderIndex
+  };
+}
+
+export const defaultAttendanceOptions = [];
 const ATTENDANCE_OPTION_SCHEMA_VERSION = 2;
 
 const privateKey = requireEnv("GOOGLE_PRIVATE_KEY").replace(/\\n/g, "\n");
-export const onboardingAttendanceOptions =
-  parseList(process.env.ATTENDANCE_OPTIONS).length > 0
-    ? parseList(process.env.ATTENDANCE_OPTIONS)
-    : defaultAttendanceOptions;
-
-export const config = {
+const runtimeConfig = {
   telegramBotToken: requireEnv("TELEGRAM_BOT_TOKEN"),
   spreadsheetId: requireEnv("GOOGLE_SHEETS_SPREADSHEET_ID"),
   googleServiceAccountEmail: requireEnv("GOOGLE_SERVICE_ACCOUNT_EMAIL"),
@@ -83,15 +353,44 @@ export const config = {
   firstReminderTime: process.env.FIRST_REMINDER_TIME || "07:00",
   secondReminderTime: process.env.SECOND_REMINDER_TIME || "08:00",
   onboardingSheetTitle: process.env.ONBOARDING_SHEET_TITLE || "ONBOARDING",
-  attendanceOptions: [...onboardingAttendanceOptions],
-  onboardingAttendanceOptions: [...onboardingAttendanceOptions],
   rosterStopMarkers: parseList(process.env.ROSTER_STOP_MARKERS || ""),
-  defaultAdminAppointments: parseList(
-    process.env.DEFAULT_ADMIN_APPOINTMENTS || "SCSE,Coxn,CO,XO,OPS 1"
-  )
+  settingsFilePath: SETTINGS_FILE_PATH,
+  unit: null,
+  hierarchy: [],
+  hierarchyNodeByKey: new Map(),
+  appointmentMetadataByName: new Map(),
+  configuredAppointments: [],
+  appointmentOrderIndex: new Map(),
+  defaultAdminAppointments: [],
+  attendanceGroups: [],
+  attendanceOptions: [],
+  onboardingAttendanceOptions: []
 };
 
+function applyUnitSettings(config, unitSettings) {
+  config.unit = unitSettings.unit;
+  config.hierarchy = unitSettings.hierarchy;
+  config.hierarchyNodeByKey = unitSettings.hierarchyNodeByKey;
+  config.appointmentMetadataByName = unitSettings.appointmentMetadataByName;
+  config.configuredAppointments = unitSettings.configuredAppointments;
+  config.appointmentOrderIndex = unitSettings.appointmentOrderIndex;
+  config.defaultAdminAppointments = unitSettings.defaultAdminAppointments;
+  config.attendanceGroups = unitSettings.attendanceGroups;
+  config.onboardingAttendanceOptions = [...unitSettings.attendanceOptions];
+  config.attendanceOptions = [...unitSettings.attendanceOptions];
+  config.defaultAttendanceOptions = [...unitSettings.attendanceOptions];
+}
+
+export const config = runtimeConfig;
+
+export async function loadUnitSettings() {
+  return loadSettingsDocument();
+}
+
 export async function applyStoredConfigOverrides() {
+  const unitSettings = await loadSettingsDocument();
+  applyUnitSettings(config, unitSettings);
+
   const settings = await getSettings();
 
   if (

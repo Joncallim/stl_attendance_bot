@@ -175,6 +175,7 @@ test("options reset restores onboarding defaults and refreshes caches", async ()
   const config = {
     attendanceOptions: ["TEMP", "OTHER"],
     onboardingAttendanceOptions: ["PRESENT", "WFH", "OS"],
+    attendanceGroups: [],
     timezone: "Asia/Singapore"
   };
   const calls = [];
@@ -207,7 +208,7 @@ test("options reset restores onboarding defaults and refreshes caches", async ()
     "refreshAdminCache",
     "preloadSheetSnapshots:true"
   ]);
-  assert.equal(messages[0].message, "Attendance options have been reset to the Onboarding default list.");
+  assert.equal(messages[0].message, "Attendance options have been reset to the settings.yaml default list.");
   assert.ok(messages[0].extra);
 });
 
@@ -257,6 +258,22 @@ test("attendance options description uses canonical order and aligned labels", (
   assert.doesNotMatch(description, /sort the list back/i);
 });
 
+test("attendance options description groups codes using configured attendance groups", () => {
+  const description = __testing.buildAttendanceOptionsDescription(
+    ["PRESENT", "DUTY", "LL", "OL"],
+    ["PRESENT", "DUTY", "LL", "OL"],
+    [
+      { label: "Present", options: ["PRESENT", "DUTY"] },
+      { label: "Leave", options: ["LL", "OL"] }
+    ]
+  );
+
+  assert.match(description, /Present:/);
+  assert.match(description, /Leave:/);
+  assert.ok(description.indexOf("Present:") < description.indexOf("Leave:"));
+  assert.ok(description.indexOf("PRESENT") < description.indexOf("LL"));
+});
+
 test("department workweek view uses the viewer's own department for non-admins", () => {
   const cache = {
     activeCodes: [
@@ -279,10 +296,23 @@ test("department workweek view uses the viewer's own department for non-admins",
       }]])
     }
   };
+  const config = {
+    timezone: "Asia/Singapore",
+    hierarchy: [
+      { key: "OFFICERS", label: "Officers" },
+      { key: "COMMS", label: "Comms" }
+    ],
+    appointmentMetadataByName: new Map([
+      ["CO", { hierarchyNodeKey: "OFFICERS" }],
+      ["SCSE (IN)", { hierarchyNodeKey: "OFFICERS" }],
+      ["CCOMMS", { hierarchyNodeKey: "COMMS" }],
+      ["COMMS 1", { hierarchyNodeKey: "COMMS" }]
+    ])
+  };
 
   const viewModel = __testing.buildDepartmentWorkweekViewModel(
     cache,
-    { timezone: "Asia/Singapore" },
+    config,
     { appointment: "Comms 1" },
     { departmentKey: "OFFICERS", isAdminUser: false, weekOffset: 0 }
   );
@@ -310,10 +340,23 @@ test("department workweek view lets admins switch and keeps department order fix
       }]])
     }
   };
+  const config = {
+    timezone: "Asia/Singapore",
+    hierarchy: [
+      { key: "OFFICERS", label: "Officers" },
+      { key: "COMMS_SPECIALIST", label: "Comms Specialist" }
+    ],
+    appointmentMetadataByName: new Map([
+      ["CO", { hierarchyNodeKey: "OFFICERS" }],
+      ["SCSE", { hierarchyNodeKey: "OFFICERS" }],
+      ["CHIEF COMMS SPECIALIST", { hierarchyNodeKey: "COMMS_SPECIALIST" }],
+      ["COMMS SPECIALIST 1", { hierarchyNodeKey: "COMMS_SPECIALIST" }]
+    ])
+  };
 
   const viewModel = __testing.buildDepartmentWorkweekViewModel(
     cache,
-    { timezone: "Asia/Singapore" },
+    config,
     { appointment: "CO" },
     { departmentKey: "COMMS_SPECIALIST", isAdminUser: true, weekOffset: 0 }
   );
@@ -323,7 +366,7 @@ test("department workweek view lets admins switch and keeps department order fix
   assert.equal(viewModel.canSwitchDepartments, true);
   assert.deepEqual(
     viewModel.allDepartmentOptions.map((entry) => entry.label),
-    ["Officers", "C2", "WS", "WCS", "UW", "Nav", "Comms", "Electronic Specialist", "Comms Specialist", "MS", "ECS", "Chef"]
+    ["Officers", "Comms Specialist"]
   );
   assert.deepEqual(
     viewModel.members.map((member) => member.appointment),
@@ -449,6 +492,37 @@ test("summary message uses grouped headers and can hide unaccounted", () => {
   assert.match(message, /<b><u>In Base:<\/u><\/b> 1/);
   assert.match(message, /IPPT: 1/);
   assert.doesNotMatch(message, /<b>Unaccounted:/);
+});
+
+test("summary message uses configured attendance groups when provided", () => {
+  const message = __testing.formatSummaryMessage({
+    date: new Date("2026-03-24T12:00:00.000Z"),
+    synchronizedAt: new Date("2026-03-24T12:30:00.000Z").toISOString(),
+    summary: {
+      total: 4,
+      accountedAttendance: 4,
+      unaccounted: 0
+    },
+    counts: [
+      ["PRESENT", 1],
+      ["DUTY", 1],
+      ["LL", 1],
+      ["OL", 1]
+    ]
+  }, {
+    timezone: "Asia/Singapore",
+    attendanceGroups: [
+      { summaryLabel: "Total PRESENT", label: "Present", options: ["PRESENT", "DUTY"] },
+      { summaryLabel: "Leave", label: "Leave", options: ["LL", "OL"] }
+    ]
+  });
+
+  assert.match(message, /<b><u>Total PRESENT:<\/u><\/b> 2/);
+  assert.match(message, /PRESENT: 1/);
+  assert.match(message, /DUTY: 1/);
+  assert.match(message, /<b><u>Leave:<\/u><\/b> 2/);
+  assert.match(message, /LL: 1/);
+  assert.match(message, /OL: 1/);
 });
 
 test("summary menu can omit unaccounted button", () => {

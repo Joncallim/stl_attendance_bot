@@ -12,6 +12,7 @@ The bot supports:
 - reminder notifications
 - cached summaries and unaccounted views
 - local persistence so the bot can recover cleanly after restarts
+- unit-specific structure from `settings.yaml`
 
 ## Quick Start
 
@@ -21,12 +22,17 @@ The simplest path is Docker Compose.
 2. Create a Google Sheet.
 3. Create a Google service account, enable the Google Sheets API, and share the sheet with that service account email.
 4. Copy `.env.example` to `.env`.
-5. Fill in these required values in `.env`:
+5. Copy `settings.yaml` and edit it for your unit:
+   - unit metadata
+   - department and section hierarchy
+   - appointment definitions and default admins
+   - attendance groups and options
+6. Fill in these required values in `.env`:
    - `TELEGRAM_BOT_TOKEN`
    - `GOOGLE_SHEETS_SPREADSHEET_ID`
    - `GOOGLE_SERVICE_ACCOUNT_EMAIL`
    - `GOOGLE_PRIVATE_KEY`
-6. Start the bot:
+7. Start the bot:
 
 ```bash
 docker compose up -d --build
@@ -127,6 +133,17 @@ If there is no roster data anywhere, it seeds:
 - The user enters the secret code to bind Telegram to the appointment.
 - If an appointment is already bound to a different Telegram account, another user cannot claim it with the same code.
 - Deregistration clears the binding and rotates the code.
+
+## `settings.yaml`
+
+`settings.yaml` is the deploy-time source of truth for unit structure.
+
+- `unit`: unit identity metadata
+- `hierarchy`: explicit department and section nodes
+- `appointments`: configured appointments, hierarchy assignment, and `defaultAdmin`
+- `attendance.groups`: grouped attendance options used by Telegram menus and summaries
+
+The bot expects `settings.yaml` at the repo root by default. Override the path with `SETTINGS_FILE_PATH` if needed.
 
 ## Attendance Flow
 
@@ -243,10 +260,10 @@ DCTC
 
 Behavior:
 
-- these values seed the onboarding workflow and the Google Sheets dropdown validation
+- these values come from `settings.yaml` and seed the Google Sheets dropdown validation
 - admins can add, remove, and reset options from Telegram
 - changes are stored in `data/settings.json`
-- resetting options restores the env-configured defaults
+- resetting options restores the `settings.yaml` defaults
 
 ## Local Data Files
 
@@ -270,13 +287,14 @@ cp .env.example .env
 ```
 
 2. Edit `.env`.
-3. Start the bot:
+3. Edit `settings.yaml` for the unit you are deploying.
+4. Start the bot:
 
 ```bash
 docker compose up -d --build
 ```
 
-4. Check logs:
+5. Check logs:
 
 ```bash
 docker compose logs -f
@@ -297,6 +315,18 @@ Steps:
 cp .env.example .env
 npm install
 npm start
+```
+
+Edit `settings.yaml` before starting the bot. To use a different file location:
+
+```bash
+SETTINGS_FILE_PATH=/path/to/settings.yaml npm start
+```
+
+For `pm2`, use the same startup contract:
+
+```bash
+pm2 start npm --name attendance-bot -- start
 ```
 
 Useful commands:
@@ -321,16 +351,15 @@ npm test
 - `FIRST_REMINDER_TIME`
 - `SECOND_REMINDER_TIME`
 - `ONBOARDING_SHEET_TITLE`
-- `DEFAULT_ADMIN_APPOINTMENTS`
-- `ATTENDANCE_OPTIONS`
 - `LOG_FILE_PATH`
+- `SETTINGS_FILE_PATH`
 
 ### Notes
 
 - `GOOGLE_PRIVATE_KEY` must keep newline escapes as `\n`.
 - `BOT_TIMEZONE` defaults to `Asia/Singapore`.
 - `ONBOARDING_SHEET_TITLE` defaults to `ONBOARDING`.
-- `DEFAULT_ADMIN_APPOINTMENTS` defaults to `SCSE,Coxn,CO,XO,OPS 1`.
+- `SETTINGS_FILE_PATH` defaults to `./settings.yaml`.
 - `ROSTER_STOP_MARKERS` is still present in config, but the bot now uses `ONBOARDING` as the canonical roster source and does not rely on `Remarks`.
 
 ## Google Setup
