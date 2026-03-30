@@ -4,23 +4,20 @@ import https from "node:https";
 
 function createIpv4Lookup() {
   return (hostname, options, callback) => {
-    let resolvedOptions = options;
     let resolvedCallback = callback;
 
-    if (typeof resolvedOptions === "function") {
-      resolvedCallback = resolvedOptions;
-      resolvedOptions = {};
+    if (typeof options === "function") {
+      resolvedCallback = options;
     }
 
-    dns.lookup(
-      hostname,
-      {
-        ...(resolvedOptions ?? {}),
-        family: 4,
-        all: false
-      },
-      resolvedCallback
-    );
+    dns.lookup(hostname, { family: 4, all: false }, (error, address, family) => {
+      if (error) {
+        resolvedCallback(error);
+        return;
+      }
+
+      resolvedCallback(null, address, family ?? 4);
+    });
   };
 }
 
