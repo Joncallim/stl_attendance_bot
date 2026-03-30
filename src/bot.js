@@ -2422,6 +2422,25 @@ async function ensureSheetReadiness(sheets, config, cache, options = {}) {
   await cache.syncManager.runCycle({ force: true, reason: "foreground" });
 }
 
+function triggerBackgroundSheetRefresh(cache, reason = "background") {
+  const syncManager = cache?.syncManager;
+
+  if (!syncManager) {
+    return false;
+  }
+
+  const status = syncManager.getStatus?.() ?? { cycleInProgress: false };
+
+  if (status.cycleInProgress) {
+    return false;
+  }
+
+  syncManager.runCycle({ force: false, reason }).catch((error) => {
+    console.error("Background sync refresh failed:", error);
+  });
+  return true;
+}
+
 async function applyAttendanceOptionChange(sheets, config, cache, nextOptions) {
   await withSheetOperation(async () => {
     config.attendanceOptions = nextOptions;
@@ -2978,29 +2997,109 @@ async function handleInviteCommand(ctx, bot, config, deps) {
   );
 }
 
+function createUiOperationTimeoutError(label, timeoutMs) {
+  const error = new Error(`${label} timed out after ${timeoutMs}ms`);
+  error.name = "UiOperationTimeoutError";
+  error.code = "ETIMEDOUT";
+  error.timeoutMs = timeoutMs;
+  return error;
+}
+
+async function withUiOperationTimeout(label, operation, timeoutMs = 8000) {
+  let timeoutId = null;
+
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(createUiOperationTimeoutError(label, timeoutMs));
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+  }
+}
+
 async function handleSyncRosterAdminAction(ctx, config, deps) {
-  const roster = await deps.syncRosterState(deps.sheets, config);
-  await deps.ensureNextMonthSheetExists(deps.sheets, config);
-  await deps.refreshAdminCache(deps.cache, config);
-  await deps.preloadSheetSnapshots(deps.sheets, config, deps.cache, { force: true });
+  const timeoutMs = deps.timeoutMs ?? 8000;
+
   await deps.sendOrUpdateAdminMessage(
     ctx,
-    `Roster synced from ${config.onboardingSheetTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.`
+    "Syncing roster with Google Sheets. If Google is slow, this will stop early instead of hanging."
   );
+
+  try {
+    const roster = await withUiOperationTimeout(
+      "Roster sync",
+      async () => {
+        const nextRoster = await deps.syncRosterState(deps.sheets, config);
+        await deps.ensureNextMonthSheetExists(deps.sheets, config);
+        await deps.refreshAdminCache(deps.cache, config);
+        await deps.preloadSheetSnapshots(deps.sheets, config, deps.cache, { force: true });
+        return nextRoster;
+      },
+      timeoutMs
+    );
+
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      `Roster synced from ${config.onboardingSheetTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.`
+    );
+  } catch (error) {
+    if (error?.name === "UiOperationTimeoutError") {
+      await deps.sendOrUpdateAdminMessage(
+        ctx,
+        "Roster sync is taking too long because Google Sheets is slow. Please try again later."
+      );
+      return;
+    }
+
+    throw error;
+  }
 }
 
 async function handleOptionsResetAction(ctx, config, deps) {
-  await deps.resetAttendanceOptions();
-  config.attendanceOptions = [...config.onboardingAttendanceOptions];
-  await deps.syncRosterState(deps.sheets, config);
-  await deps.ensureNextMonthSheetExists(deps.sheets, config);
-  await deps.refreshAdminCache(deps.adminCache, config);
-  await deps.preloadSheetSnapshots(deps.sheets, config, deps.adminCache, { force: true });
+  const timeoutMs = deps.timeoutMs ?? 8000;
+
   await deps.sendOrUpdateAdminMessage(
     ctx,
-    "Attendance options have been reset to the settings.yaml default list.",
-    buildAttendanceOptionsMenu()
+    "Resetting attendance options and refreshing active sheets. This will stop early if Google Sheets is slow."
   );
+
+  try {
+    await withUiOperationTimeout(
+      "Attendance option reset",
+      async () => {
+        await deps.resetAttendanceOptions();
+        config.attendanceOptions = [...config.onboardingAttendanceOptions];
+        await deps.syncRosterState(deps.sheets, config);
+        await deps.ensureNextMonthSheetExists(deps.sheets, config);
+        await deps.refreshAdminCache(deps.adminCache, config);
+        await deps.preloadSheetSnapshots(deps.sheets, config, deps.adminCache, { force: true });
+      },
+      timeoutMs
+    );
+
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      "Attendance options have been reset to the settings.yaml default list.",
+      buildAttendanceOptionsMenu()
+    );
+  } catch (error) {
+    if (error?.name === "UiOperationTimeoutError") {
+      await deps.sendOrUpdateAdminMessage(
+        ctx,
+        "Attendance option reset is taking too long because Google Sheets is slow. Please try again later."
+      );
+      return;
+    }
+
+    throw error;
+  }
 }
 
 function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {} }) {
@@ -3653,7 +3752,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action === "attendance") {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:attendance");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3665,7 +3764,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action === "week") {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:week");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3678,7 +3777,10 @@ export function createAttendanceBot(config) {
     }
 
     if (action === "week:this" || action === "week:next") {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(
+        adminCache,
+        action === "week:next" ? "home:week:next" : "home:week:this"
+      );
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3691,7 +3793,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action === "department") {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:department");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3705,7 +3807,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("department:view:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:department:view");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3723,7 +3825,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("department:switch:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:department:switch");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3761,7 +3863,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("department:select:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:department:select");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3777,7 +3879,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("department:edit:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:department:edit");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3841,7 +3943,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("department:pickpage:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:department:pickpage");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3885,7 +3987,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("department:pickoption:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:department:pickoption");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3953,7 +4055,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("attendance:page:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:attendance:page");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -3988,7 +4090,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("pick:attendance:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:pick:attendance");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -4049,7 +4151,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("week:page:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:week:page");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -4067,7 +4169,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action === "pick:week:skip" || action.startsWith("pick:week:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:pick:week");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -4240,7 +4342,7 @@ export function createAttendanceBot(config) {
 
     if (action === "summary") {
       const targetDate = new Date();
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:summary");
       await renderCachedSummaryOrWarmup(ctx, adminCache, config, targetDate, "home:main");
       return;
     }
@@ -4311,7 +4413,7 @@ export function createAttendanceBot(config) {
         return;
       }
 
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "home:summary:date");
       await renderCachedSummaryOrWarmup(ctx, adminCache, config, targetDate, "home:main");
       return;
     }
@@ -4362,13 +4464,13 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("menu:invite:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "admin:menu:invite");
       await renderInviteSubmenu(ctx, adminCache, Number(action.split(":")[2]));
       return;
     }
 
     if (action.startsWith("menu:deregister:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "admin:menu:deregister");
       await renderDeregisterSubmenu(ctx, adminCache, Number(action.split(":")[2]));
       return;
     }
@@ -4384,7 +4486,7 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("menu:appointments:remove:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "admin:menu:appointments:remove");
       await renderRemoveAppointmentSubmenu(ctx, adminCache, Number(action.split(":")[3]));
       return;
     }
@@ -4403,19 +4505,19 @@ export function createAttendanceBot(config) {
     }
 
     if (action.startsWith("menu:codes:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "admin:menu:codes");
       await renderCodesSubmenuPage(ctx, adminCache, Number(action.split(":")[2]));
       return;
     }
 
     if (action.startsWith("menu:addadmin:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "admin:menu:addadmin");
       await renderAddAdminSubmenu(ctx, adminCache, Number(action.split(":")[2]));
       return;
     }
 
     if (action.startsWith("menu:removeadmin:")) {
-      await ensureSheetReadiness(sheets, config, adminCache);
+      triggerBackgroundSheetRefresh(adminCache, "admin:menu:removeadmin");
       await renderRemoveAdminSubmenu(ctx, adminCache, Number(action.split(":")[2]));
       return;
     }
@@ -4455,12 +4557,34 @@ export function createAttendanceBot(config) {
     }
 
     if (action === "options:sort") {
-      await refreshAttendanceOptionUsage(sheets, config, adminCache);
       await sendOrUpdateAdminMessage(
         ctx,
-        "Attendance option usage has been refreshed. Display order remains canonical.",
-        buildAttendanceOptionsMenu()
+        "Refreshing attendance option usage from recent sheets. This will stop early if Google Sheets is slow."
       );
+
+      try {
+        await withUiOperationTimeout(
+          "Attendance option usage refresh",
+          async () => {
+            await refreshAttendanceOptionUsage(sheets, config, adminCache);
+          }
+        );
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "Attendance option usage has been refreshed. Display order remains canonical.",
+          buildAttendanceOptionsMenu()
+        );
+      } catch (error) {
+        if (error?.name === "UiOperationTimeoutError") {
+          await sendOrUpdateAdminMessage(
+            ctx,
+            "Attendance option usage refresh is taking too long because Google Sheets is slow. Please try again later."
+          );
+          return;
+        }
+
+        throw error;
+      }
       return;
     }
 
@@ -4672,6 +4796,7 @@ export const __testing = {
   handleOnboardCommand,
   handleOptionsResetAction,
   handleSyncRosterAdminAction,
+  triggerBackgroundSheetRefresh,
   renderInviteSubmenu,
   renderAttendanceOptionsMenu,
   registerBackgroundSchedules

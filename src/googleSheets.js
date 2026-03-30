@@ -1059,6 +1059,39 @@ async function readMonthlySheetRows(
   ).map((entry) => entry.row);
 }
 
+function getHeaderRowFromValues(values, fallbackHeader = []) {
+  const headerRow = (values[0] ?? []).map((value) => String(value ?? "").trim());
+  return headerRow.some(Boolean) ? headerRow : fallbackHeader;
+}
+
+function buildMonthlySheetRefreshContext(
+  values,
+  date,
+  config,
+  fallbackHeader = [],
+  canonicalAppointments = []
+) {
+  const header = getHeaderRowFromValues(values, fallbackHeader);
+  const existingAppointments = sanitizeAppointments(
+    values.slice(1).map((row) => row?.[0]),
+    config.rosterStopMarkers
+  );
+  const existingRows = buildLiveManagedMonthlyRows(
+    values,
+    header.length,
+    config.rosterStopMarkers,
+    canonicalAppointments
+  ).map((entry) => entry.row);
+  const liveSlice = createMonthSliceFromValues(date, values, config, canonicalAppointments);
+
+  return {
+    header,
+    existingAppointments,
+    existingRows,
+    liveSlice
+  };
+}
+
 async function writeMonthlySheetRows(
   sheets,
   spreadsheetId,
@@ -1237,7 +1270,6 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
     );
   }
 
-  const stopMarker = getPrimaryStopMarker(stopMarkers);
   const data = [];
 
   for (let index = 0; index < rows.length; index += 1) {
@@ -1257,10 +1289,10 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
     }
   }
 
-  if (stopMarker) {
+  if (parsed.stopRowNumber) {
     data.push({
-      range: `'${title}'!A${rows.length + 2}:A${rows.length + 2}`,
-      values: [[stopMarker]]
+      range: `'${title}'!A${parsed.stopRowNumber}:B${parsed.stopRowNumber}`,
+      values: [["", ""]]
     });
   }
 
@@ -1544,6 +1576,7 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
   });
   const sheet = ensuredSheet.sheet;
   const defaultHeader = getDefaultHeaderRow(date, config.timezone);
+  let monthlySheetValues = null;
 
   if (ensuredSheet.created) {
     await applyMonthlySheetLayout(
@@ -1555,27 +1588,21 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
       config.attendanceOptions,
       config.timezone
     );
+    monthlySheetValues = [defaultHeader];
   } else {
-    await ensureHeaderRowIfBlank(sheets, config.spreadsheetId, title, defaultHeader);
+    monthlySheetValues = await readSheetValues(sheets, config.spreadsheetId, title, "A1:ZZ1000");
+    const existingHeader = getHeaderRowFromValues(monthlySheetValues, []);
+
+    if (existingHeader.length === 0) {
+      await writeHeaderRow(sheets, config.spreadsheetId, title, defaultHeader);
+      monthlySheetValues = [defaultHeader, ...monthlySheetValues.slice(1)];
+    }
   }
   await ensureMonthlySheetProtections(
     sheets,
     config.spreadsheetId,
     sheet,
     config.googleServiceAccountEmail
-  );
-  const header = await readHeaderRow(
-    sheets,
-    config.spreadsheetId,
-    title,
-    defaultHeader
-  );
-
-  const existingAppointments = await readAppointmentColumn(
-    sheets,
-    config.spreadsheetId,
-    title,
-    config.rosterStopMarkers
   );
   const onboardingAppointments = await readCanonicalOnboardingAppointments(sheets, config, {
     cache: options.cache,
@@ -1587,18 +1614,16 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
   const preferredAppointments = onboardingAppointments.length > 0
     ? onboardingAppointments
     : appointments;
-  const existingRows = await readMonthlySheetRows(
-    sheets,
-    config.spreadsheetId,
-    title,
-    header.length,
-    config.rosterStopMarkers,
-    preferredAppointments
-  );
-  const liveSlice = createMonthSliceFromValues(
+  const {
+    header,
+    existingAppointments,
+    existingRows,
+    liveSlice
+  } = buildMonthlySheetRefreshContext(
+    monthlySheetValues ?? [defaultHeader],
     date,
-    await readSheetValues(sheets, config.spreadsheetId, title, "A1:ZZ1000"),
     config,
+    defaultHeader,
     preferredAppointments
   );
 
@@ -3392,6 +3417,7 @@ export const __testing = {
   ATTENDANCE_OPTION_USAGE_MONTH_WINDOW,
   buildQueuedAttendanceEventMetadata,
   buildManagedMonthlyRows,
+  buildMonthlySheetRefreshContext,
   buildLiveManagedMonthlyRows,
   buildDateColumnMap,
   buildHeaderUpdateRequest,

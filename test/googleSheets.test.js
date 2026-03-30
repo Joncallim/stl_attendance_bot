@@ -75,6 +75,7 @@ function createInMemorySheets(initialSheets = {}) {
   );
   const calls = {
     getSpreadsheet: 0,
+    getRanges: [],
     addedSheets: [],
     valueUpdates: [],
     batchValueUpdates: [],
@@ -359,6 +360,7 @@ function createInMemorySheets(initialSheets = {}) {
         },
         values: {
           get: async (request) => {
+            calls.getRanges.push(request.range);
             const parsedRange = parseRange(request.range);
             const sheet = ensureSheetEntry(parsedRange.title);
             return {
@@ -813,6 +815,40 @@ test("onboarding parsing reports duplicates instead of synthesizing new appointm
   assert.ok(!parsed.appointments.some((appointment) => appointment.includes("-")));
 });
 
+test("writeAppointmentColumn clears a legacy remarks boundary instead of rewriting it", async () => {
+  const fake = createInMemorySheets({
+    ONBOARDING: {
+      sheetId: 1,
+      values: [
+        ["Appointment", "Secret Code"],
+        ["ALPHA", "CODE"],
+        ["Remarks", ""]
+      ]
+    }
+  });
+
+  await __testing.writeAppointmentColumn(
+    fake.client,
+    "spreadsheet-id",
+    "ONBOARDING",
+    ["ALPHA"],
+    { stopMarkers: ["Remarks"] }
+  );
+
+  assert.equal(fake.calls.batchValueUpdates.length, 1);
+  assert.deepEqual(fake.calls.batchValueUpdates[0], [
+    {
+      range: "'ONBOARDING'!A3:B3",
+      values: [["", ""]]
+    }
+  ]);
+  assert.deepEqual(fake.getSheetValues("ONBOARDING").slice(0, 3), [
+    ["Appointment", "Secret Code"],
+    ["ALPHA", "CODE"],
+    ["", ""]
+  ]);
+});
+
 test("blank bootstrap falls back to USER1, USER2, and USER3", () => {
   assert.deepEqual(
     __testing.getBootstrapAppointments([]),
@@ -846,13 +882,12 @@ test("syncOnboardingRoster bootstraps a blank spreadsheet with onboarding and tw
       assert.equal(result.currentMonthTitle, currentMonthTitle);
       assert.equal(result.nextMonthTitle, nextMonthTitle);
       assert.deepEqual(
-        fake.getSheetValues("ONBOARDING").slice(0, 5),
+        fake.getSheetValues("ONBOARDING").slice(0, 4),
         [
           ["Appointment", "Secret Code"],
           ["USER1", ""],
           ["USER2", ""],
-          ["USER3", ""],
-          ["Remarks"]
+          ["USER3", ""]
         ]
       );
       assert.equal(fake.getSheetValues(currentMonthTitle)[0][0], "Appointment");
@@ -901,12 +936,11 @@ test("syncOnboardingRoster restores onboarding from the latest existing month sh
 
       assert.deepEqual(result.onboardingAppointments, ["ALPHA", "BRAVO"]);
       assert.deepEqual(
-        fake.getSheetValues("ONBOARDING").slice(0, 4),
+        fake.getSheetValues("ONBOARDING").slice(0, 3),
         [
           ["Appointment", "Secret Code"],
           ["ALPHA", ""],
-          ["BRAVO", ""],
-          ["Remarks"]
+          ["BRAVO", ""]
         ]
       );
       assert.equal(fake.getSheetValues(currentMonthTitle)[1][0], "ALPHA");
@@ -1878,5 +1912,64 @@ test("reconciliation fails closed when the live date header no longer matches th
     assert.deepEqual(result.writtenEventIds, []);
     assert.equal(result.conflictedEvents[0].reason, "date_column_changed");
     assert.equal(fake.calls.batchValueUpdates.length, 0);
+  });
+});
+
+test("syncOnboardingRoster reuses one live month snapshot per active sheet refresh", async () => {
+  await withTempDataDir(async () => {
+    const currentMonthTitle = __testing.getMonthParts(new Date(), "Asia/Singapore").title;
+    const nextMonthTitle = __testing.getMonthParts(
+      __testing.shiftMonth(new Date(), "Asia/Singapore", 1),
+      "Asia/Singapore"
+    ).title;
+    const fake = createInMemorySheets({
+      ONBOARDING: {
+        sheetId: 1,
+        values: [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", "A1"],
+          ["BRAVO", "B2"]
+        ]
+      },
+      [currentMonthTitle]: {
+        sheetId: 2,
+        values: [
+          ["Appointment", "1"],
+          ["ALPHA", "PRESENT"],
+          ["BRAVO", "WFH"]
+        ]
+      },
+      [nextMonthTitle]: {
+        sheetId: 3,
+        values: [
+          ["Appointment", "1"],
+          ["ALPHA", ""],
+          ["BRAVO", ""]
+        ]
+      }
+    });
+
+    await syncOnboardingRoster(fake.client, {
+      spreadsheetId: "spreadsheet-1",
+      onboardingSheetTitle: "ONBOARDING",
+      googleServiceAccountEmail: "bot@example.com",
+      timezone: "Asia/Singapore",
+      rosterStopMarkers: ["Remarks"],
+      attendanceOptions: ["PRESENT", "WFH"]
+    }, { persist: false });
+
+    const currentMonthReads = fake.calls.getRanges.filter(
+      (range) => range === `'${currentMonthTitle}'!A1:ZZ1000`
+    );
+    const nextMonthReads = fake.calls.getRanges.filter(
+      (range) => range === `'${nextMonthTitle}'!A1:ZZ1000`
+    );
+
+    assert.equal(currentMonthReads.length, 1);
+    assert.equal(nextMonthReads.length, 1);
+    assert.ok(!fake.calls.getRanges.includes(`'${currentMonthTitle}'!A2:A`));
+    assert.ok(!fake.calls.getRanges.includes(`'${currentMonthTitle}'!A1:ZZ1`));
+    assert.ok(!fake.calls.getRanges.includes(`'${nextMonthTitle}'!A2:A`));
+    assert.ok(!fake.calls.getRanges.includes(`'${nextMonthTitle}'!A1:ZZ1`));
   });
 });

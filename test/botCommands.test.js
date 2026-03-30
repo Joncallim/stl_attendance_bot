@@ -140,6 +140,36 @@ test("admin menu description includes the current pre-v1 version", () => {
   assert.match(description, /^Admin Menu \(v0\.9\.0\)/);
 });
 
+test("triggerBackgroundSheetRefresh starts a non-blocking refresh when idle", () => {
+  const runCycleCalls = [];
+  const result = __testing.triggerBackgroundSheetRefresh({
+    syncManager: {
+      getStatus: () => ({ cycleInProgress: false }),
+      runCycle: async (options) => {
+        runCycleCalls.push(options);
+      }
+    }
+  }, "home:summary");
+
+  assert.equal(result, true);
+  assert.deepEqual(runCycleCalls, [{ force: false, reason: "home:summary" }]);
+});
+
+test("triggerBackgroundSheetRefresh skips duplicate refreshes while a cycle is running", () => {
+  const runCycleCalls = [];
+  const result = __testing.triggerBackgroundSheetRefresh({
+    syncManager: {
+      getStatus: () => ({ cycleInProgress: true }),
+      runCycle: async (options) => {
+        runCycleCalls.push(options);
+      }
+    }
+  }, "home:summary");
+
+  assert.equal(result, false);
+  assert.deepEqual(runCycleCalls, []);
+});
+
 test("syncroster admin action refreshes sheets and reports current and next month", async () => {
   const messages = [];
   const calls = [];
@@ -173,6 +203,10 @@ test("syncroster admin action refreshes sheets and reports current and next mont
   ]);
   assert.equal(
     messages[0],
+    "Syncing roster with Google Sheets. If Google is slow, this will stop early instead of hanging."
+  );
+  assert.equal(
+    messages[1],
     "Roster synced from ONBOARDING. Current month: Mar 26. Next month: Apr 26."
   );
 });
@@ -214,8 +248,42 @@ test("options reset restores onboarding defaults and refreshes caches", async ()
     "refreshAdminCache",
     "preloadSheetSnapshots:true"
   ]);
-  assert.equal(messages[0].message, "Attendance options have been reset to the settings.yaml default list.");
-  assert.ok(messages[0].extra);
+  assert.equal(
+    messages[0].message,
+    "Resetting attendance options and refreshing active sheets. This will stop early if Google Sheets is slow."
+  );
+  assert.equal(messages[1].message, "Attendance options have been reset to the settings.yaml default list.");
+  assert.ok(messages[1].extra);
+});
+
+test("syncroster admin action fails fast when Google Sheets is too slow", async () => {
+  const messages = [];
+
+  await __testing.handleSyncRosterAdminAction(
+    {},
+    { onboardingSheetTitle: "ONBOARDING", timezone: "Asia/Singapore" },
+    {
+      timeoutMs: 5,
+      syncRosterState: async () => new Promise(() => {}),
+      ensureNextMonthSheetExists: async () => {},
+      refreshAdminCache: async () => {},
+      preloadSheetSnapshots: async () => {},
+      sendOrUpdateAdminMessage: async (_ctx, message) => {
+        messages.push(message);
+      },
+      sheets: {},
+      cache: {}
+    }
+  );
+
+  assert.equal(
+    messages[0],
+    "Syncing roster with Google Sheets. If Google is slow, this will stop early instead of hanging."
+  );
+  assert.equal(
+    messages[1],
+    "Roster sync is taking too long because Google Sheets is slow. Please try again later."
+  );
 });
 
 test("manage admins description keeps default admins ordered and marks not onboarded", () => {
