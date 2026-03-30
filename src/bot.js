@@ -1,5 +1,6 @@
 import cron from "node-cron";
 import { Markup, Telegraf, session } from "telegraf";
+import { ipv4HttpsAgent } from "./network.js";
 import {
   applyAttendanceEntriesToSnapshotBundle,
   addAppointmentToSheets,
@@ -3100,7 +3101,11 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
 }
 
 export function createAttendanceBot(config) {
-  const bot = new Telegraf(config.telegramBotToken);
+  const bot = new Telegraf(config.telegramBotToken, {
+    telegram: {
+      agent: ipv4HttpsAgent
+    }
+  });
   const sheets = createGoogleSheetsClient(config);
   const adminCache = createAdminCache();
   adminCache.syncManager = createSyncManager({

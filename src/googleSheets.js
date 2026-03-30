@@ -5,6 +5,7 @@ import {
   writeJsonFile as writeJsonFileToStore
 } from "./fileStore.js";
 import { getSingaporePublicHolidaySet } from "./holidays.js";
+import { ipv4HttpsAgent } from "./network.js";
 
 const SHEET_CACHE_FILE = () => getDataFile("sheet-cache.json");
 const SPREADSHEET_METADATA_TTL_MS = 15 * 60 * 1000;
@@ -2715,7 +2716,10 @@ export function createGoogleSheetsClient(config) {
   const auth = new google.auth.JWT({
     email: config.googleServiceAccountEmail,
     key: config.googlePrivateKey,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+    transporterOptions: {
+      agent: ipv4HttpsAgent
+    }
   });
 
   return google.sheets({ version: "v4", auth });
