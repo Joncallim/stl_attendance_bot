@@ -1,5 +1,6 @@
 import cron from "node-cron";
 import { Markup, Telegraf, session } from "telegraf";
+import { ipv4HttpsAgent } from "./network.js";
 import {
   applyAttendanceEntriesToSnapshotBundle,
   addAppointmentToSheets,
@@ -58,6 +59,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
+const BOT_VERSION = "v0.9.0";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -1060,8 +1062,8 @@ function isAfterAttendanceReminderCutoff(date, timezone) {
   return numericTime > 845;
 }
 
-function sortAppointmentsForAdmin(items) {
-  const priority = new Map([
+function sortAppointmentsForAdmin(items, config = null) {
+  const fallbackPriority = new Map([
     ["CO", 0],
     ["XO", 1],
     ["COXN", 2],
@@ -1072,8 +1074,16 @@ function sortAppointmentsForAdmin(items) {
   return [...items].sort((left, right) => {
     const leftKey = left.appointment.toUpperCase();
     const rightKey = right.appointment.toUpperCase();
-    const leftPriority = priority.has(leftKey) ? priority.get(leftKey) : Number.MAX_SAFE_INTEGER;
-    const rightPriority = priority.has(rightKey) ? priority.get(rightKey) : Number.MAX_SAFE_INTEGER;
+    const leftPriority = config?.appointmentOrderIndex?.has(leftKey)
+      ? config.appointmentOrderIndex.get(leftKey)
+      : fallbackPriority.has(leftKey)
+        ? fallbackPriority.get(leftKey)
+      : Number.MAX_SAFE_INTEGER;
+    const rightPriority = config?.appointmentOrderIndex?.has(rightKey)
+      ? config.appointmentOrderIndex.get(rightKey)
+      : fallbackPriority.has(rightKey)
+        ? fallbackPriority.get(rightKey)
+      : Number.MAX_SAFE_INTEGER;
 
     if (leftPriority !== rightPriority) {
       return leftPriority - rightPriority;
@@ -1132,18 +1142,34 @@ function normalizeDepartmentKey(value) {
     .replace(/\s+/g, "_");
 }
 
-function getDepartmentOptions() {
+function getDepartmentOptions(config = {}) {
+  if (Array.isArray(config.hierarchy) && config.hierarchy.length > 0) {
+    return config.hierarchy.map((entry) => ({
+      key: entry.key,
+      label: entry.label,
+      type: entry.type,
+      parentId: entry.parentId ?? null
+    }));
+  }
+
   return DEPARTMENT_BUCKETS.map((entry) => ({
     key: entry.key,
     label: entry.label
   }));
 }
 
-function getDepartmentLabelByKey(departmentKey) {
-  return getDepartmentOptions().find((entry) => entry.key === departmentKey)?.label ?? null;
+function getDepartmentLabelByKey(config, departmentKey) {
+  return getDepartmentOptions(config).find((entry) => entry.key === departmentKey)?.label ?? null;
 }
 
-function getDepartmentKeyForAppointment(appointment) {
+function getDepartmentKeyForAppointment(config, appointment) {
+  const normalizedAppointment = String(appointment ?? "").trim().toUpperCase();
+  const configuredMeta = config?.appointmentMetadataByName?.get?.(normalizedAppointment);
+
+  if (configuredMeta?.hierarchyNodeKey) {
+    return configuredMeta.hierarchyNodeKey;
+  }
+
   const label = classifyAppointmentDepartment(appointment);
 
   if (!label) {
@@ -1184,7 +1210,7 @@ function buildDepartmentWorkweekViewModel(cache, config, viewer, options = {}) {
     return { ok: false, reason: "not_bound" };
   }
 
-  const viewerDepartmentKey = getDepartmentKeyForAppointment(viewer.appointment);
+  const viewerDepartmentKey = getDepartmentKeyForAppointment(config, viewer.appointment);
 
   if (!viewerDepartmentKey) {
     return { ok: false, reason: "unclassified" };
@@ -1193,7 +1219,7 @@ function buildDepartmentWorkweekViewModel(cache, config, viewer, options = {}) {
   const canSwitchDepartments = options.isAdminUser === true;
   const requestedKey = normalizeDepartmentKey(options.departmentKey || viewerDepartmentKey);
   const departmentKey = canSwitchDepartments ? requestedKey : viewerDepartmentKey;
-  const departmentLabel = getDepartmentLabelByKey(departmentKey);
+  const departmentLabel = getDepartmentLabelByKey(config, departmentKey);
 
   if (!departmentLabel) {
     return { ok: false, reason: "unknown_department" };
@@ -1207,7 +1233,7 @@ function buildDepartmentWorkweekViewModel(cache, config, viewer, options = {}) {
     .map((entry) => entry.appointment)
     .filter(Boolean);
   const appointments = activeAppointments.filter(
-    (appointment) => getDepartmentKeyForAppointment(appointment) === departmentKey
+    (appointment) => getDepartmentKeyForAppointment(config, appointment) === departmentKey
   );
   const page = Math.max(0, Number(options.page ?? 0));
   const totalPages = Math.max(1, Math.ceil(appointments.length / DEPARTMENT_MEMBER_PAGE_SIZE));
@@ -1234,7 +1260,7 @@ function buildDepartmentWorkweekViewModel(cache, config, viewer, options = {}) {
     totalPages,
     members,
     totalMembers: appointments.length,
-    allDepartmentOptions: getDepartmentOptions()
+    allDepartmentOptions: getDepartmentOptions(config)
   };
 }
 
@@ -1442,7 +1468,7 @@ function buildHomeMenuText({ greeting, name, isAdminUser, timezone, syncStatus }
 
 function buildAdminMenuDescription() {
   return [
-    "Admin Menu",
+    `Admin Menu (${BOT_VERSION})`,
     "",
     "Use this menu to manage roster operations and onboarding support.",
     "",
@@ -1502,17 +1528,35 @@ function formatAttendanceOptionLine(option, width) {
     : code;
 }
 
-function buildAttendanceOptionsDescription(attendanceOptions, onboardingAttendanceOptions = []) {
+function buildAttendanceOptionsDescription(
+  attendanceOptions,
+  onboardingAttendanceOptions = [],
+  attendanceGroups = []
+) {
   const lines = [
     "Attendance Options",
     "",
     "These codes appear in Telegram and in the Google Sheets dropdown validation.",
-    "The Onboarding workflow seeds the default list from ATTENDANCE_OPTIONS, and Telegram changes are saved in local storage.",
+    "The default list comes from settings.yaml, and Telegram changes are saved in local storage.",
     ""
   ];
 
   if (attendanceOptions.length === 0) {
     lines.push("No attendance options are currently configured.");
+  } else if (Array.isArray(attendanceGroups) && attendanceGroups.length > 0) {
+    lines.push(`Current options (${attendanceOptions.length}):`);
+
+    for (const group of attendanceGroups) {
+      const visibleOptions = group.options.filter((option) => attendanceOptions.includes(option));
+
+      if (visibleOptions.length === 0) {
+        continue;
+      }
+
+      lines.push("");
+      lines.push(`${group.label}:`);
+      lines.push(...visibleOptions.map((option) => formatAttendanceOptionLine(option, 0)));
+    }
   } else {
     const canonicalOptions = getCanonicalAttendanceOptions(
       attendanceOptions,
@@ -1730,85 +1774,94 @@ function formatSummaryMessage(summary, config, options = {}) {
     lines.push(`<b>Unaccounted:</b> ${counts.unaccounted}`);
   }
 
-  const sections = [
-    {
-      heading: "Total PRESENT",
-      total: counts.present,
-      breakdown: buildBreakdown(["PRESENT", "DUTY"])
-    },
-    {
-      heading: "PH",
-      total: counts.ph,
-      breakdown: buildBreakdown(["PH"])
-    },
-    {
-      heading: "OSD",
-      total: counts.osd,
-      breakdown: buildBreakdown(["OSD"])
-    },
-    {
-      heading: "OE",
-      total: counts.oe,
-      breakdown: buildBreakdown(["OE"])
-    },
-    {
-      heading: "WFH",
-      total: counts.wfh,
-      breakdown: buildBreakdown(["WFH"])
-    },
-    {
-      heading: "FISHING",
-      total: counts.fishing,
-      breakdown: buildBreakdown(["FISHING"])
-    },
-    {
-      heading: "OFF",
-      total: counts.off,
-      breakdown: buildBreakdown(["OIL", "EMBARK OFF", "OFF", "DISEMBARK OFF", "RR", "SR"])
-    },
-    {
-      heading: "Outstationed",
-      total: counts.outstationed,
-      breakdown: buildBreakdown(["OS", "TNB", "YARD", "ORCA"])
-    },
-    {
-      heading: "Report Sick",
-      total: counts.reportSick,
-      breakdown: buildBreakdown(["RSO", "MC", "OML", "MA", "HL", "RSI"])
-    },
-    {
-      heading: "Local Leave",
-      total: counts.localLeave,
-      breakdown: buildBreakdown(["LL", "CCL", "PCL", "CSL", "COMPASSIONATE", "PTL"])
-    },
-    {
-      heading: "Overseas Leave",
-      total: counts.overseasLeave,
-      breakdown: buildBreakdown(["OL"])
-    },
-    {
-      heading: "Attached Out",
-      total: counts.attachedOut,
-      breakdown: buildBreakdown(["AO", "68", "69", "70", "71", "73"])
-    },
-    {
-      heading: "On Course",
-      total: counts.onCourse,
-      breakdown: buildBreakdown(["OC"])
-    },
-    {
-      heading: "Posted Out",
-      total: counts.postedOut,
-      breakdown: buildBreakdown(["ORD", "POST OUT"])
-    },
-    {
-      heading: "In Base",
-      total: counts.inBase,
-      breakdown: buildBreakdown(["IPPT", "FMSS", "CNB", "CST", "DCTC"])
-    }
-  ];
+  const configuredSections = Array.isArray(config.attendanceGroups) && config.attendanceGroups.length > 0
+    ? config.attendanceGroups.map((group) => ({
+      heading: group.summaryLabel ?? group.label,
+      total: group.options.reduce(
+        (sum, option) => sum + Number(rawCounts.get(option) ?? 0),
+        0
+      ),
+      breakdown: buildBreakdown(group.options)
+    }))
+    : [
+      {
+        heading: "Total PRESENT",
+        total: counts.present,
+        breakdown: buildBreakdown(["PRESENT", "DUTY"])
+      },
+      {
+        heading: "PH",
+        total: counts.ph,
+        breakdown: buildBreakdown(["PH"])
+      },
+      {
+        heading: "OSD",
+        total: counts.osd,
+        breakdown: buildBreakdown(["OSD"])
+      },
+      {
+        heading: "OE",
+        total: counts.oe,
+        breakdown: buildBreakdown(["OE"])
+      },
+      {
+        heading: "WFH",
+        total: counts.wfh,
+        breakdown: buildBreakdown(["WFH"])
+      },
+      {
+        heading: "FISHING",
+        total: counts.fishing,
+        breakdown: buildBreakdown(["FISHING"])
+      },
+      {
+        heading: "OFF",
+        total: counts.off,
+        breakdown: buildBreakdown(["OIL", "EMBARK OFF", "OFF", "DISEMBARK OFF", "RR", "SR"])
+      },
+      {
+        heading: "Outstationed",
+        total: counts.outstationed,
+        breakdown: buildBreakdown(["OS", "TNB", "YARD", "ORCA"])
+      },
+      {
+        heading: "Report Sick",
+        total: counts.reportSick,
+        breakdown: buildBreakdown(["RSO", "MC", "OML", "MA", "HL", "RSI"])
+      },
+      {
+        heading: "Local Leave",
+        total: counts.localLeave,
+        breakdown: buildBreakdown(["LL", "CCL", "PCL", "CSL", "COMPASSIONATE", "PTL"])
+      },
+      {
+        heading: "Overseas Leave",
+        total: counts.overseasLeave,
+        breakdown: buildBreakdown(["OL"])
+      },
+      {
+        heading: "Attached Out",
+        total: counts.attachedOut,
+        breakdown: buildBreakdown(["AO", "68", "69", "70", "71", "73"])
+      },
+      {
+        heading: "On Course",
+        total: counts.onCourse,
+        breakdown: buildBreakdown(["OC"])
+      },
+      {
+        heading: "Posted Out",
+        total: counts.postedOut,
+        breakdown: buildBreakdown(["ORD", "POST OUT"])
+      },
+      {
+        heading: "In Base",
+        total: counts.inBase,
+        breakdown: buildBreakdown(["IPPT", "FMSS", "CNB", "CST", "DCTC"])
+      }
+    ];
 
-  for (const section of sections) {
+  for (const section of configuredSections) {
     lines.push("", `<b><u>${section.heading}:</u></b> ${section.total}`);
 
     if (section.breakdown.length === 0) {
@@ -2323,10 +2376,10 @@ async function refreshAdminCache(cache, config) {
     .filter((entry) => entry.source === "custom")
     .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
 
-  cache.inviteCandidates = sortAppointmentsForAdmin(cache.inviteCandidates);
-  cache.removeAppointmentCandidates = sortAppointmentsForAdmin(cache.removeAppointmentCandidates);
-  cache.addAdminCandidates = sortAppointmentsForAdmin(cache.addAdminCandidates);
-  cache.removeAdminCandidates = sortAppointmentsForAdmin(cache.removeAdminCandidates);
+  cache.inviteCandidates = sortAppointmentsForAdmin(cache.inviteCandidates, config);
+  cache.removeAppointmentCandidates = sortAppointmentsForAdmin(cache.removeAppointmentCandidates, config);
+  cache.addAdminCandidates = sortAppointmentsForAdmin(cache.addAdminCandidates, config);
+  cache.removeAdminCandidates = sortAppointmentsForAdmin(cache.removeAdminCandidates, config);
 }
 
 async function ensureSheetReadiness(sheets, config, cache, options = {}) {
@@ -2650,7 +2703,11 @@ async function renderRemoveAppointmentSubmenu(ctx, cache, page = 0) {
 async function renderAttendanceOptionsMenu(ctx, config) {
   await sendOrUpdateAdminMessage(
     ctx,
-    buildAttendanceOptionsDescription(config.attendanceOptions, config.onboardingAttendanceOptions),
+    buildAttendanceOptionsDescription(
+      config.attendanceOptions,
+      config.onboardingAttendanceOptions,
+      config.attendanceGroups
+    ),
     buildAttendanceOptionsMenu(),
     { parse_mode: "HTML" }
   );
@@ -2941,7 +2998,7 @@ async function handleOptionsResetAction(ctx, config, deps) {
   await deps.preloadSheetSnapshots(deps.sheets, config, deps.adminCache, { force: true });
   await deps.sendOrUpdateAdminMessage(
     ctx,
-    "Attendance options have been reset to the Onboarding default list.",
+    "Attendance options have been reset to the settings.yaml default list.",
     buildAttendanceOptionsMenu()
   );
 }
@@ -3044,7 +3101,11 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
 }
 
 export function createAttendanceBot(config) {
-  const bot = new Telegraf(config.telegramBotToken);
+  const bot = new Telegraf(config.telegramBotToken, {
+    telegram: {
+      agent: ipv4HttpsAgent
+    }
+  });
   const sheets = createGoogleSheetsClient(config);
   const adminCache = createAdminCache();
   adminCache.syncManager = createSyncManager({
@@ -4592,6 +4653,7 @@ export function createAttendanceBot(config) {
 }
 
 export const __testing = {
+  buildAdminMenuDescription,
   buildAttendanceOptionsDescription,
   buildHomeMenu,
   buildDepartmentWorkweekViewModel,

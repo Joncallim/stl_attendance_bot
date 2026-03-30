@@ -709,6 +709,39 @@ test("existing monthly sheets get protections for the header row and appointment
   );
 });
 
+test("monthly sheet protection failures are treated as best effort", async () => {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (message) => warnings.push(message);
+
+  try {
+    await __testing.ensureMonthlySheetProtections(
+      {
+        spreadsheets: {
+          batchUpdate: async () => {
+            throw Object.assign(new Error("slow backend"), {
+              code: "ETIMEDOUT",
+              status: 504,
+              isTimeout: true
+            });
+          }
+        }
+      },
+      "spreadsheet-id",
+      {
+        properties: { sheetId: 99 },
+        protectedRanges: []
+      },
+      "bot@example.com"
+    );
+  } finally {
+    console.warn = originalWarn;
+  }
+
+  assert.ok(warnings.length >= 1);
+  assert.match(warnings.at(-1), /Skipping monthly sheet protections for sheet 99/);
+});
+
 test("date lookup follows the actual header row instead of fixed column offsets", () => {
   const headerRow = ["Appointment", "Notes", "1 Mar", "2 Mar", "Custom"];
   const date = new Date("2026-03-01T12:00:00.000Z");

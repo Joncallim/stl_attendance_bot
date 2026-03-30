@@ -1,8 +1,10 @@
 import { applyStoredConfigOverrides, config } from "./config.js";
 import { createAttendanceBot } from "./bot.js";
 import { setupLogging } from "./logger.js";
+import { configureNetworkStack } from "./network.js";
 
 async function main() {
+  configureNetworkStack();
   await setupLogging();
   await applyStoredConfigOverrides();
   const bot = createAttendanceBot(config);

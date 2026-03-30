@@ -1,0 +1,208 @@
+schemaVersion: 1
+
+unit:
+  id: default-unit
+  name: Default Unit
+
+hierarchy:
+  - id: officers
+    name: Officers
+    type: department
+    order: 0
+  - id: c2
+    name: C2
+    type: department
+    order: 1
+  - id: ws
+    name: WS
+    type: department
+    order: 2
+  - id: wcs
+    name: WCS
+    type: department
+    order: 3
+  - id: uw
+    name: UW
+    type: department
+    order: 4
+  - id: nav
+    name: Nav
+    type: department
+    order: 5
+  - id: comms
+    name: Comms
+    type: department
+    order: 6
+  - id: electronic_specialist
+    name: Electronic Specialist
+    type: department
+    order: 7
+  - id: comms_specialist
+    name: Comms Specialist
+    type: department
+    order: 8
+  - id: ms
+    name: MS
+    type: department
+    order: 9
+  - id: ecs
+    name: ECS
+    type: department
+    order: 10
+  - id: chef
+    name: Chef
+    type: department
+    order: 11
+
+appointments:
+  - name: CO
+    hierarchyNodeId: officers
+    defaultAdmin: true
+    order: 0
+  - name: XO
+    hierarchyNodeId: officers
+    defaultAdmin: true
+    order: 1
+  - name: Coxn
+    hierarchyNodeId: officers
+    defaultAdmin: true
+    order: 2
+  - name: SCSE
+    hierarchyNodeId: officers
+    defaultAdmin: true
+    order: 3
+  - name: OPS 1
+    hierarchyNodeId: officers
+    defaultAdmin: true
+    order: 4
+  - name: USER1
+    hierarchyNodeId: officers
+    order: 5
+  - name: USER2
+    hierarchyNodeId: officers
+    order: 6
+  - name: USER3
+    hierarchyNodeId: officers
+    order: 7
+
+attendance:
+  groups:
+    - id: present
+      label: Present
+      summaryLabel: Total PRESENT
+      order: 0
+      options:
+        - PRESENT
+        - DUTY
+    - id: public_holiday
+      label: Public Holiday
+      summaryLabel: PH
+      order: 1
+      options:
+        - PH
+    - id: overseas_duty
+      label: Overseas Duty
+      summaryLabel: OSD
+      order: 2
+      options:
+        - OSD
+    - id: outside_event
+      label: Outside Event
+      summaryLabel: OE
+      order: 3
+      options:
+        - OE
+    - id: work_from_home
+      label: Work from Home
+      summaryLabel: WFH
+      order: 4
+      options:
+        - WFH
+    - id: fishing
+      label: Fishing
+      summaryLabel: FISHING
+      order: 5
+      options:
+        - FISHING
+    - id: off
+      label: Off
+      summaryLabel: OFF
+      order: 6
+      options:
+        - OIL
+        - EMBARK OFF
+        - OFF
+        - DISEMBARK OFF
+        - RR
+        - SR
+    - id: outstationed
+      label: Outstationed
+      summaryLabel: Outstationed
+      order: 7
+      options:
+        - OS
+        - TNB
+        - YARD
+        - ORCA
+    - id: report_sick
+      label: Report Sick
+      summaryLabel: Report Sick
+      order: 8
+      options:
+        - RSO
+        - MC
+        - OML
+        - MA
+        - HL
+        - RSI
+    - id: local_leave
+      label: Local Leave
+      summaryLabel: Local Leave
+      order: 9
+      options:
+        - LL
+        - CCL
+        - PCL
+        - CSL
+        - COMPASSIONATE
+        - PTL
+    - id: overseas_leave
+      label: Overseas Leave
+      summaryLabel: Overseas Leave
+      order: 10
+      options:
+        - OL
+    - id: attached_out
+      label: Attached Out
+      summaryLabel: Attached Out
+      order: 11
+      options:
+        - AO
+        - 68
+        - 69
+        - 70
+        - 71
+        - 73
+    - id: on_course
+      label: On Course
+      summaryLabel: On Course
+      order: 12
+      options:
+        - OC
+    - id: posted_out
+      label: Posted Out
+      summaryLabel: Posted Out
+      order: 13
+      options:
+        - ORD
+        - POST OUT
+    - id: in_base
+      label: In Base
+      summaryLabel: In Base
+      order: 14
+      options:
+        - IPPT
+        - FMSS
+        - CNB
+        - CST
+        - DCTC

@@ -9,6 +9,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 COPY src ./src
 COPY README.md ./
+COPY settings.yaml ./settings.yaml
 
 RUN mkdir -p /app/data && chown -R node:node /app
 
