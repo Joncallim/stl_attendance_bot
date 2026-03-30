@@ -17,7 +17,10 @@ const GOOGLE_SHEETS_MAX_RETRY_ATTEMPTS = 5;
 const GOOGLE_SHEETS_INITIAL_RETRY_DELAY_MS = 1000;
 const GOOGLE_SHEETS_MAX_RETRY_DELAY_MS = 32000;
 const GOOGLE_SHEETS_REQUEST_TIMEOUT_MS = 15000;
+const MONTHLY_PROTECTION_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
 const runtimeSheetContext = new WeakMap();
+const ensuredMonthlySheetProtectionIds = new Set();
+const monthlySheetProtectionFailureUntil = new Map();
 const ATTENDANCE_STATUS_ALIAS_MAP = new Map([
   ["PUBLIC HOLIDAY", "PH"],
   ["OVERSEAS DUTY", "OSD"],
@@ -1399,20 +1402,55 @@ function buildMonthlySheetProtectionRequests(sheet, serviceAccountEmail) {
 }
 
 async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, serviceAccountEmail) {
-  const requests = buildMonthlySheetProtectionRequests(sheet, serviceAccountEmail);
+  const sheetId = Number(sheet?.properties?.sheetId);
 
-  if (requests.length === 0) {
+  if (!Number.isFinite(sheetId)) {
     return;
   }
 
-  await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${sheet.properties.sheetId}:protections`, () =>
-    sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
-      requestBody: {
-        requests
+  if (ensuredMonthlySheetProtectionIds.has(sheetId)) {
+    return;
+  }
+
+  const failureUntil = monthlySheetProtectionFailureUntil.get(sheetId) ?? 0;
+
+  if (failureUntil > Date.now()) {
+    return;
+  }
+
+  const requests = buildMonthlySheetProtectionRequests(sheet, serviceAccountEmail);
+
+  if (requests.length === 0) {
+    ensuredMonthlySheetProtectionIds.add(sheetId);
+    return;
+  }
+
+  try {
+    await runGoogleSheetsRequest(
+      `spreadsheets.batchUpdate:${sheetId}:protections`,
+      () =>
+        sheets.spreadsheets.batchUpdate({
+          spreadsheetId,
+          requestBody: {
+            requests
+          }
+        }),
+      {
+        maxAttempts: 2,
+        timeoutMs: 5000
       }
-    })
-  );
+    );
+    ensuredMonthlySheetProtectionIds.add(sheetId);
+    monthlySheetProtectionFailureUntil.delete(sheetId);
+  } catch (error) {
+    monthlySheetProtectionFailureUntil.set(
+      sheetId,
+      Date.now() + MONTHLY_PROTECTION_FAILURE_COOLDOWN_MS
+    );
+    console.warn(
+      `Skipping monthly sheet protections for sheet ${sheetId} after failure: ${error.message}`
+    );
+  }
 }
 
 async function ensureHeaderRowIfBlank(sheets, spreadsheetId, title, header) {
@@ -3297,6 +3335,7 @@ export const __testing = {
   parseOnboardingManagedRows,
   runGoogleSheetsRequest,
   ensureHeaderRowIfBlank,
+  ensureMonthlySheetProtections,
   getExpectedDateHeaderLabel,
   getMonthParts,
   shiftMonth,
