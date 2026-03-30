@@ -21,6 +21,15 @@ const MONTHLY_PROTECTION_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
 const runtimeSheetContext = new WeakMap();
 const ensuredMonthlySheetProtectionIds = new Set();
 const monthlySheetProtectionFailureUntil = new Map();
+
+function logSheetsSuccess(message, details = null) {
+  if (details) {
+    console.log(`${message} ${JSON.stringify(details)}`);
+    return;
+  }
+
+  console.log(message);
+}
 const ATTENDANCE_STATUS_ALIAS_MAP = new Map([
   ["PUBLIC HOLIDAY", "PH"],
   ["OVERSEAS DUTY", "OSD"],
@@ -1442,6 +1451,11 @@ async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, servi
     );
     ensuredMonthlySheetProtectionIds.add(sheetId);
     monthlySheetProtectionFailureUntil.delete(sheetId);
+    logSheetsSuccess("Monthly sheet protections ensured.", {
+      title: sheet?.properties?.title ?? null,
+      sheetId,
+      requestCount: requests.length
+    });
   } catch (error) {
     monthlySheetProtectionFailureUntil.set(
       sheetId,
@@ -1515,6 +1529,14 @@ function buildManagedMonthlyRows({
 }
 
 async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, mode, options = {}) {
+  if (!isManagedMonthlyDate(date, config.timezone)) {
+    return {
+      title: getMonthParts(date, config.timezone).title,
+      appointments: [...appointments],
+      skipped: true
+    };
+  }
+
   const { title } = getMonthParts(date, config.timezone);
   const ensuredSheet = await ensureSheet(sheets, config.spreadsheetId, title, {
     cache: options.cache
@@ -1612,6 +1634,13 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     nextRows,
     config.rosterStopMarkers
   );
+
+  logSheetsSuccess("Monthly attendance sheet synchronized.", {
+    title,
+    mode,
+    appointmentCount: nextAppointments.length,
+    created: ensuredSheet.created === true
+  });
 
   return {
     title,
@@ -2219,6 +2248,13 @@ function getDateFromMonthTitle(title) {
   return new Date(Date.UTC(parsed.year, parsed.monthIndex, 1));
 }
 
+function isManagedMonthlyDate(date, timezone, baseDate = new Date()) {
+  const targetTitle = getMonthParts(date, timezone).title;
+  const currentTitle = getMonthParts(baseDate, timezone).title;
+  const nextTitle = getMonthParts(shiftMonth(baseDate, timezone, 1), timezone).title;
+  return targetTitle === currentTitle || targetTitle === nextTitle;
+}
+
 function countFilledAttendanceCells(snapshot) {
   let count = 0;
 
@@ -2500,7 +2536,16 @@ async function refreshMonthSlice(sheets, config, input, options = {}) {
     force: options.force === true,
     persist: false
   });
-  await ensureMonthlyAttendanceSheet(sheets, config, date, onboardingSlice.appointments, "merge", { cache });
+  if (isManagedMonthlyDate(date, config.timezone)) {
+    await ensureMonthlyAttendanceSheet(
+      sheets,
+      config,
+      date,
+      onboardingSlice.appointments,
+      "replace",
+      { cache }
+    );
+  }
   const values = await readSheetValues(sheets, config.spreadsheetId, title);
   const slice = createMonthSliceFromValues(date, values, config, onboardingSlice.appointments);
 
@@ -2742,7 +2787,7 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
     config,
     new Date(),
     onboardingAppointments,
-    "merge",
+    "replace",
     { cache }
   );
   const nextMonth = await ensureMonthlyAttendanceSheet(
@@ -2758,6 +2803,12 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
     cache.updatedAt = new Date().toISOString();
     await writeLocalSheetCache(cache);
   }
+
+  logSheetsSuccess("Onboarding roster synchronized to active monthly sheets.", {
+    onboardingCount: onboardingAppointments.length,
+    currentMonthTitle: currentMonth.title,
+    nextMonthTitle: nextMonth.title
+  });
 
   return {
     onboardingAppointments,
@@ -2796,6 +2847,9 @@ export async function syncOnboardingCodeColumn(sheets, config, codeEntries) {
     { cache }
   );
   await refreshOnboardingSlice(sheets, config, { cache, force: true });
+  logSheetsSuccess("Onboarding secret code column synchronized.", {
+    entryCount: rows.length
+  });
 }
 
 export async function addAppointmentToSheets(sheets, config, appointment) {
@@ -2827,7 +2881,7 @@ export async function addAppointmentToSheets(sheets, config, appointment) {
   );
   await refreshOnboardingSlice(sheets, config, { cache, force: true, persist: false });
 
-  await ensureMonthlyAttendanceSheet(sheets, config, new Date(), nextAppointments, "merge", { cache });
+  await ensureMonthlyAttendanceSheet(sheets, config, new Date(), nextAppointments, "replace", { cache });
   await ensureMonthlyAttendanceSheet(
     sheets,
     config,
@@ -2836,6 +2890,10 @@ export async function addAppointmentToSheets(sheets, config, appointment) {
     "replace",
     { cache }
   );
+  logSheetsSuccess("Appointment added to active monthly sheets.", {
+    appointment,
+    appointmentCount: nextAppointments.length
+  });
 }
 
 export async function removeAppointmentFromSheets(sheets, config, appointment) {
@@ -2867,6 +2925,10 @@ export async function removeAppointmentFromSheets(sheets, config, appointment) {
     "replace",
     { cache }
   );
+  logSheetsSuccess("Appointment removed from active monthly sheets.", {
+    appointment,
+    appointmentCount: nextAppointments.length
+  });
 }
 
 export async function writeAttendanceStatus(sheets, config, entry) {
@@ -3188,13 +3250,15 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
 export async function ensureNextMonthSheetExists(sheets, config) {
   const cache = await readLocalSheetCache();
   const roster = await syncOnboardingRoster(sheets, config, { cache });
+  logSheetsSuccess("Verified next month sheet exists.", {
+    nextMonthTitle: roster.nextMonthTitle
+  });
   return roster.nextMonthTitle;
 }
 
 export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
   const baseDate = options.date ?? new Date();
   const targetDates = options.targetDates ?? [
-    shiftMonth(baseDate, config.timezone, -1),
     baseDate,
     shiftMonth(baseDate, config.timezone, 1)
   ];
@@ -3218,6 +3282,9 @@ export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
 
   localCache.updatedAt = new Date().toISOString();
   await writeLocalSheetCache(localCache);
+  logSheetsSuccess("Preloaded active month attendance snapshots.", {
+    titles: targetDates.map((date) => getMonthParts(date, config.timezone).title)
+  });
   return buildSnapshotBundleFromMonthSlices(
     Object.fromEntries(
       Object.entries(localCache.monthSlices ?? {}).map(([title, slice]) => [title, deserializeMonthSlice(slice)])

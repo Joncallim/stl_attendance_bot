@@ -134,6 +134,12 @@ test("invite command reports missing appointments", async () => {
   assert.equal(ctx.replies[0].message, "Appointment not found in the active onboarding roster.");
 });
 
+test("admin menu description includes the current pre-v1 version", () => {
+  const description = __testing.buildAdminMenuDescription();
+
+  assert.match(description, /^Admin Menu \(v0\.9\.0\)/);
+});
+
 test("syncroster admin action refreshes sheets and reports current and next month", async () => {
   const messages = [];
   const calls = [];

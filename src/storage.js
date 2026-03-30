@@ -38,6 +38,15 @@ function generateSecretCode(existingCodes) {
   return code;
 }
 
+function logStorageSuccess(message, details = null) {
+  if (details) {
+    console.log(`${message} ${JSON.stringify(details)}`);
+    return;
+  }
+
+  console.log(message);
+}
+
 function clearUserBindingFields(user) {
   return {
     ...user,
@@ -268,6 +277,10 @@ export async function addAppointmentToRegistry(appointment) {
 
     registry.updatedAt = new Date().toISOString();
     await writeAppointmentRegistry(registry);
+    logStorageSuccess("Generated secret code for new appointment.", {
+      appointment: normalizedAppointment,
+      secretCode
+    });
     return { ok: true, appointment: normalizedAppointment, secretCode };
   });
 }

@@ -58,6 +58,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
+const BOT_VERSION = "v0.9.0";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -1466,7 +1467,7 @@ function buildHomeMenuText({ greeting, name, isAdminUser, timezone, syncStatus }
 
 function buildAdminMenuDescription() {
   return [
-    "Admin Menu",
+    `Admin Menu (${BOT_VERSION})`,
     "",
     "Use this menu to manage roster operations and onboarding support.",
     "",
@@ -4647,6 +4648,7 @@ export function createAttendanceBot(config) {
 }
 
 export const __testing = {
+  buildAdminMenuDescription,
   buildAttendanceOptionsDescription,
   buildHomeMenu,
   buildDepartmentWorkweekViewModel,
