@@ -1054,11 +1054,11 @@ test("syncOnboardingRoster blocks month repair when unexpected rows exist inside
   });
 });
 
-test("attendance option usage only scans the latest 3 month sheets", async () => {
+test("attendance option usage only scans the latest 2 month sheets", async () => {
   const baseDate = new Date();
-  const recentTitles = __testing.getRecentMonthTitles(baseDate, "Asia/Singapore", 3);
+  const recentTitles = __testing.getRecentMonthTitles(baseDate, "Asia/Singapore", 2);
   const olderTitle = __testing.getMonthParts(
-    __testing.shiftMonth(baseDate, "Asia/Singapore", -3),
+    __testing.shiftMonth(baseDate, "Asia/Singapore", -2),
     "Asia/Singapore"
   ).title;
   const requestedRanges = [];
@@ -1067,10 +1067,9 @@ test("attendance option usage only scans the latest 3 month sheets", async () =>
       get: async () => ({
         data: {
           sheets: [
-            { properties: { title: recentTitles[2], sheetId: 1 } },
-            { properties: { title: recentTitles[1], sheetId: 2 } },
-            { properties: { title: recentTitles[0], sheetId: 3 } },
-            { properties: { title: olderTitle, sheetId: 4 } }
+            { properties: { title: recentTitles[1], sheetId: 1 } },
+            { properties: { title: recentTitles[0], sheetId: 2 } },
+            { properties: { title: olderTitle, sheetId: 3 } }
           ]
         }
       }),
@@ -1086,11 +1085,7 @@ test("attendance option usage only scans the latest 3 month sheets", async () =>
             return { data: { values: [["Appointment", "Day"], ["ALPHA", "WFH"], ["Remarks", ""]] } };
           }
 
-          if (request.range.startsWith(`'${recentTitles[2]}'`)) {
-            return { data: { values: [["Appointment", "Day"], ["ALPHA", "OS"], ["Remarks", ""]] } };
-          }
-
-          return { data: { values: [["Appointment", "Day"], ["ALPHA", "MC"], ["Remarks", ""]] } };
+          return { data: { values: [["Appointment", "Day"], ["ALPHA", "OS"], ["Remarks", ""]] } };
         }
       }
     }
@@ -1105,11 +1100,10 @@ test("attendance option usage only scans the latest 3 month sheets", async () =>
 
   assert.equal(counts.PRESENT, 1);
   assert.equal(counts.WFH, 1);
-  assert.equal(counts.OS, 1);
+  assert.equal(counts.OS, 0);
   assert.equal(counts.MC, 0);
   assert.ok(requestedRanges.some((range) => range.startsWith(`'${recentTitles[0]}'`)));
   assert.ok(requestedRanges.some((range) => range.startsWith(`'${recentTitles[1]}'`)));
-  assert.ok(requestedRanges.some((range) => range.startsWith(`'${recentTitles[2]}'`)));
   assert.ok(!requestedRanges.some((range) => range.startsWith(`'${olderTitle}'`)));
 });
 
@@ -1745,10 +1739,10 @@ test("reconciliation fails safely when a managed appointment row has been delete
     );
 
     assert.deepEqual(result.writtenEventIds, []);
-    assert.equal(result.conflictedEvents[0].reason, "cell_value_changed_by_human");
+    assert.equal(result.conflictedEvents[0].reason, "appointment_missing");
     assert.deepEqual(fake.getSheetValues("Mar 26").slice(1, 3), [
-      ["ALPHA", ""],
-      ["BRAVO", "WFH"]
+      ["BRAVO", "WFH"],
+      ["Remarks", ""]
     ]);
   });
 });
@@ -1828,12 +1822,12 @@ test("reconciliation resolves moved rows by appointment identity instead of stal
 
     assert.deepEqual(result.writtenEventIds, ["event-move"]);
     assert.deepEqual(fake.calls.batchValueUpdates.at(-1), [{
-      range: "'Mar 26'!B2",
+      range: "'Mar 26'!B3",
       values: [["OS"]]
     }]);
     assert.deepEqual(fake.getSheetValues("Mar 26").slice(1, 4), [
-      ["ALPHA", "OS"],
       ["BRAVO", "WFH"],
+      ["ALPHA", "OS"],
       ["Remarks", ""]
     ]);
   });
