@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getDataFile } from "./dataDir.js";
-import { appendJsonLine, readJsonLines, runSerialized } from "./fileStore.js";
+import { appendJsonLine, readJsonLines, runSerialized, writeJsonLines } from "./fileStore.js";
 
 const QUEUE_MUTEX_KEY = "attendance-queue";
 const ATTENDANCE_QUEUE_FILE = () => getDataFile("attendance-queue.ndjson");
@@ -416,4 +416,37 @@ export async function getAttendanceQueueStatus() {
     conflictedCount: conflicted.length,
     nextRetryAt
   };
+}
+
+// Rewrites the queue file keeping only unresolved events (pending / failed_retryable).
+// Terminal events (flushed, skipped, conflicted) are dropped from disk once they no
+// longer affect any active event, preventing unbounded file growth.
+export async function compactAttendanceQueue() {
+  return runSerialized(QUEUE_MUTEX_KEY, async () => {
+    const state = await loadAttendanceQueueState();
+    const activeIds = new Set(
+      [...state.events.values()]
+        .filter((event) =>
+          event.queueStatus === "pending" || event.queueStatus === "failed_retryable"
+        )
+        .map((event) => event.id)
+    );
+
+    if (activeIds.size === state.events.size) {
+      return { compacted: false, removedCount: 0 };
+    }
+
+    const retainedRecords = state.records.filter((record) => {
+      const eventId = record.event?.id ?? record.eventId;
+      return activeIds.has(eventId);
+    });
+
+    await writeJsonLines(ATTENDANCE_QUEUE_FILE(), retainedRecords);
+
+    const removedCount = state.records.length - retainedRecords.length;
+    cachedQueueState = createQueueState(retainedRecords);
+    cachedQueueState.records = retainedRecords;
+
+    return { compacted: true, removedCount };
+  });
 }
