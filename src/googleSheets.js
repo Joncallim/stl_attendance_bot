@@ -13,7 +13,7 @@ const ONBOARDING_SLICE_TTL_MS = 2 * 60 * 1000;
 const MONTH_SLICE_TTL_MS = 60 * 1000;
 const DEFAULT_MAX_MANAGED_ROWS = 1000;
 const DEFAULT_BOOTSTRAP_APPOINTMENTS = ["USER1", "USER2", "USER3"];
-const ATTENDANCE_OPTION_USAGE_MONTH_WINDOW = 3;
+const ATTENDANCE_OPTION_USAGE_MONTH_WINDOW = 2;
 const GOOGLE_SHEETS_MAX_RETRY_ATTEMPTS = 5;
 const GOOGLE_SHEETS_INITIAL_RETRY_DELAY_MS = 1000;
 const GOOGLE_SHEETS_MAX_RETRY_DELAY_MS = 32000;
@@ -3123,9 +3123,10 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
   )];
 
   await updateSpreadsheetMetadataCache(sheets, config, localCache, options.force === true);
+  // Use cached onboarding data; forced refreshes are handled by the sync cycle separately.
   await refreshOnboardingSlice(sheets, config, {
     cache: localCache,
-    force: options.force === true,
+    force: false,
     persist: false
   });
 

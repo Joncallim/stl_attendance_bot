@@ -35,6 +35,14 @@ export async function appendJsonLine(filePath, value) {
   await appendFile(filePath, `${JSON.stringify(value)}\n`, "utf8");
 }
 
+export async function writeJsonLines(filePath, values) {
+  await ensureParentDir(filePath);
+  const temporaryFilePath = `${filePath}.tmp`;
+  const content = values.map((value) => JSON.stringify(value)).join("\n") + (values.length > 0 ? "\n" : "");
+  await writeFile(temporaryFilePath, content, "utf8");
+  await rename(temporaryFilePath, filePath);
+}
+
 export async function readJsonLines(filePath) {
   await ensureParentDir(filePath);
 

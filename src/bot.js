@@ -21,6 +21,7 @@ import {
   writeAttendanceStatuses
 } from "./googleSheets.js";
 import {
+  compactAttendanceQueue,
   enqueueAttendanceEvent,
   enqueueAttendanceEvents,
   getAttendanceQueueStatus,
@@ -1427,6 +1428,7 @@ function formatHomeSynchronizationTimestamp(timestamp, timezone) {
 }
 
 function buildHomeMenuText({ greeting, name, isAdminUser, timezone, syncStatus }) {
+  const todayLabel = formatAttendanceDateLabel(new Date(), timezone);
   const descriptions = [
     "📝 Today's Attendance: Submit or update your attendance for today.",
     ...getHomeWeekDescriptions(timezone),
@@ -1446,7 +1448,7 @@ function buildHomeMenuText({ greeting, name, isAdminUser, timezone, syncStatus }
   }
 
   const lines = [
-    `${greeting}, ${name}.`,
+    `${greeting}, ${name}. Today is ${todayLabel}.`,
     "",
     "Choose an action below:",
     "",
@@ -2023,9 +2025,12 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, appointment, cache) {
   }
 
   await clearWeeklyAttendanceState(ctx);
+  const weeklyHeader = entries.length > 0
+    ? "Weekly attendance updated and queued for Google Sheets sync:"
+    : "Weekly attendance reviewed. No new entries were submitted.";
   await sendOrUpdateAdminMessage(
     ctx,
-    ["Weekly attendance updated and queued for Google Sheets sync:", "", ...results].join("\n"),
+    [weeklyHeader, "", ...results].join("\n"),
     Markup.inlineKeyboard([
       [
         Markup.button.callback("🔙 Back", "home:main"),
@@ -2930,8 +2935,10 @@ async function sendPromptToChat(bot, config, chatId, cache = null) {
       "home:main"
     )
   );
+  // Only set awaitingAttendance if no status is on file; users who already filed
+  // should not be put into a text-prompt state just from receiving the reminder.
   await updateUserByChatId(chatId, {
-    awaitingAttendance: true,
+    awaitingAttendance: !currentStatus,
     promptedAt: new Date().toISOString()
   });
 }
@@ -3142,6 +3149,16 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         await refreshAttendanceOptionUsageFn(sheets, config, adminCache);
       } catch (error) {
         console.error("Nightly attendance option sort failed:", error);
+      }
+
+      try {
+        const result = await compactAttendanceQueue();
+
+        if (result.compacted) {
+          console.log(`Nightly queue compaction removed ${result.removedCount} resolved records.`);
+        }
+      } catch (error) {
+        console.error("Nightly queue compaction failed:", error);
       }
     },
     { timezone: config.timezone }

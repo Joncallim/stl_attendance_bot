@@ -278,8 +278,7 @@ export async function addAppointmentToRegistry(appointment) {
     registry.updatedAt = new Date().toISOString();
     await writeAppointmentRegistry(registry);
     logStorageSuccess("Generated secret code for new appointment.", {
-      appointment: normalizedAppointment,
-      secretCode
+      appointment: normalizedAppointment
     });
     return { ok: true, appointment: normalizedAppointment, secretCode };
   });
