@@ -547,13 +547,15 @@ async function runGoogleSheetsRequestWithTimeout(operation, request, options = {
   const timeoutMs = options.timeoutMs ?? GOOGLE_SHEETS_REQUEST_TIMEOUT_MS;
   const setTimeoutFn = options.setTimeoutFn ?? setTimeout;
   const clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout;
+  const controller = new AbortController();
   let timeoutId = null;
 
   try {
     return await Promise.race([
-      request(),
+      request(controller.signal),
       new Promise((_, reject) => {
         timeoutId = setTimeoutFn(() => {
+          controller.abort();
           reject(createGoogleSheetsTimeoutError(operation, timeoutMs));
         }, timeoutMs);
       })
@@ -562,6 +564,7 @@ async function runGoogleSheetsRequestWithTimeout(operation, request, options = {
     if (timeoutId !== null) {
       clearTimeoutFn(timeoutId);
     }
+    controller.abort();
   }
 }
 
@@ -742,11 +745,11 @@ async function getSpreadsheet(sheets, spreadsheetId, options = {}) {
     return runtimeContext.spreadsheet;
   }
 
-  const response = await runGoogleSheetsRequest("spreadsheets.get", () =>
+  const response = await runGoogleSheetsRequest("spreadsheets.get", (signal) =>
     sheets.spreadsheets.get({
       spreadsheetId,
       includeGridData: false
-    })
+    }, { signal })
   );
   const spreadsheet = response.data;
 
@@ -763,7 +766,7 @@ async function getSheetByTitle(sheets, spreadsheetId, title, options = {}) {
 }
 
 async function addSheet(sheets, spreadsheetId, title) {
-  const response = await runGoogleSheetsRequest(`spreadsheets.batchUpdate:addSheet:${title}`, () =>
+  const response = await runGoogleSheetsRequest(`spreadsheets.batchUpdate:addSheet:${title}`, (signal) =>
     sheets.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
@@ -781,7 +784,7 @@ async function addSheet(sheets, spreadsheetId, title) {
           }
         ]
       }
-    })
+    }, { signal })
   );
 
   return response.data.replies?.[0]?.addSheet ?? null;
@@ -851,11 +854,11 @@ async function ensureSheet(sheets, spreadsheetId, title, options = {}) {
 }
 
 async function readAppointmentColumn(sheets, spreadsheetId, title, stopMarkers = []) {
-  const response = await runGoogleSheetsRequest(`spreadsheets.values.get:${title}:A2:A`, () =>
+  const response = await runGoogleSheetsRequest(`spreadsheets.values.get:${title}:A2:A`, (signal) =>
     sheets.spreadsheets.values.get({
       spreadsheetId,
       range: `'${title}'!A2:A`
-    })
+    }, { signal })
   );
 
   const rawValues = (response.data.values ?? []).map(([value]) => value);
@@ -1008,10 +1011,10 @@ async function getStopAwareWriteBoundary(
 ) {
   const response = await runGoogleSheetsRequest(
     `spreadsheets.values.get:${title}:A2:A${maxRow}`,
-    () => sheets.spreadsheets.values.get({
+    (signal) => sheets.spreadsheets.values.get({
       spreadsheetId,
       range: `'${title}'!A2:A${maxRow}`
-    })
+    }, { signal })
   );
   const rawValues = (response.data.values ?? []).map(([value]) => normalizeAppointmentLabel(value));
   const stopIndex = rawValues.findIndex((value) => isStopMarker(value, stopMarkers));
@@ -1139,13 +1142,13 @@ async function writeMonthlySheetRows(
         };
     });
 
-    await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${title}:rows`, () =>
+    await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${title}:rows`, (signal) =>
       sheets.spreadsheets.batchUpdate({
         spreadsheetId,
         requestBody: {
           requests
         }
-      })
+      }, { signal })
     );
   }
 
@@ -1180,20 +1183,20 @@ async function writeMonthlySheetRows(
   }
 
   if (changedData.length > 0) {
-    await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${title}:managedRows`, () =>
+    await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${title}:managedRows`, (signal) =>
       sheets.spreadsheets.values.batchUpdate({
         spreadsheetId,
         requestBody: {
           valueInputOption: "USER_ENTERED",
           data: changedData
         }
-      })
+      }, { signal })
     );
   }
 }
 
 async function writeHeaderRow(sheets, spreadsheetId, title, header) {
-  await runGoogleSheetsRequest(`spreadsheets.values.update:${title}:header`, () =>
+  await runGoogleSheetsRequest(`spreadsheets.values.update:${title}:header`, (signal) =>
     sheets.spreadsheets.values.update({
       spreadsheetId,
       range: `'${title}'!A1:${columnNumberToLabel(header.length)}1`,
@@ -1201,7 +1204,7 @@ async function writeHeaderRow(sheets, spreadsheetId, title, header) {
       requestBody: {
         values: [header]
       }
-    })
+    }, { signal })
   );
 }
 
@@ -1237,7 +1240,7 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
   const boundaryRowNumber = parsed.boundaryRowNumber;
 
   if (rowDelta !== 0) {
-    await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${title}:onboardingRows`, () =>
+    await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${title}:onboardingRows`, (signal) =>
       sheets.spreadsheets.batchUpdate({
         spreadsheetId,
         requestBody: {
@@ -1266,7 +1269,7 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
               }
           ]
         }
-      })
+      }, { signal })
     );
   }
 
@@ -1296,14 +1299,14 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
     });
   }
 
-  await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${title}:onboardingRows`, () =>
+  await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${title}:onboardingRows`, (signal) =>
     sheets.spreadsheets.values.batchUpdate({
       spreadsheetId,
       requestBody: {
         valueInputOption: "USER_ENTERED",
         data
       }
-    })
+    }, { signal })
   );
 }
 
@@ -1386,13 +1389,13 @@ async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, hea
     ...(await buildDisabledDayFormattingRequests(sheetId, date, timezone))
   ];
 
-  await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${sheetId}:layout`, () =>
+  await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${sheetId}:layout`, (signal) =>
     sheets.spreadsheets.batchUpdate({
       spreadsheetId,
       requestBody: {
         requests
       }
-    })
+    }, { signal })
   );
 }
 
@@ -1470,13 +1473,13 @@ async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, servi
   try {
     await runGoogleSheetsRequest(
       `spreadsheets.batchUpdate:${sheetId}:protections`,
-      () =>
+      (signal) =>
         sheets.spreadsheets.batchUpdate({
           spreadsheetId,
           requestBody: {
             requests
           }
-        }),
+        }, { signal }),
       {
         maxAttempts: 2,
         timeoutMs: 5000
@@ -1677,10 +1680,10 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
 async function readSheetColumnValues(sheets, spreadsheetId, title, columnLabel) {
   const response = await runGoogleSheetsRequest(
     `spreadsheets.values.get:${title}:${columnLabel}`,
-    () => sheets.spreadsheets.values.get({
+    (signal) => sheets.spreadsheets.values.get({
       spreadsheetId,
       range: `'${title}'!${columnLabel}2:${columnLabel}1000`
-    })
+    }, { signal })
   );
 
   return (response.data.values ?? []).map(([value]) => String(value ?? "").trim());
@@ -2624,10 +2627,10 @@ function buildSummaryPayload(date, sheetTitle, rosterValues) {
 async function readSheetValues(sheets, spreadsheetId, title, range = "A1:ZZ1000") {
   const response = await runGoogleSheetsRequest(
     `spreadsheets.values.get:${title}:${range}`,
-    () => sheets.spreadsheets.values.get({
+    (signal) => sheets.spreadsheets.values.get({
       spreadsheetId,
       range: `'${title}'!${range}`
-    })
+    }, { signal })
   );
 
   return response.data.values ?? [];
@@ -2638,7 +2641,7 @@ async function applyAttendanceAliasCorrections(sheets, spreadsheetId, title, cor
     return;
   }
 
-  await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${title}:normalizeAliases`, () =>
+  await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${title}:normalizeAliases`, (signal) =>
     sheets.spreadsheets.values.batchUpdate({
       spreadsheetId,
       requestBody: {
@@ -2648,7 +2651,7 @@ async function applyAttendanceAliasCorrections(sheets, spreadsheetId, title, cor
           values: [[correction.normalizedValue]]
         }))
       }
-    })
+    }, { signal })
   );
 }
 
@@ -3084,14 +3087,14 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
     }
 
     if (data.length > 0) {
-      await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${sheetTitle}:attendanceWrite`, () =>
+      await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${sheetTitle}:attendanceWrite`, (signal) =>
         sheets.spreadsheets.values.batchUpdate({
           spreadsheetId: config.spreadsheetId,
           requestBody: {
             valueInputOption: "USER_ENTERED",
             data
           }
-        })
+        }, { signal })
       );
     }
   }
@@ -3255,14 +3258,14 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
   }
 
   if (data.length > 0) {
-    await runGoogleSheetsRequest("spreadsheets.values.batchUpdate:reconcilePending", () =>
+    await runGoogleSheetsRequest("spreadsheets.values.batchUpdate:reconcilePending", (signal) =>
       sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: config.spreadsheetId,
         requestBody: {
           valueInputOption: "USER_ENTERED",
           data
         }
-      })
+      }, { signal })
     );
   }
 
