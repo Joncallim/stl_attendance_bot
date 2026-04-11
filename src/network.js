@@ -1,6 +1,7 @@
 import dns from "node:dns";
 import http from "node:http";
 import https from "node:https";
+import { Agent as UndiciAgent, setGlobalDispatcher } from "undici";
 
 function createIpv4Lookup() {
   return (hostname, options, callback) => {
@@ -40,12 +41,26 @@ export function configureNetworkStack() {
     return;
   }
 
+  // Force IPv4 for the legacy http/https modules.
   if (typeof dns.setDefaultResultOrder === "function") {
     dns.setDefaultResultOrder("ipv4first");
   }
 
   http.globalAgent = ipv4HttpAgent;
   https.globalAgent = ipv4HttpsAgent;
+
+  // Node 18+ uses undici for native fetch, which googleapis v144/gaxios v6
+  // relies on.  undici bypasses https.globalAgent entirely, so we must
+  // configure it separately via setGlobalDispatcher.  Without this, undici
+  // may attempt IPv6 connections that silently hang on IPv6-unroutable hosts.
+  setGlobalDispatcher(
+    new UndiciAgent({
+      connect: {
+        lookup: ipv4Lookup
+      }
+    })
+  );
+
   networkStackConfigured = true;
   console.log("Configured network stack to prefer IPv4 for outbound requests.");
 }
