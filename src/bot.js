@@ -9,10 +9,12 @@ import {
   createGoogleSheetsClient,
   DEPARTMENT_BUCKETS,
   ensureNextMonthSheetExists,
+  getLastStructuralMaintenanceAt,
   loadAttendanceSnapshotsFromLocalCache,
   preloadAttendanceSnapshots,
   reconcilePendingAttendanceWithSheets,
   removeAppointmentFromSheets,
+  runDailySheetMaintenance,
   summarizeAttendanceOptionUsage,
   syncOnboardingCodeColumn,
   syncOnboardingRoster,
@@ -3111,19 +3113,53 @@ async function handleOptionsResetAction(ctx, config, deps) {
 
 function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {} }) {
   const setIntervalFn = deps.setIntervalFn ?? setInterval;
+  const setTimeoutFn = deps.setTimeoutFn ?? setTimeout;
   const scheduleFn = deps.scheduleFn ?? cron.schedule;
   const refreshAttendanceOptionUsageFn = deps.refreshAttendanceOptionUsageFn ?? refreshAttendanceOptionUsage;
   const isReminderWorkingDayFn = deps.isReminderWorkingDayFn ?? isReminderWorkingDay;
   const listUsersFn = deps.listUsersFn ?? listUsers;
   const sendPromptToChatFn = deps.sendPromptToChatFn ?? sendPromptToChat;
+  const runDailySheetMaintenanceFn = deps.runDailySheetMaintenanceFn ?? runDailySheetMaintenance;
 
-  adminCache.syncManager.runCycle({ force: true, reason: "startup" }).catch((error) => {
+  // Startup: lightweight read-only sync (no structural writes).
+  adminCache.syncManager.runCycle({ force: false, reason: "startup" }).catch((error) => {
     console.error("Initial roster sync failed:", error);
   });
 
   refreshAttendanceOptionUsageFn(sheets, config, adminCache).catch((error) => {
     console.error("Initial attendance option sort failed:", error);
   });
+
+  // If maintenance hasn't run in over 20 hours, schedule it shortly after startup
+  // rather than waiting until the next midnight cron.
+  getLastStructuralMaintenanceAt()
+    .then((lastMaintenanceAt) => {
+      const lastMaint = lastMaintenanceAt ? Date.parse(lastMaintenanceAt) : 0;
+      const staleMs = 20 * 60 * 60 * 1000; // 20 hours
+
+      if (Date.now() - lastMaint > staleMs) {
+        console.log("Scheduling deferred startup maintenance (last run: " +
+          (lastMaintenanceAt ?? "never") + ")");
+        setTimeoutFn(async () => {
+          try {
+            await runDailySheetMaintenanceFn(sheets, config);
+            await syncAppointmentRegistry();
+            await syncOnboardingCodeColumn(
+              sheets,
+              config,
+              (await getAppointmentRegistry()).appointments.filter((entry) => entry.active)
+            );
+            await refreshAdminCache(adminCache, config);
+            await refreshAttendanceOptionUsageFn(sheets, config, adminCache);
+          } catch (error) {
+            console.error("Deferred startup maintenance failed:", error);
+          }
+        }, 10_000);
+      }
+    })
+    .catch(() => {
+      // Non-fatal; the midnight cron will run maintenance at the next opportunity.
+    });
 
   setIntervalFn(async () => {
     try {
@@ -3141,16 +3177,31 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
     }
   }, 5 * 60 * 1000);
 
+  // Midnight: full structural maintenance (sheet creation, row sync, layout, protections).
+  scheduleFn(
+    "0 0 * * *",
+    async () => {
+      try {
+        await runDailySheetMaintenanceFn(sheets, config);
+        await syncAppointmentRegistry();
+        await syncOnboardingCodeColumn(
+          sheets,
+          config,
+          (await getAppointmentRegistry()).appointments.filter((entry) => entry.active)
+        );
+        await refreshAdminCache(adminCache, config);
+        await refreshAttendanceOptionUsageFn(sheets, config, adminCache);
+      } catch (error) {
+        console.error("Midnight sheet maintenance failed:", error);
+      }
+    },
+    { timezone: config.timezone }
+  );
+
+  // 00:05: queue compaction only (cheap local file operation).
   scheduleFn(
     "5 0 * * *",
     async () => {
-      try {
-        await adminCache.syncManager.runCycle({ force: true, reason: "nightly" });
-        await refreshAttendanceOptionUsageFn(sheets, config, adminCache);
-      } catch (error) {
-        console.error("Nightly attendance option sort failed:", error);
-      }
-
       try {
         const result = await compactAttendanceQueue();
 
@@ -3231,14 +3282,16 @@ export function createAttendanceBot(config) {
           force: true
         }))
       ),
-    refreshOnboarding: async () => withSheetOperation(async () => {
-      await syncRosterState(sheets, config);
-      return true;
-    }),
+    // refreshOnboarding is intentionally a no-op in the hot-path cycle.
+    // Onboarding data is read as part of refreshMonthSlices (via refreshMonthSlice →
+    // refreshOnboardingSlice with TTL). Full structural roster sync runs once a day
+    // via the midnight maintenance cron.
+    refreshOnboarding: async () => false,
     refreshMonthSlices: async (options = {}) => withSheetOperation(async () => {
       await preloadSheetSnapshots(sheets, config, adminCache, {
         ...options,
-        normalizeAliases: options.reason === "five-minute" || options.reason === "nightly"
+        structural: false,
+        normalizeAliases: options.reason === "five-minute"
       });
       return true;
     }),
