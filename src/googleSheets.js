@@ -2620,8 +2620,8 @@ async function refreshMonthSlice(sheets, config, input, options = {}) {
     persist: false
   });
   // Structural ops (sheet creation, row sync, layout, protections) are expensive.
-  // Skip them in hot-path read cycles; run only during daily maintenance.
-  if (options.structural !== false && isManagedMonthlyDate(date, config.timezone)) {
+  // Only run when explicitly requested (e.g. runDailySheetMaintenance or admin actions).
+  if (options.structural === true && isManagedMonthlyDate(date, config.timezone)) {
     await ensureMonthlyAttendanceSheet(
       sheets,
       config,
@@ -3354,7 +3354,7 @@ export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
   // Allow callers to pass in a shared cache object (e.g. from runDailySheetMaintenance)
   // to avoid a redundant readLocalSheetCache() + writeLocalSheetCache() round-trip.
   const localCache = options.cache ?? (await readLocalSheetCache());
-  const structural = options.structural !== false ? options.structural === true : false;
+  const structural = options.structural === true;
 
   await updateSpreadsheetMetadataCache(sheets, config, localCache, options.force === true);
   await refreshOnboardingSlice(sheets, config, {
