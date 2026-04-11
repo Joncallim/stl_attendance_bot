@@ -1,7 +1,5 @@
-import dns from "node:dns";
 import http from "node:http";
 import https from "node:https";
-import { instance as gaxiosInstance } from "gaxios";
 
 function createIpv4Lookup() {
   return (hostname, options, callback) => {
@@ -50,21 +48,8 @@ export function configureNetworkStack() {
     return;
   }
 
-  // Force IPv4 for the legacy http/https modules (used by telegraf etc.).
-  if (typeof dns.setDefaultResultOrder === "function") {
-    dns.setDefaultResultOrder("ipv4first");
-  }
-
-  http.globalAgent = ipv4HttpAgent;
-  https.globalAgent = ipv4HttpsAgent;
-
-  // gaxios (used by googleapis + google-auth-library) uses node-fetch under
-  // the hood, which uses Node's legacy https module.  gaxios creates its own
-  // https.Agent per request unless opts.agent is set — bypassing
-  // https.globalAgent.  Setting defaults.agent forces all gaxios requests
-  // (Sheets API calls AND auth token fetches) through our IPv4-only agent.
-  gaxiosInstance.defaults.agent = ipv4HttpsAgent;
-
+  http.globalAgent = keepAliveHttpAgent;
+  https.globalAgent = keepAliveHttpsAgent;
   networkStackConfigured = true;
-  console.log("Configured network stack to prefer IPv4 for outbound requests.");
+  console.log("Configured network stack (keep-alive agents).");
 }

@@ -2831,16 +2831,8 @@ export function createGoogleSheetsClient(config) {
   const auth = new google.auth.JWT({
     email: config.googleServiceAccountEmail,
     key: config.googlePrivateKey,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-    transporterOptions: {
-      agent: ipv4HttpsAgent
-    }
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"]
   });
-
-  // googleapis merges google._options into every API request's gaxios options.
-  // Setting agent here ensures all Sheets API calls (not just token fetches)
-  // use our IPv4-only https.Agent.
-  google.options({ agent: ipv4HttpsAgent });
 
   return google.sheets({ version: "v4", auth });
 }
