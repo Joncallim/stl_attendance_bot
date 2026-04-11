@@ -1,12 +1,45 @@
 import http from "node:http";
 import https from "node:https";
 
-export const keepAliveHttpAgent = new http.Agent({ keepAlive: true });
-export const keepAliveHttpsAgent = new https.Agent({ keepAlive: true });
+function createIpv4Lookup() {
+  return (hostname, options, callback) => {
+    let resolvedOptions = options;
+    let resolvedCallback = callback;
 
-// Back-compat aliases used by callers that import ipv4Http(s)Agent.
-export const ipv4HttpAgent = keepAliveHttpAgent;
-export const ipv4HttpsAgent = keepAliveHttpsAgent;
+    if (typeof resolvedOptions === "function") {
+      resolvedCallback = resolvedOptions;
+      resolvedOptions = {};
+    } else if (typeof resolvedOptions === "number") {
+      resolvedOptions = { family: resolvedOptions };
+    }
+
+    dns.lookup(hostname, { family: 4, all: false }, (error, address, family) => {
+      if (error) {
+        resolvedCallback(error);
+        return;
+      }
+
+      if (resolvedOptions?.all) {
+        resolvedCallback(null, [{ address, family: family ?? 4 }]);
+        return;
+      }
+
+      resolvedCallback(null, address, family ?? 4);
+    });
+  };
+}
+
+const ipv4Lookup = createIpv4Lookup();
+
+export const ipv4HttpAgent = new http.Agent({
+  keepAlive: true,
+  lookup: ipv4Lookup
+});
+
+export const ipv4HttpsAgent = new https.Agent({
+  keepAlive: true,
+  lookup: ipv4Lookup
+});
 
 let networkStackConfigured = false;
 
