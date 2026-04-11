@@ -1,6 +1,7 @@
 import dns from "node:dns";
 import http from "node:http";
 import https from "node:https";
+import { instance as gaxiosInstance } from "gaxios";
 
 function createIpv4Lookup() {
   return (hostname, options, callback) => {
@@ -33,25 +34,6 @@ export const ipv4HttpsAgent = new https.Agent({
   lookup: ipv4Lookup
 });
 
-// Attempt to configure the undici global dispatcher so that Node's native
-// fetch (used by gaxios v6 / googleapis v144) also resolves to IPv4 only.
-//
-// `node:undici` exposes the SAME internal dispatcher instance that powers
-// `globalThis.fetch`.  It became importable in Node 21+.  On older Node
-// versions the import will throw ERR_UNKNOWN_BUILTIN_MODULE; in that case
-// we skip gracefully — the dns.setDefaultResultOrder("ipv4first") call in
-// configureNetworkStack() is still in effect as a weaker fallback.
-let _setGlobalDispatcher = null;
-let _UndiciAgent = null;
-
-try {
-  const nodeUndici = await import("node:undici");
-  _setGlobalDispatcher = nodeUndici.setGlobalDispatcher;
-  _UndiciAgent = nodeUndici.Agent;
-} catch {
-  // node:undici not available on this Node version — skip.
-}
-
 let networkStackConfigured = false;
 
 export function configureNetworkStack() {
@@ -67,18 +49,12 @@ export function configureNetworkStack() {
   http.globalAgent = ipv4HttpAgent;
   https.globalAgent = ipv4HttpsAgent;
 
-  // Configure undici's global dispatcher so that native fetch (gaxios v6)
-  // also only connects over IPv4.  Only possible when node:undici is
-  // available (Node 21+).
-  if (_setGlobalDispatcher && _UndiciAgent) {
-    _setGlobalDispatcher(
-      new _UndiciAgent({
-        connect: {
-          lookup: ipv4Lookup
-        }
-      })
-    );
-  }
+  // gaxios (used by googleapis + google-auth-library) uses node-fetch under
+  // the hood, which uses Node's legacy https module.  gaxios creates its own
+  // https.Agent per request unless opts.agent is set — bypassing
+  // https.globalAgent.  Setting defaults.agent forces all gaxios requests
+  // (Sheets API calls AND auth token fetches) through our IPv4-only agent.
+  gaxiosInstance.defaults.agent = ipv4HttpsAgent;
 
   networkStackConfigured = true;
   console.log("Configured network stack to prefer IPv4 for outbound requests.");
