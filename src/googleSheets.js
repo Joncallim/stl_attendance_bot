@@ -2837,6 +2837,11 @@ export function createGoogleSheetsClient(config) {
     }
   });
 
+  // googleapis merges google._options into every API request's gaxios options.
+  // Setting agent here ensures all Sheets API calls (not just token fetches)
+  // use our IPv4-only https.Agent.
+  google.options({ agent: ipv4HttpsAgent });
+
   return google.sheets({ version: "v4", auth });
 }
 
