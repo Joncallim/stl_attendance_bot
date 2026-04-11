@@ -1,7 +1,6 @@
 import dns from "node:dns";
 import http from "node:http";
 import https from "node:https";
-import { Agent as UndiciAgent, setGlobalDispatcher } from "undici";
 
 function createIpv4Lookup() {
   return (hostname, options, callback) => {
@@ -34,6 +33,25 @@ export const ipv4HttpsAgent = new https.Agent({
   lookup: ipv4Lookup
 });
 
+// Attempt to configure the undici global dispatcher so that Node's native
+// fetch (used by gaxios v6 / googleapis v144) also resolves to IPv4 only.
+//
+// `node:undici` exposes the SAME internal dispatcher instance that powers
+// `globalThis.fetch`.  It became importable in Node 21+.  On older Node
+// versions the import will throw ERR_UNKNOWN_BUILTIN_MODULE; in that case
+// we skip gracefully — the dns.setDefaultResultOrder("ipv4first") call in
+// configureNetworkStack() is still in effect as a weaker fallback.
+let _setGlobalDispatcher = null;
+let _UndiciAgent = null;
+
+try {
+  const nodeUndici = await import("node:undici");
+  _setGlobalDispatcher = nodeUndici.setGlobalDispatcher;
+  _UndiciAgent = nodeUndici.Agent;
+} catch {
+  // node:undici not available on this Node version — skip.
+}
+
 let networkStackConfigured = false;
 
 export function configureNetworkStack() {
@@ -41,7 +59,7 @@ export function configureNetworkStack() {
     return;
   }
 
-  // Force IPv4 for the legacy http/https modules.
+  // Force IPv4 for the legacy http/https modules (used by telegraf etc.).
   if (typeof dns.setDefaultResultOrder === "function") {
     dns.setDefaultResultOrder("ipv4first");
   }
@@ -49,17 +67,18 @@ export function configureNetworkStack() {
   http.globalAgent = ipv4HttpAgent;
   https.globalAgent = ipv4HttpsAgent;
 
-  // Node 18+ uses undici for native fetch, which googleapis v144/gaxios v6
-  // relies on.  undici bypasses https.globalAgent entirely, so we must
-  // configure it separately via setGlobalDispatcher.  Without this, undici
-  // may attempt IPv6 connections that silently hang on IPv6-unroutable hosts.
-  setGlobalDispatcher(
-    new UndiciAgent({
-      connect: {
-        lookup: ipv4Lookup
-      }
-    })
-  );
+  // Configure undici's global dispatcher so that native fetch (gaxios v6)
+  // also only connects over IPv4.  Only possible when node:undici is
+  // available (Node 21+).
+  if (_setGlobalDispatcher && _UndiciAgent) {
+    _setGlobalDispatcher(
+      new _UndiciAgent({
+        connect: {
+          lookup: ipv4Lookup
+        }
+      })
+    );
+  }
 
   networkStackConfigured = true;
   console.log("Configured network stack to prefer IPv4 for outbound requests.");
