@@ -1130,7 +1130,8 @@ test("retry wrapper succeeds after retryable 429 errors", async () => {
 
   assert.equal(result, "ok");
   assert.equal(attempts, 3);
-  assert.deepEqual(delays, [0, 0]);
+  // randomFn returns 0 so jitter is 0, but the 500ms floor applies.
+  assert.deepEqual(delays, [500, 500]);
 });
 
 test("retry wrapper stops immediately for non-retryable errors", async () => {

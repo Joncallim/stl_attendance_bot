@@ -62,7 +62,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-const BOT_VERSION = "v0.9.0";
+const BOT_VERSION = "v0.9.1";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -3121,17 +3121,19 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   const sendPromptToChatFn = deps.sendPromptToChatFn ?? sendPromptToChat;
   const runDailySheetMaintenanceFn = deps.runDailySheetMaintenanceFn ?? runDailySheetMaintenance;
 
-  // Startup: lightweight read-only sync (no structural writes).
-  adminCache.syncManager.runCycle({ force: false, reason: "startup" }).catch((error) => {
-    console.error("Initial roster sync failed:", error);
-  });
-
-  refreshAttendanceOptionUsageFn(sheets, config, adminCache).catch((error) => {
-    console.error("Initial attendance option sort failed:", error);
-  });
+  // Startup: lightweight read-only sync (no structural writes), followed by
+  // attendance option sort once the sync finishes — serialized to avoid
+  // hammering the Sheets API with concurrent requests.
+  const startupSyncPromise = adminCache.syncManager
+    .runCycle({ force: false, reason: "startup" })
+    .then(() => refreshAttendanceOptionUsageFn(sheets, config, adminCache))
+    .catch((error) => {
+      console.error("Initial startup sync/sort failed:", error);
+    });
 
   // If maintenance hasn't run in over 20 hours, schedule it shortly after startup
-  // rather than waiting until the next midnight cron.
+  // rather than waiting until the next midnight cron.  Wait for the startup sync
+  // to finish first so we don't flood the API.
   getLastStructuralMaintenanceAt()
     .then((lastMaintenanceAt) => {
       const lastMaint = lastMaintenanceAt ? Date.parse(lastMaintenanceAt) : 0;
@@ -3142,6 +3144,9 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
           (lastMaintenanceAt ?? "never") + ")");
         setTimeoutFn(async () => {
           try {
+            // Wait for the startup sync cycle + option sort to finish before
+            // issuing more API calls.
+            await startupSyncPromise;
             await runDailySheetMaintenanceFn(sheets, config);
             await syncAppointmentRegistry();
             await syncOnboardingCodeColumn(
