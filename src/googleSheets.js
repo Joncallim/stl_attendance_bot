@@ -470,6 +470,8 @@ function getPrimaryStopMarker(stopMarkers = []) {
 function buildDefaultSheetCache() {
   return {
     updatedAt: null,
+    lastStructuralMaintenanceAt: null,
+    maintainedSheetProtectionIds: [],
     spreadsheetMetadata: {
       fetchedAt: null,
       sheetIdsByTitle: {}
@@ -1446,7 +1448,7 @@ function buildMonthlySheetProtectionRequests(sheet, serviceAccountEmail) {
   return requests;
 }
 
-async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, serviceAccountEmail) {
+async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, serviceAccountEmail, options = {}) {
   const sheetId = Number(sheet?.properties?.sheetId);
 
   if (!Number.isFinite(sheetId)) {
@@ -1467,6 +1469,7 @@ async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, servi
 
   if (requests.length === 0) {
     ensuredMonthlySheetProtectionIds.add(sheetId);
+    await persistProtectionId(sheetId, options.cache);
     return;
   }
 
@@ -1487,6 +1490,7 @@ async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, servi
     );
     ensuredMonthlySheetProtectionIds.add(sheetId);
     monthlySheetProtectionFailureUntil.delete(sheetId);
+    await persistProtectionId(sheetId, options.cache);
     logSheetsSuccess("Monthly sheet protections ensured.", {
       title: sheet?.properties?.title ?? null,
       sheetId,
@@ -1500,6 +1504,44 @@ async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, servi
     console.warn(
       `Skipping monthly sheet protections for sheet ${sheetId} after failure: ${error.message}`
     );
+  }
+}
+
+async function persistProtectionId(sheetId, cache) {
+  // Persist the sheetId so future process restarts skip re-running the batchUpdate.
+  // If a cache object is provided, mutate it in-place and let the caller persist;
+  // otherwise do a targeted read-modify-write on the local cache file.
+  const MAX_MAINTAINED_IDS = 24; // ~2 years of monthly sheets
+
+  if (cache) {
+    if (!Array.isArray(cache.maintainedSheetProtectionIds)) {
+      cache.maintainedSheetProtectionIds = [];
+    }
+    if (!cache.maintainedSheetProtectionIds.includes(sheetId)) {
+      cache.maintainedSheetProtectionIds = [
+        ...cache.maintainedSheetProtectionIds.slice(-(MAX_MAINTAINED_IDS - 1)),
+        sheetId
+      ];
+    }
+    return;
+  }
+
+  // No cache object in scope — read-modify-write the file directly.
+  try {
+    const existing = await readLocalSheetCache();
+    const ids = Array.isArray(existing.maintainedSheetProtectionIds)
+      ? existing.maintainedSheetProtectionIds
+      : [];
+
+    if (!ids.includes(sheetId)) {
+      existing.maintainedSheetProtectionIds = [
+        ...ids.slice(-(MAX_MAINTAINED_IDS - 1)),
+        sheetId
+      ];
+      await writeLocalSheetCache(existing);
+    }
+  } catch {
+    // Non-fatal — we already have the in-memory set populated.
   }
 }
 
@@ -1605,7 +1647,8 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     sheets,
     config.spreadsheetId,
     sheet,
-    config.googleServiceAccountEmail
+    config.googleServiceAccountEmail,
+    { cache: options.cache }
   );
   const onboardingAppointments = await readCanonicalOnboardingAppointments(sheets, config, {
     cache: options.cache,
@@ -2063,7 +2106,7 @@ function deserializeSnapshot(payload) {
 
 async function readLocalSheetCache() {
   const cache = await readJsonFile(SHEET_CACHE_FILE(), buildDefaultSheetCache());
-  return {
+  const merged = {
     ...buildDefaultSheetCache(),
     ...cache,
     spreadsheetMetadata: {
@@ -2071,8 +2114,19 @@ async function readLocalSheetCache() {
       ...(cache?.spreadsheetMetadata ?? {})
     },
     monthSlices: { ...(cache?.monthSlices ?? {}) },
-    snapshots: { ...(cache?.snapshots ?? {}) }
+    snapshots: { ...(cache?.snapshots ?? {}) },
+    maintainedSheetProtectionIds: Array.isArray(cache?.maintainedSheetProtectionIds)
+      ? cache.maintainedSheetProtectionIds
+      : []
   };
+
+  // Hydrate the in-memory protection set from the persisted list so cold restarts
+  // don't re-fire batchUpdate protection requests on already-protected sheets.
+  for (const sheetId of merged.maintainedSheetProtectionIds) {
+    ensuredMonthlySheetProtectionIds.add(Number(sheetId));
+  }
+
+  return merged;
 }
 
 export async function loadAttendanceSnapshotsFromLocalCache() {
@@ -2565,7 +2619,9 @@ async function refreshMonthSlice(sheets, config, input, options = {}) {
     force: options.force === true,
     persist: false
   });
-  if (isManagedMonthlyDate(date, config.timezone)) {
+  // Structural ops (sheet creation, row sync, layout, protections) are expensive.
+  // Only run when explicitly requested (e.g. runDailySheetMaintenance or admin actions).
+  if (options.structural === true && isManagedMonthlyDate(date, config.timezone)) {
     await ensureMonthlyAttendanceSheet(
       sheets,
       config,
@@ -3295,7 +3351,10 @@ export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
     baseDate,
     shiftMonth(baseDate, config.timezone, 1)
   ];
-  const localCache = await readLocalSheetCache();
+  // Allow callers to pass in a shared cache object (e.g. from runDailySheetMaintenance)
+  // to avoid a redundant readLocalSheetCache() + writeLocalSheetCache() round-trip.
+  const localCache = options.cache ?? (await readLocalSheetCache());
+  const structural = options.structural === true;
 
   await updateSpreadsheetMetadataCache(sheets, config, localCache, options.force === true);
   await refreshOnboardingSlice(sheets, config, {
@@ -3309,6 +3368,7 @@ export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
       cache: localCache,
       force: options.force === true,
       normalizeAliases: options.normalizeAliases === true,
+      structural,
       persist: false
     });
   }
@@ -3323,6 +3383,43 @@ export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
       Object.entries(localCache.monthSlices ?? {}).map(([title, slice]) => [title, deserializeMonthSlice(slice)])
     )
   );
+}
+
+/**
+ * Runs all structural sheet maintenance: roster sync, monthly sheet creation, row layout,
+ * formatting, protections, and full snapshot preload with alias normalisation.
+ *
+ * This is intentionally expensive and should only be called once a day (midnight cron).
+ * Hot-path read cycles should use preloadAttendanceSnapshots({ structural: false }).
+ */
+export async function runDailySheetMaintenance(sheets, config) {
+  const cache = await readLocalSheetCache();
+
+  // Full onboarding + monthly sheet structural sync (row inserts, formatting, protections).
+  await syncOnboardingRoster(sheets, config, { cache });
+
+  // Force-refresh snapshots with structural writes + alias normalisation enabled.
+  // Pass the same cache object to skip the redundant readLocalSheetCache() inside.
+  await preloadAttendanceSnapshots(sheets, config, {
+    cache,
+    force: true,
+    structural: true,
+    normalizeAliases: true
+  });
+
+  cache.lastStructuralMaintenanceAt = new Date().toISOString();
+  await writeLocalSheetCache(cache);
+
+  logSheetsSuccess("Daily sheet maintenance completed.", {
+    lastStructuralMaintenanceAt: cache.lastStructuralMaintenanceAt
+  });
+
+  return { maintenanceAt: cache.lastStructuralMaintenanceAt };
+}
+
+export async function getLastStructuralMaintenanceAt() {
+  const cache = await readLocalSheetCache();
+  return cache.lastStructuralMaintenanceAt ?? null;
 }
 
 export function summarizeStatusesFromSnapshot(snapshotBundle, config, options = {}) {
@@ -3441,5 +3538,8 @@ export const __testing = {
   getMonthParts,
   shiftMonth,
   writeMonthlySheetRows,
-  writeAppointmentColumn
+  writeAppointmentColumn,
+  clearEnsuredMonthlySheetProtectionIds() {
+    ensuredMonthlySheetProtectionIds.clear();
+  }
 };

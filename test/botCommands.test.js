@@ -636,11 +636,13 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
         intervals.push({ fn, delay });
         return delay;
       },
+      setTimeoutFn: () => 0,
       scheduleFn: (expression, fn, options) => {
         schedules.push({ expression, fn, options });
         return { stop() {} };
       },
-      refreshAttendanceOptionUsageFn: async () => {}
+      refreshAttendanceOptionUsageFn: async () => {},
+      runDailySheetMaintenanceFn: async () => {}
     }
   });
 
@@ -648,10 +650,13 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
     intervals.map((entry) => entry.delay),
     [60 * 1000, 5 * 60 * 1000]
   );
-  assert.equal(schedules[0].expression, "5 0 * * *");
+  // First cron is midnight structural maintenance; second is 00:05 queue compaction.
+  assert.equal(schedules[0].expression, "0 0 * * *");
+  assert.equal(schedules[1].expression, "5 0 * * *");
   assert.ok(schedules.some((entry) => entry.expression === "0 7 * * *"));
   assert.ok(schedules.some((entry) => entry.expression === "0 8 * * *"));
-  assert.deepEqual(runCycleCalls, [{ force: true, reason: "startup" }]);
+  // Startup cycle is now lightweight (force: false).
+  assert.deepEqual(runCycleCalls, [{ force: false, reason: "startup" }]);
 });
 
 test("scheduled reminder forces a sync before sending prompts", async () => {
@@ -676,11 +681,13 @@ test("scheduled reminder forces a sync before sending prompts", async () => {
     },
     deps: {
       setIntervalFn: () => 0,
+      setTimeoutFn: () => 0,
       scheduleFn: (expression, fn) => {
         schedules.push({ expression, fn });
         return { stop() {} };
       },
       refreshAttendanceOptionUsageFn: async () => {},
+      runDailySheetMaintenanceFn: async () => {},
       isReminderWorkingDayFn: async () => true,
       listUsersFn: async () => [{ chatId: "chat-1", appointment: "ALPHA" }],
       sendPromptToChatFn: async (_bot, _config, chatId) => {
@@ -693,7 +700,7 @@ test("scheduled reminder forces a sync before sending prompts", async () => {
   await reminderSchedule.fn();
 
   assert.deepEqual(runCycleCalls, [
-    { force: true, reason: "startup" },
+    { force: false, reason: "startup" },
     { force: true, reason: "reminder" }
   ]);
   assert.deepEqual(prompts, ["chat-1"]);
@@ -724,11 +731,13 @@ test("scheduled reminder still sends prompts when pre-send sync fails", async ()
     },
     deps: {
       setIntervalFn: () => 0,
+      setTimeoutFn: () => 0,
       scheduleFn: (expression, fn) => {
         schedules.push({ expression, fn });
         return { stop() {} };
       },
       refreshAttendanceOptionUsageFn: async () => {},
+      runDailySheetMaintenanceFn: async () => {},
       isReminderWorkingDayFn: async () => true,
       listUsersFn: async () => [{ chatId: "chat-1", appointment: "ALPHA" }],
       sendPromptToChatFn: async (_bot, _config, chatId) => {
@@ -786,11 +795,13 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
     },
     deps: {
       setIntervalFn: () => 0,
+      setTimeoutFn: () => 0,
       scheduleFn: (expression, fn) => {
         schedules.push({ expression, fn });
         return { stop() {} };
       },
       refreshAttendanceOptionUsageFn: async () => {},
+      runDailySheetMaintenanceFn: async () => {},
       isReminderWorkingDayFn: async () => true,
       listUsersFn: async () => [
         { chatId: "chat-1", appointment: "ALPHA" },

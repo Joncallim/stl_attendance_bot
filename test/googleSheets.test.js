@@ -403,6 +403,8 @@ async function withTempDataDir(run) {
   } finally {
     delete process.env.ATTENDANCE_BOT_DATA_DIR;
     await rm(tempDir, { recursive: true, force: true });
+    // Clear the module-level protection ID cache so tests don't bleed into each other.
+    __testing.clearEnsuredMonthlySheetProtectionIds();
   }
 }
 
@@ -653,62 +655,57 @@ test("existing human-managed headers are preserved when already populated", asyn
 });
 
 test("existing monthly sheets get protections for the header row and appointment column", async () => {
-  const fake = createInMemorySheets({
-    ONBOARDING: {
-      sheetId: 1,
-      values: [
-        ["Appointment", "Secret Code"],
-        ["ALPHA", "CODE-1"]
-      ]
-    },
-    "Mar 26": {
-      sheetId: 2,
-      values: [
-        ["Appointment", "1 Mar"],
-        ["ALPHA", "PRESENT"]
-      ]
-    }
-  });
-  const originalFetch = global.fetch;
-  global.fetch = async () => ({
-    ok: true,
-    json: async () => ({ data: { holidays: [] } })
-  });
-
-  try {
-    await syncOnboardingRoster(
-      fake.client,
-      {
-        spreadsheetId: "spreadsheet-id",
-        timezone: "Asia/Singapore",
-        rosterStopMarkers: [],
-        onboardingSheetTitle: "ONBOARDING",
-        attendanceOptions: ["PRESENT", "WFH"],
-        googleServiceAccountEmail: "bot@example.com"
+  await withTempDataDir(async () => {
+    const fake = createInMemorySheets({
+      ONBOARDING: {
+        sheetId: 1,
+        values: [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", "CODE-1"]
+        ]
+      },
+      "Mar 26": {
+        sheetId: 2,
+        values: [
+          ["Appointment", "1 Mar"],
+          ["ALPHA", "PRESENT"]
+        ]
       }
+    });
+
+    await withMockedFetch({ data: { holidays: [] } }, async () => {
+      await syncOnboardingRoster(
+        fake.client,
+        {
+          spreadsheetId: "spreadsheet-id",
+          timezone: "Asia/Singapore",
+          rosterStopMarkers: [],
+          onboardingSheetTitle: "ONBOARDING",
+          attendanceOptions: ["PRESENT", "WFH"],
+          googleServiceAccountEmail: "bot@example.com"
+        }
+      );
+    });
+
+    const protectionRequests = fake.calls.batchUpdateRequests
+      .flat()
+      .filter((request) => request.addProtectedRange);
+
+    assert.equal(protectionRequests.length, 4);
+    assert.deepEqual(
+      protectionRequests.map((request) => request.addProtectedRange.protectedRange.description),
+      [
+        "attendance-bot:protect-header-row",
+        "attendance-bot:protect-appointment-column",
+        "attendance-bot:protect-header-row",
+        "attendance-bot:protect-appointment-column"
+      ]
     );
-  } finally {
-    global.fetch = originalFetch;
-  }
-
-  const protectionRequests = fake.calls.batchUpdateRequests
-    .flat()
-    .filter((request) => request.addProtectedRange);
-
-  assert.equal(protectionRequests.length, 4);
-  assert.deepEqual(
-    protectionRequests.map((request) => request.addProtectedRange.protectedRange.description),
-    [
-      "attendance-bot:protect-header-row",
-      "attendance-bot:protect-appointment-column",
-      "attendance-bot:protect-header-row",
-      "attendance-bot:protect-appointment-column"
-    ]
-  );
-  assert.deepEqual(
-    protectionRequests.map((request) => request.addProtectedRange.protectedRange.editors?.users ?? []),
-    [["bot@example.com"], ["bot@example.com"], ["bot@example.com"], ["bot@example.com"]]
-  );
+    assert.deepEqual(
+      protectionRequests.map((request) => request.addProtectedRange.protectedRange.editors?.users ?? []),
+      [["bot@example.com"], ["bot@example.com"], ["bot@example.com"], ["bot@example.com"]]
+    );
+  });
 });
 
 test("monthly sheet protection failures are treated as best effort", async () => {
