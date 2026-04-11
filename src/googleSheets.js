@@ -16,12 +16,15 @@ const DEFAULT_BOOTSTRAP_APPOINTMENTS = ["USER1", "USER2", "USER3"];
 const ATTENDANCE_OPTION_USAGE_MONTH_WINDOW = 2;
 const GOOGLE_SHEETS_MAX_RETRY_ATTEMPTS = 5;
 const GOOGLE_SHEETS_INITIAL_RETRY_DELAY_MS = 1000;
+const GOOGLE_SHEETS_MIN_RETRY_DELAY_MS = 500;
 const GOOGLE_SHEETS_MAX_RETRY_DELAY_MS = 32000;
 const GOOGLE_SHEETS_REQUEST_TIMEOUT_MS = 15000;
+const GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS = 5000;
 const MONTHLY_PROTECTION_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
 const runtimeSheetContext = new WeakMap();
 const ensuredMonthlySheetProtectionIds = new Set();
 const monthlySheetProtectionFailureUntil = new Map();
+let activeGoogleSheetsRequests = 0;
 
 function logSheetsSuccess(message, details = null) {
   if (details) {
@@ -527,7 +530,8 @@ function getGoogleSheetsRetryDelay(attempt, options = {}) {
     GOOGLE_SHEETS_MAX_RETRY_DELAY_MS
   );
 
-  return Math.floor(randomFn() * cappedBaseDelay);
+  const jitteredDelay = Math.floor(randomFn() * cappedBaseDelay);
+  return Math.max(jitteredDelay, GOOGLE_SHEETS_MIN_RETRY_DELAY_MS);
 }
 
 async function sleep(ms) {
@@ -576,25 +580,52 @@ async function runGoogleSheetsRequest(operation, request, options = {}) {
   const logFn = options.logFn ?? console.warn;
   let attempt = 0;
 
-  while (attempt < maxAttempts) {
-    attempt += 1;
+  activeGoogleSheetsRequests += 1;
+  const startTime = Date.now();
+  const startTs = new Date().toISOString();
 
-    try {
-      return await runGoogleSheetsRequestWithTimeout(operation, request, options);
-    } catch (error) {
-      if (!isRetryableGoogleSheetsError(error) || attempt >= maxAttempts) {
-        throw error;
+  console.log(
+    `[${startTs}] [Sheets] START ${operation} (in-flight: ${activeGoogleSheetsRequests})`
+  );
+
+  try {
+    while (attempt < maxAttempts) {
+      attempt += 1;
+
+      try {
+        const result = await runGoogleSheetsRequestWithTimeout(operation, request, options);
+        const durationMs = Date.now() - startTime;
+
+        if (durationMs >= GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS) {
+          logFn(
+            `[${new Date().toISOString()}] [Sheets] SLOW ${operation} completed in ${durationMs}ms`
+          );
+        }
+
+        return result;
+      } catch (error) {
+        if (!isRetryableGoogleSheetsError(error) || attempt >= maxAttempts) {
+          const durationMs = Date.now() - startTime;
+          logFn(
+            `[${new Date().toISOString()}] [Sheets] FAIL ${operation} after ${durationMs}ms` +
+            ` (attempt ${attempt}/${maxAttempts}): ${error.message}`
+          );
+          throw error;
+        }
+
+        const delayMs = getGoogleSheetsRetryDelay(attempt, options);
+        logFn(
+          `[${new Date().toISOString()}] [Sheets] retry ${attempt}/${maxAttempts}` +
+          ` for ${operation} after ${delayMs}ms: ${error.message}`
+        );
+        await sleepFn(delayMs);
       }
-
-      const delayMs = getGoogleSheetsRetryDelay(attempt, options);
-      logFn(
-        `Google Sheets request retry ${attempt}/${maxAttempts} for ${operation} after ${delayMs}ms: ${error.message}`
-      );
-      await sleepFn(delayMs);
     }
-  }
 
-  throw new Error(`Google Sheets request exhausted retries for ${operation}`);
+    throw new Error(`Google Sheets request exhausted retries for ${operation}`);
+  } finally {
+    activeGoogleSheetsRequests -= 1;
+  }
 }
 
 function columnNumberToLabel(columnNumber) {
