@@ -781,7 +781,8 @@ async function getSpreadsheet(sheets, spreadsheetId, options = {}) {
   const response = await runGoogleSheetsRequest("spreadsheets.get", (signal) =>
     sheets.spreadsheets.get({
       spreadsheetId,
-      includeGridData: false
+      includeGridData: false,
+      fields: "spreadsheetId,sheets(properties,protectedRanges)"
     }, { signal })
   );
   const spreadsheet = response.data;
