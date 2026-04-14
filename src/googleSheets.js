@@ -12,6 +12,8 @@ const SPREADSHEET_METADATA_TTL_MS = 15 * 60 * 1000;
 const ONBOARDING_SLICE_TTL_MS = 2 * 60 * 1000;
 const MONTH_SLICE_TTL_MS = 60 * 1000;
 const DEFAULT_MAX_MANAGED_ROWS = 1000;
+// Extra rows beyond the known appointment count: stop-marker row + blank-row drift tolerance.
+const MANAGED_ROW_BUFFER = 5;
 // Monthly sheets have at most 1 appointment col + 31 day cols = 32 cols; cap at 33 for safety.
 // Column 33 in A1 notation = "AH".
 const MAX_MONTH_SHEET_COLUMN_LABEL = "AH";
@@ -632,6 +634,19 @@ async function runGoogleSheetsRequest(operation, request, options = {}) {
   }
 }
 
+/**
+ * Returns the maximum row number to use when reading a managed sheet range.
+ * When the appointment count is known, cap at (count + header row + buffer).
+ * Falls back to DEFAULT_MAX_MANAGED_ROWS when count is unknown.
+ */
+function managedRowLimit(knownAppointmentCount) {
+  if (Number.isInteger(knownAppointmentCount) && knownAppointmentCount > 0) {
+    return 1 + knownAppointmentCount + MANAGED_ROW_BUFFER; // 1 header + appointments + buffer
+  }
+
+  return DEFAULT_MAX_MANAGED_ROWS;
+}
+
 function columnNumberToLabel(columnNumber) {
   let current = columnNumber;
   let label = "";
@@ -1071,7 +1086,7 @@ async function writeAppointmentColumn(
   appointments,
   options = {}
 ) {
-  const values = await readSheetValues(sheets, spreadsheetId, title, "A1:B1000");
+  const values = await readSheetValues(sheets, spreadsheetId, title, `A1:B${managedRowLimit(appointments.length)}`);
   const parsed = parseOnboardingManagedRows(values, options.stopMarkers ?? []);
   const existingCodes = new Map(parsed.managedRows.map((row) => [row.appointment, row.secretCode]));
   const rows = appointments.map((appointment) => [appointment, existingCodes.get(appointment) ?? ""]);
@@ -1086,11 +1101,12 @@ async function readMonthlySheetRows(
   stopMarkers,
   canonicalAppointments = []
 ) {
+  const rowLimit = managedRowLimit(canonicalAppointments.length);
   const values = await readSheetValues(
     sheets,
     spreadsheetId,
     title,
-    `A2:${columnNumberToLabel(headerLength)}1000`
+    `A2:${columnNumberToLabel(headerLength)}${rowLimit}`
   );
   return buildLiveManagedMonthlyRows(
     [["Appointment"], ...values],
@@ -1270,7 +1286,7 @@ function buildHeaderUpdateRequest(sheetId, header) {
 
 async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarkers = [], options = {}) {
   const sheet = await getSheetByTitle(sheets, spreadsheetId, title, options);
-  const values = await readSheetValues(sheets, spreadsheetId, title, "A1:B1000");
+  const values = await readSheetValues(sheets, spreadsheetId, title, `A1:B${managedRowLimit(rows.length)}`);
   const parsed = parseOnboardingManagedRows(values, stopMarkers);
   const currentCount = parsed.appointments.length;
   const nextCount = rows.length;
@@ -1672,7 +1688,7 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     );
     monthlySheetValues = [defaultHeader];
   } else {
-    monthlySheetValues = await readSheetValues(sheets, config.spreadsheetId, title, `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${DEFAULT_MAX_MANAGED_ROWS}`);
+    monthlySheetValues = await readSheetValues(sheets, config.spreadsheetId, title, `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${managedRowLimit(appointments.length)}`);
     const existingHeader = getHeaderRowFromValues(monthlySheetValues, []);
 
     if (existingHeader.length === 0) {
@@ -2304,7 +2320,9 @@ async function refreshOnboardingSlice(sheets, config, options = {}) {
 
   const title = config.onboardingSheetTitle;
   const ensuredSheet = await ensureSheet(sheets, config.spreadsheetId, title, { cache });
-  const values = await readSheetValues(sheets, config.spreadsheetId, title, "A1:B1000");
+  // Use a cached appointment count as the row hint when available (stale cache is fine as an upper bound).
+  const cachedCount = cache.onboardingSlice?.appointments?.length ?? 0;
+  const values = await readSheetValues(sheets, config.spreadsheetId, title, `A1:B${managedRowLimit(cachedCount)}`);
   const headerRow = (values[0] ?? []).map((value) => String(value ?? "").trim());
   const parsed = parseOnboardingManagedRows(values, config.rosterStopMarkers);
   const stopMarker = getPrimaryStopMarker(config.rosterStopMarkers);
@@ -2668,7 +2686,8 @@ async function refreshMonthSlice(sheets, config, input, options = {}) {
       { cache }
     );
   }
-  const values = await readSheetValues(sheets, config.spreadsheetId, title);
+  const rowLimit = managedRowLimit(onboardingSlice.appointments.length);
+  const values = await readSheetValues(sheets, config.spreadsheetId, title, `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${rowLimit}`);
   const slice = createMonthSliceFromValues(date, values, config, onboardingSlice.appointments);
 
   if (options.normalizeAliases === true && (slice.aliasCorrections?.length ?? 0) > 0) {
@@ -3556,9 +3575,11 @@ export async function summarizeAttendanceOptionUsage(sheets, config) {
     .map((entry) => entry.title)
     .filter((title) => recentMonthTitleSet.has(title));
   const counts = new Map(config.attendanceOptions.map((option) => [option, 0]));
+  const cachedOnboardingCount = cache.onboardingSlice?.appointments?.length ?? 0;
+  const usageRowLimit = managedRowLimit(cachedOnboardingCount);
 
   for (const title of monthTitles) {
-    const values = await readSheetValues(sheets, config.spreadsheetId, title);
+    const values = await readSheetValues(sheets, config.spreadsheetId, title, `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${usageRowLimit}`);
     const rows = values.slice(1);
 
     for (const row of rows) {
