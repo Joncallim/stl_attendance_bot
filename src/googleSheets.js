@@ -12,6 +12,10 @@ const SPREADSHEET_METADATA_TTL_MS = 15 * 60 * 1000;
 const ONBOARDING_SLICE_TTL_MS = 2 * 60 * 1000;
 const MONTH_SLICE_TTL_MS = 60 * 1000;
 const DEFAULT_MAX_MANAGED_ROWS = 1000;
+// Monthly sheets have at most 1 appointment col + 31 day cols = 32 cols; cap at 33 for safety.
+// Column 33 in A1 notation = "AH".
+const MAX_MONTH_SHEET_COLUMN_LABEL = "AH";
+const GOOGLE_SHEETS_VERIFY_WRITES = process.env.GOOGLE_SHEETS_VERIFY_WRITES === "true";
 const DEFAULT_BOOTSTRAP_APPOINTMENTS = ["USER1", "USER2", "USER3"];
 const ATTENDANCE_OPTION_USAGE_MONTH_WINDOW = 2;
 const GOOGLE_SHEETS_MAX_RETRY_ATTEMPTS = 5;
@@ -1030,7 +1034,7 @@ function buildLiveManagedMonthlyRows(values, headerLength, stopMarkers = [], can
 }
 
 async function readHeaderRow(sheets, spreadsheetId, title, fallbackHeader = []) {
-  const values = await readSheetValues(sheets, spreadsheetId, title, "A1:ZZ1");
+  const values = await readSheetValues(sheets, spreadsheetId, title, `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}1`);
   const headerRow = (values[0] ?? []).map((value) => String(value ?? "").trim());
   const hasHeader = headerRow.some(Boolean);
   return hasHeader ? headerRow : fallbackHeader;
@@ -1342,6 +1346,7 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
       }
     }, { signal })
   );
+  await verifyBatchWrite(sheets, spreadsheetId, data);
 }
 
 function buildAttendanceValidationRequest(sheetId, headerLength, options) {
@@ -1351,7 +1356,7 @@ function buildAttendanceValidationRequest(sheetId, headerLength, options) {
         sheetId,
         startRowIndex: 1,
         startColumnIndex: 1,
-        endRowIndex: 1000,
+        endRowIndex: DEFAULT_MAX_MANAGED_ROWS,
         endColumnIndex: headerLength
       },
       rule: {
@@ -1399,7 +1404,7 @@ async function buildDisabledDayFormattingRequests(sheetId, date, timezone) {
         range: {
           sheetId,
           startRowIndex: 0,
-          endRowIndex: 1000,
+          endRowIndex: DEFAULT_MAX_MANAGED_ROWS,
           startColumnIndex: day,
           endColumnIndex: day + 1
         },
@@ -1578,7 +1583,7 @@ async function persistProtectionId(sheetId, cache) {
 }
 
 async function ensureHeaderRowIfBlank(sheets, spreadsheetId, title, header) {
-  const values = await readSheetValues(sheets, spreadsheetId, title, "A1:ZZ1");
+  const values = await readSheetValues(sheets, spreadsheetId, title, `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}1`);
   const existingHeaderRow = values[0] ?? [];
   const hasAnyHeaderValue = existingHeaderRow.some((value) => String(value ?? "").trim());
 
@@ -1667,7 +1672,7 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     );
     monthlySheetValues = [defaultHeader];
   } else {
-    monthlySheetValues = await readSheetValues(sheets, config.spreadsheetId, title, "A1:ZZ1000");
+    monthlySheetValues = await readSheetValues(sheets, config.spreadsheetId, title, `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${DEFAULT_MAX_MANAGED_ROWS}`);
     const existingHeader = getHeaderRowFromValues(monthlySheetValues, []);
 
     if (existingHeader.length === 0) {
@@ -1757,7 +1762,7 @@ async function readSheetColumnValues(sheets, spreadsheetId, title, columnLabel) 
     `spreadsheets.values.get:${title}:${columnLabel}`,
     (signal) => sheets.spreadsheets.values.get({
       spreadsheetId,
-      range: `'${title}'!${columnLabel}2:${columnLabel}1000`
+      range: `'${title}'!${columnLabel}2:${columnLabel}${DEFAULT_MAX_MANAGED_ROWS}`
     }, { signal })
   );
 
@@ -2712,7 +2717,53 @@ function buildSummaryPayload(date, sheetTitle, rosterValues) {
   };
 }
 
-async function readSheetValues(sheets, spreadsheetId, title, range = "A1:ZZ1000") {
+/**
+ * After a batchUpdate, reads back each written range and compares cell-by-cell.
+ * Only active when GOOGLE_SHEETS_VERIFY_WRITES=true. Logs warnings on mismatch.
+ * Returns { ok, discrepancies } where discrepancies is an array of { range, cell, expected, actual }.
+ */
+async function verifyBatchWrite(sheets, spreadsheetId, writes, options = {}) {
+  if (!GOOGLE_SHEETS_VERIFY_WRITES) {
+    return { ok: true, discrepancies: [] };
+  }
+
+  const logFn = options.logFn ?? console.warn;
+  const discrepancies = [];
+
+  for (const write of writes) {
+    const response = await runGoogleSheetsRequest(
+      `spreadsheets.values.get:verify:${write.range}`,
+      (signal) => sheets.spreadsheets.values.get({ spreadsheetId, range: write.range }, { signal })
+    );
+
+    const actual = response.data.values ?? [];
+    const expected = write.values ?? [];
+
+    for (let r = 0; r < expected.length; r++) {
+      for (let c = 0; c < (expected[r] ?? []).length; c++) {
+        const exp = String(expected[r][c] ?? "").trim();
+        const act = String((actual[r] ?? [])[c] ?? "").trim();
+
+        if (exp !== act) {
+          discrepancies.push({ range: write.range, cell: `[${r}][${c}]`, expected: exp, actual: act });
+        }
+      }
+    }
+  }
+
+  if (discrepancies.length > 0) {
+    const detail = discrepancies
+      .map((d) => `${d.range}${d.cell}: wrote "${d.expected}" but read "${d.actual}"`)
+      .join("; ");
+    logFn(`[${new Date().toISOString()}] [Sheets] VERIFY MISMATCH (${discrepancies.length} cell(s)): ${detail}`);
+  } else {
+    console.log(`[${new Date().toISOString()}] [Sheets] VERIFY OK — ${writes.length} write(s) confirmed`);
+  }
+
+  return { ok: discrepancies.length === 0, discrepancies };
+}
+
+async function readSheetValues(sheets, spreadsheetId, title, range = `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${DEFAULT_MAX_MANAGED_ROWS}`) {
   const response = await runGoogleSheetsRequest(
     `spreadsheets.values.get:${title}:${range}`,
     (signal) => sheets.spreadsheets.values.get({
@@ -3181,6 +3232,7 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
           }
         }, { signal })
       );
+      await verifyBatchWrite(sheets, config.spreadsheetId, data);
     }
   }
 
@@ -3352,6 +3404,7 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
         }
       }, { signal })
     );
+    await verifyBatchWrite(sheets, config.spreadsheetId, data);
   }
 
   for (const [title, slice] of mergedSlices.entries()) {

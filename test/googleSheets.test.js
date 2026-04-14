@@ -1409,7 +1409,7 @@ test("five-minute reconciliation prefers direct sheet edits over queued bot chan
               };
             }
 
-            if (request.range === "'Mar 26'!A1:ZZ1000" || request.range === "'Mar 26'!A1:ZZ1") {
+            if (request.range === "'Mar 26'!A1:AH1000" || request.range === "'Mar 26'!A1:AH1") {
               return {
                 data: {
                   values: [
@@ -1951,17 +1951,17 @@ test("syncOnboardingRoster reuses one live month snapshot per active sheet refre
     }, { persist: false });
 
     const currentMonthReads = fake.calls.getRanges.filter(
-      (range) => range === `'${currentMonthTitle}'!A1:ZZ1000`
+      (range) => range === `'${currentMonthTitle}'!A1:AH1000`
     );
     const nextMonthReads = fake.calls.getRanges.filter(
-      (range) => range === `'${nextMonthTitle}'!A1:ZZ1000`
+      (range) => range === `'${nextMonthTitle}'!A1:AH1000`
     );
 
     assert.equal(currentMonthReads.length, 1);
     assert.equal(nextMonthReads.length, 1);
     assert.ok(!fake.calls.getRanges.includes(`'${currentMonthTitle}'!A2:A`));
-    assert.ok(!fake.calls.getRanges.includes(`'${currentMonthTitle}'!A1:ZZ1`));
+    assert.ok(!fake.calls.getRanges.includes(`'${currentMonthTitle}'!A1:AH1`));
     assert.ok(!fake.calls.getRanges.includes(`'${nextMonthTitle}'!A2:A`));
-    assert.ok(!fake.calls.getRanges.includes(`'${nextMonthTitle}'!A1:ZZ1`));
+    assert.ok(!fake.calls.getRanges.includes(`'${nextMonthTitle}'!A1:AH1`));
   });
 });
