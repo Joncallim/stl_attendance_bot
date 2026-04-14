@@ -32,6 +32,18 @@ const ensuredMonthlySheetProtectionIds = new Set();
 const monthlySheetProtectionFailureUntil = new Map();
 let activeGoogleSheetsRequests = 0;
 
+// Semaphore: serialise all outgoing Sheets API calls so only one is in-flight
+// at a time. Google Sheets throttles concurrent requests from the same service
+// account token, causing cascading timeouts when two requests run together.
+let sheetsSemaphorePromise = Promise.resolve();
+
+function acquireSheetsSemaphore(fn) {
+  const next = sheetsSemaphorePromise.then(() => fn());
+  // Allow the queue to drain even if fn() rejects.
+  sheetsSemaphorePromise = next.catch(() => {});
+  return next;
+}
+
 function logSheetsSuccess(message, details = null) {
   if (details) {
     console.log(`${message} ${JSON.stringify(details)}`);
@@ -580,7 +592,7 @@ async function runGoogleSheetsRequestWithTimeout(operation, request, options = {
   }
 }
 
-async function runGoogleSheetsRequest(operation, request, options = {}) {
+async function runGoogleSheetsRequestQueued(operation, request, options = {}) {
   const maxAttempts = options.maxAttempts ?? GOOGLE_SHEETS_MAX_RETRY_ATTEMPTS;
   const sleepFn = options.sleepFn ?? sleep;
   const logFn = options.logFn ?? console.warn;
@@ -632,6 +644,13 @@ async function runGoogleSheetsRequest(operation, request, options = {}) {
   } finally {
     activeGoogleSheetsRequests -= 1;
   }
+}
+
+function runGoogleSheetsRequest(operation, request, options = {}) {
+  // Route through the semaphore so at most one Sheets API request is in-flight
+  // at any time. This prevents Google from throttling concurrent calls from the
+  // same service account token, which manifests as cascading 15s timeouts.
+  return acquireSheetsSemaphore(() => runGoogleSheetsRequestQueued(operation, request, options));
 }
 
 /**
