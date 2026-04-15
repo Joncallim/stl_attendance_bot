@@ -1563,7 +1563,7 @@ async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, servi
           }
         }, { signal }),
       {
-        maxAttempts: 2,
+        maxAttempts: 1,
         timeoutMs: GOOGLE_SHEETS_REQUEST_TIMEOUT_MS
       }
     );

@@ -62,7 +62,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.8";
+export const BOT_VERSION = "v0.9.9";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -2795,7 +2795,11 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
   }
 
   if (action === "syncroster") {
-    await handleSyncRosterAdminAction(ctx, config, {
+    // Do NOT await — roster sync can take several minutes with a large roster.
+    // Telegraf kills any action/command handler Promise at 90s; awaiting would
+    // cause every sync to appear as a failure even when it ultimately succeeds.
+    // The sync sends its own completion message via ctx when it finishes.
+    handleSyncRosterAdminAction(ctx, config, {
       syncRosterState,
       ensureNextMonthSheetExists,
       refreshAdminCache,
@@ -2803,6 +2807,8 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       sendOrUpdateAdminMessage,
       sheets,
       cache
+    }).catch((error) => {
+      console.error("Background roster sync error:", error.message);
     });
     return;
   }

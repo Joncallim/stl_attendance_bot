@@ -3,6 +3,8 @@ const PUBLIC_HOLIDAY_FETCH_TIMEOUT_MS = 10000;
 // Brief pause between fetching individual dataset pages to avoid 429s from
 // the data.gov.sg API when the collection contains multiple datasets.
 const PUBLIC_HOLIDAY_INTER_FETCH_DELAY_MS = 500;
+const PUBLIC_HOLIDAY_MAX_RETRY_ATTEMPTS = 3;
+const PUBLIC_HOLIDAY_RETRY_INITIAL_DELAY_MS = 2000;
 const publicHolidayCache = {
   years: new Map(),
   loadingPromise: null
@@ -18,8 +20,7 @@ function createPublicHolidayTimeoutError(url, timeoutMs) {
   return error;
 }
 
-async function fetchJson(url, options = {}) {
-  const timeoutMs = options.timeoutMs ?? PUBLIC_HOLIDAY_FETCH_TIMEOUT_MS;
+async function fetchJsonOnce(url, timeoutMs) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     controller.abort();
@@ -40,10 +41,36 @@ async function fetchJson(url, options = {}) {
   }
 
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status} ${response.statusText}`);
+    const error = new Error(`Request failed: ${response.status} ${response.statusText}`);
+    error.status = response.status;
+    throw error;
   }
 
   return response.json();
+}
+
+async function fetchJson(url, options = {}) {
+  const timeoutMs = options.timeoutMs ?? PUBLIC_HOLIDAY_FETCH_TIMEOUT_MS;
+  let delayMs = PUBLIC_HOLIDAY_RETRY_INITIAL_DELAY_MS;
+
+  for (let attempt = 1; attempt <= PUBLIC_HOLIDAY_MAX_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await fetchJsonOnce(url, timeoutMs);
+    } catch (error) {
+      const isRateLimit = error?.status === 429;
+      const isLastAttempt = attempt >= PUBLIC_HOLIDAY_MAX_RETRY_ATTEMPTS;
+
+      if (!isRateLimit || isLastAttempt) {
+        throw error;
+      }
+
+      console.warn(
+        `Public holiday fetch rate-limited (429). Retry ${attempt}/${PUBLIC_HOLIDAY_MAX_RETRY_ATTEMPTS - 1} after ${delayMs}ms for ${url}`
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      delayMs = Math.min(delayMs * 2, 16000);
+    }
+  }
 }
 
 export async function loadSingaporePublicHolidayCache() {
