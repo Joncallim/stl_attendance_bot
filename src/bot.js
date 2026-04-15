@@ -62,7 +62,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.7";
+export const BOT_VERSION = "v0.9.8";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -3033,41 +3033,49 @@ async function withUiOperationTimeout(label, operation, timeoutMs = 8000) {
   }
 }
 
-async function handleSyncRosterAdminAction(ctx, config, deps) {
-  const timeoutMs = deps.timeoutMs ?? 8000;
+// Guards against concurrent roster syncs. withUiOperationTimeout(Promise.race)
+// was previously used here but it does not cancel in-flight Sheets API calls —
+// it only abandons the awaiter, leaving the calls running and jamming the
+// semaphore queue. Each "failed" attempt would queue more API calls behind the
+// still-running ones, making subsequent attempts progressively slower.
+let rosterSyncInProgress = false;
 
-  await deps.sendOrUpdateAdminMessage(
-    ctx,
-    "Syncing roster with Google Sheets. If Google is slow, this will stop early instead of hanging."
-  );
+async function handleSyncRosterAdminAction(ctx, config, deps) {
+  if (rosterSyncInProgress) {
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      "A roster sync is already in progress. Please wait for the current sync to complete."
+    );
+    return;
+  }
+
+  // Set the guard BEFORE the first await so that any concurrent call starting
+  // in the same microtask turn will see it and be rejected.
+  rosterSyncInProgress = true;
 
   try {
-    const roster = await withUiOperationTimeout(
-      "Roster sync",
-      async () => {
-        const nextRoster = await deps.syncRosterState(deps.sheets, config);
-        await deps.ensureNextMonthSheetExists(deps.sheets, config);
-        await deps.refreshAdminCache(deps.cache, config);
-        await deps.preloadSheetSnapshots(deps.sheets, config, deps.cache, { force: true });
-        return nextRoster;
-      },
-      timeoutMs
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      "Syncing roster with Google Sheets. This may take a minute with a large roster — please wait."
     );
+    const roster = await deps.syncRosterState(deps.sheets, config);
+    await deps.ensureNextMonthSheetExists(deps.sheets, config);
+    await deps.refreshAdminCache(deps.cache, config);
+    await deps.preloadSheetSnapshots(deps.sheets, config, deps.cache, { force: true });
 
     await deps.sendOrUpdateAdminMessage(
       ctx,
       `Roster synced from ${config.onboardingSheetTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.`
     );
   } catch (error) {
-    if (error?.name === "UiOperationTimeoutError") {
-      await deps.sendOrUpdateAdminMessage(
-        ctx,
-        "Roster sync is taking too long because Google Sheets is slow. Please try again later."
-      );
-      return;
-    }
-
+    console.error("Roster sync failed:", error.message);
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      `Roster sync failed: ${error.message}`
+    );
     throw error;
+  } finally {
+    rosterSyncInProgress = false;
   }
 }
 
@@ -4874,5 +4882,6 @@ export const __testing = {
   triggerBackgroundSheetRefresh,
   renderInviteSubmenu,
   renderAttendanceOptionsMenu,
-  registerBackgroundSchedules
+  registerBackgroundSchedules,
+  resetRosterSyncGuard() { rosterSyncInProgress = false; }
 };

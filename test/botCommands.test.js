@@ -137,7 +137,7 @@ test("invite command reports missing appointments", async () => {
 test("admin menu description includes the current pre-v1 version", () => {
   const description = __testing.buildAdminMenuDescription();
 
-  assert.match(description, /^Admin Menu \(v0\.9\.7\)/);
+  assert.match(description, /^Admin Menu \(v0\.9\.8\)/);
 });
 
 test("triggerBackgroundSheetRefresh starts a non-blocking refresh when idle", () => {
@@ -171,6 +171,7 @@ test("triggerBackgroundSheetRefresh skips duplicate refreshes while a cycle is r
 });
 
 test("syncroster admin action refreshes sheets and reports current and next month", async () => {
+  __testing.resetRosterSyncGuard();
   const messages = [];
   const calls = [];
 
@@ -203,7 +204,7 @@ test("syncroster admin action refreshes sheets and reports current and next mont
   ]);
   assert.equal(
     messages[0],
-    "Syncing roster with Google Sheets. If Google is slow, this will stop early instead of hanging."
+    "Syncing roster with Google Sheets. This may take a minute with a large roster — please wait."
   );
   assert.equal(
     messages[1],
@@ -256,33 +257,57 @@ test("options reset restores onboarding defaults and refreshes caches", async ()
   assert.ok(messages[1].extra);
 });
 
-test("syncroster admin action fails fast when Google Sheets is too slow", async () => {
+test("syncroster admin action rejects concurrent sync attempts", async () => {
+  __testing.resetRosterSyncGuard();
   const messages = [];
+  let resolveFirst;
+  const firstSyncPending = new Promise((resolve) => { resolveFirst = resolve; });
 
-  await __testing.handleSyncRosterAdminAction(
+  // Start a sync that won't complete yet — don't await it
+  const firstSync = __testing.handleSyncRosterAdminAction(
     {},
     { onboardingSheetTitle: "ONBOARDING", timezone: "Asia/Singapore" },
     {
-      timeoutMs: 5,
-      syncRosterState: async () => new Promise(() => {}),
+      syncRosterState: async () => firstSyncPending,
       ensureNextMonthSheetExists: async () => {},
       refreshAdminCache: async () => {},
       preloadSheetSnapshots: async () => {},
-      sendOrUpdateAdminMessage: async (_ctx, message) => {
-        messages.push(message);
-      },
+      sendOrUpdateAdminMessage: async (_ctx, message) => messages.push(message),
       sheets: {},
       cache: {}
     }
   );
 
+  // A concurrent attempt should be rejected immediately with an informational message
+  await __testing.handleSyncRosterAdminAction(
+    {},
+    { onboardingSheetTitle: "ONBOARDING", timezone: "Asia/Singapore" },
+    {
+      syncRosterState: async () => { throw new Error("should not be reached"); },
+      ensureNextMonthSheetExists: async () => {},
+      refreshAdminCache: async () => {},
+      preloadSheetSnapshots: async () => {},
+      sendOrUpdateAdminMessage: async (_ctx, message) => messages.push(message),
+      sheets: {},
+      cache: {}
+    }
+  );
+
+  // Resolve the first sync and let it finish
+  resolveFirst({ currentMonthTitle: "Mar 26", nextMonthTitle: "Apr 26" });
+  await firstSync;
+
   assert.equal(
     messages[0],
-    "Syncing roster with Google Sheets. If Google is slow, this will stop early instead of hanging."
+    "Syncing roster with Google Sheets. This may take a minute with a large roster — please wait."
   );
   assert.equal(
     messages[1],
-    "Roster sync is taking too long because Google Sheets is slow. Please try again later."
+    "A roster sync is already in progress. Please wait for the current sync to complete."
+  );
+  assert.equal(
+    messages[2],
+    "Roster synced from ONBOARDING. Current month: Mar 26. Next month: Apr 26."
   );
 });
 
