@@ -1,5 +1,5 @@
 import { applyStoredConfigOverrides, config } from "./config.js";
-import { createAttendanceBot } from "./bot.js";
+import { createAttendanceBot, BOT_VERSION } from "./bot.js";
 import { setupLogging } from "./logger.js";
 import { configureNetworkStack } from "./network.js";
 
@@ -18,7 +18,21 @@ async function main() {
     { command: "summary", description: "View attendance summary" },
     { command: "deregister", description: "Deregister this Telegram account" }
   ]);
-  console.log("Attendance bot is running.");
+
+  const maskedSpreadsheetId = config.spreadsheetId
+    ? `${config.spreadsheetId.slice(0, 6)}…`
+    : "(not set)";
+  const maskedServiceAccount = config.googleServiceAccountEmail
+    ? config.googleServiceAccountEmail.replace(/^(.{6}).*(@.*)$/, "$1…$2")
+    : "(not set)";
+
+  console.log(
+    `Attendance bot started. ${BOT_VERSION} | ` +
+    `spreadsheet=${maskedSpreadsheetId} | ` +
+    `timezone=${config.timezone} | ` +
+    `account=${maskedServiceAccount} | ` +
+    `node=${process.version}`
+  );
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));

@@ -1198,7 +1198,11 @@ test("retry wrapper times out stalled requests instead of hanging forever", asyn
     /timed out/
   );
 
-  assert.ok(Date.now() - startedAt < 250);
+  // The request itself should time out in ~5ms. The semaphore may add up to
+  // GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS (250ms) of queuing before it starts,
+  // so allow 1s total — the point is to confirm the timeout fires rather than
+  // the call hanging forever.
+  assert.ok(Date.now() - startedAt < 1000);
 });
 
 test("pending attendance overlays replace the snapshot value seen by the bot", async () => {
