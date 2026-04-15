@@ -1,5 +1,8 @@
 const SINGAPORE_PUBLIC_HOLIDAY_COLLECTION_ID = "691";
 const PUBLIC_HOLIDAY_FETCH_TIMEOUT_MS = 10000;
+// Brief pause between fetching individual dataset pages to avoid 429s from
+// the data.gov.sg API when the collection contains multiple datasets.
+const PUBLIC_HOLIDAY_INTER_FETCH_DELAY_MS = 500;
 const publicHolidayCache = {
   years: new Map(),
   loadingPromise: null
@@ -55,7 +58,11 @@ export async function loadSingaporePublicHolidayCache() {
     );
     const datasetIds = metadata?.data?.collectionMetadata?.childDatasets ?? [];
 
-    for (const datasetId of datasetIds) {
+    for (const [index, datasetId] of datasetIds.entries()) {
+      if (index > 0) {
+        await new Promise((resolve) => setTimeout(resolve, PUBLIC_HOLIDAY_INTER_FETCH_DELAY_MS));
+      }
+
       try {
         const payload = await fetchJson(
           `https://data.gov.sg/api/action/datastore_search?resource_id=${datasetId}`

@@ -26,6 +26,10 @@ const GOOGLE_SHEETS_MIN_RETRY_DELAY_MS = 500;
 const GOOGLE_SHEETS_MAX_RETRY_DELAY_MS = 32000;
 const GOOGLE_SHEETS_REQUEST_TIMEOUT_MS = 15000;
 const GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS = 5000;
+// Minimum gap between consecutive Sheets API calls. Google throttles rapid
+// bursts from the same service-account token (not with 429s but with silent
+// hangs), so we pace the queue to avoid that during startup.
+const GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS = 250;
 const MONTHLY_PROTECTION_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
 const runtimeSheetContext = new WeakMap();
 const ensuredMonthlySheetProtectionIds = new Set();
@@ -39,8 +43,11 @@ let sheetsSemaphorePromise = Promise.resolve();
 
 function acquireSheetsSemaphore(fn) {
   const next = sheetsSemaphorePromise.then(() => fn());
-  // Allow the queue to drain even if fn() rejects.
-  sheetsSemaphorePromise = next.catch(() => {});
+  // Allow the queue to drain even if fn() rejects, then wait the inter-request
+  // delay so rapid bursts during startup don't trigger Google's token throttle.
+  sheetsSemaphorePromise = next
+    .catch(() => {})
+    .then(() => new Promise((resolve) => setTimeout(resolve, GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS)));
   return next;
 }
 
@@ -1557,7 +1564,7 @@ async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, servi
         }, { signal }),
       {
         maxAttempts: 2,
-        timeoutMs: 5000
+        timeoutMs: GOOGLE_SHEETS_REQUEST_TIMEOUT_MS
       }
     );
     ensuredMonthlySheetProtectionIds.add(sheetId);
