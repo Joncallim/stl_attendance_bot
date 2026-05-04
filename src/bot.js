@@ -62,7 +62,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.9";
+export const BOT_VERSION = "v0.9.10";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -1653,7 +1653,9 @@ function buildInvitationAdminDescription(pendingCount) {
     pendingCount === 1
       ? "1 person is currently not onboarded."
       : `${pendingCount} people are currently not onboarded.`,
-    "Select a person to generate and send a forwardable invitation message."
+    "Select a person to generate and send a forwardable invitation message.",
+    "",
+    "💡 To remove a pending person from the roster entirely, use ➖ Remove Appointment instead."
   ].join("\n");
 }
 
@@ -3295,20 +3297,26 @@ export function createAttendanceBot(config) {
   const sheets = createGoogleSheetsClient(config);
   const adminCache = createAdminCache();
   adminCache.syncManager = createSyncManager({
+    // Do NOT pass force:true — that triggers a forced spreadsheets.get (metadata) on every
+    // flush attempt, which takes 10–15 s from this VPS and consistently hits the 15 s timeout.
+    // The month-slice read inside reconcilePendingAttendanceWithSheets already uses force:true
+    // for the individual sheet values (cheap), so dropping it here only skips the expensive
+    // metadata re-fetch. The 15-minute metadata TTL keeps structural info fresh enough.
     flushQueue: async () =>
       withSheetOperation(async () =>
-        flushAttendanceQueue((entries) => reconcilePendingAttendanceWithSheets(sheets, config, entries, {
-          force: true
-        }))
+        flushAttendanceQueue((entries) => reconcilePendingAttendanceWithSheets(sheets, config, entries))
       ),
     // refreshOnboarding is intentionally a no-op in the hot-path cycle.
     // Onboarding data is read as part of refreshMonthSlices (via refreshMonthSlice →
     // refreshOnboardingSlice with TTL). Full structural roster sync runs once a day
     // via the midnight maintenance cron.
     refreshOnboarding: async () => false,
+    // Do NOT spread options.force into preloadSheetSnapshots. When the five-minute cycle
+    // passes force:true, propagating it would trigger a forced spreadsheets.get metadata
+    // call (10–15 s, borderline timeout) on every reconciliation. The onboarding TTL (2 min)
+    // and month-slice TTL (60 s) guarantee fresh data without an explicit force flag.
     refreshMonthSlices: async (options = {}) => withSheetOperation(async () => {
       await preloadSheetSnapshots(sheets, config, adminCache, {
-        ...options,
         structural: false,
         normalizeAliases: options.reason === "five-minute"
       });
@@ -4510,7 +4518,8 @@ export function createAttendanceBot(config) {
 
   bot.action(/manual:(.+)/, async (ctx) => {
     const sectionKey = ctx.match[1];
-    await ctx.answerCbQuery();
+    // Ignore "query is too old" — happens when a stale button is pressed and is harmless.
+    await ctx.answerCbQuery().catch(() => {});
     const isAdminUser = await isAdmin(ctx, config);
     await sendOrUpdateAdminMessage(
       ctx,
@@ -4521,7 +4530,8 @@ export function createAttendanceBot(config) {
 
   bot.action(/admin:(.+)/, async (ctx) => {
     const action = ctx.match[1];
-    await ctx.answerCbQuery();
+    // Ignore "query is too old" — happens when a stale button is pressed and is harmless.
+    await ctx.answerCbQuery().catch(() => {});
 
     if (!(await requireAdmin(ctx, config))) {
       return;
