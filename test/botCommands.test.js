@@ -137,7 +137,7 @@ test("invite command reports missing appointments", async () => {
 test("admin menu description includes the current pre-v1 version", () => {
   const description = __testing.buildAdminMenuDescription();
 
-  assert.match(description, /^Admin Menu \(v0\.9\.9\)/);
+  assert.match(description, /^Admin Menu \(v0\.9\.10\)/);
 });
 
 test("triggerBackgroundSheetRefresh starts a non-blocking refresh when idle", () => {
@@ -499,13 +499,17 @@ test("attendance options menu is sent with HTML parse mode", async () => {
 });
 
 test("invitation admin description includes non-onboarded count", () => {
+  const removeTip = "💡 To remove a pending person from the roster entirely, use ➖ Remove Appointment instead.";
+
   assert.equal(
     __testing.buildInvitationAdminDescription(1),
     [
       "Send Invitation",
       "",
       "1 person is currently not onboarded.",
-      "Select a person to generate and send a forwardable invitation message."
+      "Select a person to generate and send a forwardable invitation message.",
+      "",
+      removeTip
     ].join("\n")
   );
 
@@ -515,7 +519,9 @@ test("invitation admin description includes non-onboarded count", () => {
       "Send Invitation",
       "",
       "3 people are currently not onboarded.",
-      "Select a person to generate and send a forwardable invitation message."
+      "Select a person to generate and send a forwardable invitation message.",
+      "",
+      removeTip
     ].join("\n")
   );
 });

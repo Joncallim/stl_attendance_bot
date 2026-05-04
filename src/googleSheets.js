@@ -823,13 +823,15 @@ async function getSpreadsheet(sheets, spreadsheetId, options = {}) {
     return runtimeContext.spreadsheet;
   }
 
+  // spreadsheets.get consistently takes 10–15 s from this VPS. Use a longer per-call
+  // timeout than the default 15 s so borderline calls don't fail on every cycle.
   const response = await runGoogleSheetsRequest("spreadsheets.get", (signal) =>
     sheets.spreadsheets.get({
       spreadsheetId,
       includeGridData: false,
       fields: "spreadsheetId,sheets(properties,protectedRanges)"
     }, { signal })
-  );
+  , { timeoutMs: 20000 });
   const spreadsheet = response.data;
 
   if (runtimeContext) {
