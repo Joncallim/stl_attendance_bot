@@ -1754,7 +1754,9 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     preferredAppointments
   );
 
-  if ((liveSlice.unexpectedAppointments?.length ?? 0) > 0 || (liveSlice.duplicateAppointments?.length ?? 0) > 0) {
+  // Duplicate appointments are a hard block in any mode: the Map lookup in
+  // buildManagedMonthlyRows would silently drop one duplicate's attendance data.
+  if ((liveSlice.duplicateAppointments?.length ?? 0) > 0) {
     return {
       title,
       appointments: preferredAppointments,
@@ -1764,6 +1766,28 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
         duplicateAppointments: liveSlice.duplicateAppointments
       }
     };
+  }
+
+  // In "replace" mode (structural sync), unexpected appointments are not a blocker —
+  // the rebuild will drop them and write only the canonical ONBOARDING list.
+  // In "merge" mode, block as before: merging unexpected rows has undefined semantics.
+  if ((liveSlice.unexpectedAppointments?.length ?? 0) > 0 && mode !== "replace") {
+    return {
+      title,
+      appointments: preferredAppointments,
+      blockedByDrift: true,
+      driftReasons: {
+        unexpectedAppointments: liveSlice.unexpectedAppointments,
+        duplicateAppointments: liveSlice.duplicateAppointments
+      }
+    };
+  }
+
+  if ((liveSlice.unexpectedAppointments?.length ?? 0) > 0) {
+    console.warn(
+      `[${title}] Structural sync: removing ${liveSlice.unexpectedAppointments.length} unexpected row(s) ` +
+      `not in ONBOARDING: ${liveSlice.unexpectedAppointments.join(", ")}`
+    );
   }
 
   const { nextAppointments, nextRows } = buildManagedMonthlyRows({
