@@ -63,7 +63,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.11";
+export const BOT_VERSION = "v0.9.12";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -538,6 +538,9 @@ function buildAdminMenu() {
     [
       Markup.button.callback("🧩 Attendance Options", "admin:menu:options"),
       Markup.button.callback("🧾 Deregister Person", "admin:menu:deregister:0")
+    ],
+    [
+      Markup.button.callback("📤 Push Attendance", "admin:flushqueue")
     ],
     [
       Markup.button.callback("🔙 Back", "home:main")
@@ -1483,6 +1486,7 @@ function buildAdminMenuDescription() {
     "📣 Prompt All: Send the attendance prompt to all currently bound users.",
     "🧩 Attendance Options: View, add, remove, or reset the allowed attendance codes.",
     "🧾 Deregister Person: Remove another person’s Telegram binding and rotate their code.",
+    "📤 Push Attendance: Immediately flush all pending attendance entries to Google Sheets.",
     "🔙 Back: Return to the main home menu."
   ].join("\n");
 }
@@ -2817,6 +2821,22 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
     return;
   }
 
+  if (action === "flushqueue") {
+    // Fire-and-forget: flush can take tens of seconds; Telegraf 90 s limit would kill it.
+    handleFlushAttendanceAdminAction(ctx, config, {
+      getAttendanceQueueStatus,
+      flushAttendanceQueue,
+      reconcilePendingAttendanceWithSheets,
+      preloadSheetSnapshots,
+      sendOrUpdateAdminMessage,
+      sheets,
+      cache
+    }).catch((error) => {
+      console.error("Background attendance flush error:", error.message);
+    });
+    return;
+  }
+
   if (action === "promptall") {
     await ensureSheetReadiness(sheets, config, cache);
     const users = (await listUsers()).filter((user) => user.appointment);
@@ -3101,6 +3121,76 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
     throw error;
   } finally {
     rosterSyncInProgress = false;
+  }
+}
+
+async function handleFlushAttendanceAdminAction(ctx, config, deps) {
+  const status = await deps.getAttendanceQueueStatus();
+
+  if (status.queueDepth === 0) {
+    const conflictNote = status.conflictedCount > 0
+      ? `\n\n⚠️ ${status.conflictedCount} conflicted ${status.conflictedCount === 1 ? "entry" : "entries"} cannot be pushed until a Sync Roster is run to fix the sheet layout.`
+      : "";
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      `✅ No pending attendance entries to push.${conflictNote}`
+    );
+    return;
+  }
+
+  await deps.sendOrUpdateAdminMessage(
+    ctx,
+    `📤 Pushing ${status.queueDepth} pending attendance ${status.queueDepth === 1 ? "entry" : "entries"} to Google Sheets…`
+  );
+
+  let outcome = null;
+
+  try {
+    const result = await deps.flushAttendanceQueue(async (entries) => {
+      outcome = await deps.reconcilePendingAttendanceWithSheets(deps.sheets, config, entries);
+      return outcome;
+    });
+
+    const writtenCount = outcome?.writtenEventIds?.length ?? result.flushedEvents?.length ?? 0;
+    const conflictedCount = outcome?.conflictedEvents?.length ?? 0;
+    const skippedCount = outcome?.skippedEvents?.length ?? 0;
+
+    console.log(
+      `[Admin] Attendance push complete: ${writtenCount} written, ` +
+      `${skippedCount} skipped, ${conflictedCount} conflicted.`
+    );
+
+    // Refresh in-memory snapshot so summary view reflects the newly written data.
+    await deps.preloadSheetSnapshots(deps.sheets, config, deps.cache, {});
+
+    const parts = [];
+
+    if (writtenCount > 0) {
+      parts.push(`✅ ${writtenCount} ${writtenCount === 1 ? "entry" : "entries"} written to sheet.`);
+    }
+
+    if (skippedCount > 0) {
+      parts.push(`⏭ ${skippedCount} already up to date.`);
+    }
+
+    if (conflictedCount > 0) {
+      parts.push(
+        `⚠️ ${conflictedCount} conflicted — run 🔄 Sync Roster to fix the sheet layout, ` +
+        `then push again.`
+      );
+    }
+
+    if (parts.length === 0) {
+      parts.push("✅ Queue flushed — no new data to write.");
+    }
+
+    await deps.sendOrUpdateAdminMessage(ctx, parts.join("\n"));
+  } catch (error) {
+    console.error(`[Admin] Attendance push failed: ${error.message}`);
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      `❌ Push failed: ${error.message}\n\nThe queue will retry automatically in the background.`
+    );
   }
 }
 
@@ -4911,6 +5001,7 @@ export const __testing = {
   handleInviteCommand,
   handleOnboardCommand,
   handleOptionsResetAction,
+  handleFlushAttendanceAdminAction,
   handleSyncRosterAdminAction,
   triggerBackgroundSheetRefresh,
   renderInviteSubmenu,

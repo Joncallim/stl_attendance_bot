@@ -258,6 +258,11 @@ export async function flushAttendanceQueue(writeEntries) {
 
     const finalEvents = [...coalescedEntries.values()];
 
+    console.log(
+      `[Queue] Flushing ${pendingEvents.length} pending event(s) → ` +
+      `${finalEvents.length} coalesced (last-write-wins per appointment+date).`
+    );
+
     try {
       const outcome = await writeEntries(
         finalEvents.map((event) => ({
@@ -370,7 +375,16 @@ export async function flushAttendanceQueue(writeEntries) {
         }
       }
 
-      return { flushedEvents: finalEvents, pendingEvents: [] };
+      const writtenCount = outcome?.writtenEventIds?.length ?? finalEvents.length;
+      const skippedCount = outcome?.skippedEvents?.length ?? 0;
+      const conflictedCount = outcome?.conflictedEvents?.length ?? 0;
+      console.log(
+        `[Queue] Flush complete: ${writtenCount} written, ${skippedCount} skipped, ` +
+        `${conflictedCount} conflicted.` +
+        (conflictedCount > 0 ? " Run Sync Roster to fix layout mismatch." : "")
+      );
+
+      return { flushedEvents: finalEvents, pendingEvents: [], outcome };
     } catch (error) {
       const failedAt = new Date().toISOString();
       const maxRetryCount = Math.max(...pendingEvents.map((event) => Number(event.retryCount ?? 0)), 0);
@@ -378,6 +392,12 @@ export async function flushAttendanceQueue(writeEntries) {
       const nextRetryAt = new Date(
         Date.now() + Math.min(15 * 60 * 1000, 1000 * (2 ** Math.min(nextRetryCount, 5))) + Math.floor(Math.random() * 250)
       ).toISOString();
+      const retryDelayS = Math.round(
+        (new Date(nextRetryAt).getTime() - Date.now()) / 1000
+      );
+      console.error(
+        `[Queue] Flush failed (will retry in ~${retryDelayS}s): ${error.message}`
+      );
 
       for (const event of pendingEvents) {
         await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
