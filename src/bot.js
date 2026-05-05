@@ -28,7 +28,8 @@ import {
   enqueueAttendanceEvents,
   getAttendanceQueueStatus,
   listPendingAttendanceEvents,
-  flushAttendanceQueue
+  flushAttendanceQueue,
+  resetConflictedQueueEntries
 } from "./attendanceQueue.js";
 import { getSingaporePublicHolidaySet } from "./holidays.js";
 import {
@@ -62,7 +63,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.10";
+export const BOT_VERSION = "v0.9.11";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -2806,6 +2807,7 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       ensureNextMonthSheetExists,
       refreshAdminCache,
       preloadSheetSnapshots,
+      resetConflictedQueueEntries,
       sendOrUpdateAdminMessage,
       sheets,
       cache
@@ -3069,11 +3071,26 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
     const roster = await deps.syncRosterState(deps.sheets, config);
     await deps.ensureNextMonthSheetExists(deps.sheets, config);
     await deps.refreshAdminCache(deps.cache, config);
-    await deps.preloadSheetSnapshots(deps.sheets, config, deps.cache, { force: true });
+
+    // structural:true re-applies weekend/holiday greying and fixes any layout mismatches
+    // (unexpected appointment rows) that would block attendance writes.
+    await deps.preloadSheetSnapshots(deps.sheets, config, deps.cache, {
+      force: true,
+      structural: true,
+      normalizeAliases: true
+    });
+
+    // After the layout fix, reset any attendance entries that were stuck in "conflicted"
+    // state due to a layout mismatch. They will be retried on the next flush cycle.
+    const resetResult = await deps.resetConflictedQueueEntries();
+
+    if (resetResult.resetCount > 0) {
+      console.log(`Roster sync: reset ${resetResult.resetCount} conflicted attendance queue entries for retry.`);
+    }
 
     await deps.sendOrUpdateAdminMessage(
       ctx,
-      `Roster synced from ${config.onboardingSheetTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.`
+      `Roster synced from ${config.onboardingSheetTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.${resetResult.resetCount > 0 ? ` (${resetResult.resetCount} previously stuck attendance ${resetResult.resetCount === 1 ? "entry" : "entries"} re-queued for retry.)` : ""}`
     );
   } catch (error) {
     console.error("Roster sync failed:", error.message);

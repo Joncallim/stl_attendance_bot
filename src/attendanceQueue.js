@@ -82,6 +82,17 @@ function createQueueState(records) {
         current.nextRetryAt = null;
       }
     }
+
+    if (record.kind === "attendance_conflict_reset") {
+      const current = events.get(record.eventId);
+
+      if (current && current.queueStatus === "conflicted") {
+        current.queueStatus = "pending";
+        current.conflictReason = null;
+        current.lastError = null;
+        current.nextRetryAt = null;
+      }
+    }
   }
 
   return {
@@ -416,6 +427,40 @@ export async function getAttendanceQueueStatus() {
     conflictedCount: conflicted.length,
     nextRetryAt
   };
+}
+
+/**
+ * Resets all conflicted queue entries back to pending so they will be retried
+ * on the next flush cycle. Should be called after a structural sheet sync that
+ * fixes the layout mismatch that caused the conflicts.
+ */
+export async function resetConflictedQueueEntries() {
+  return runSerialized(QUEUE_MUTEX_KEY, async () => {
+    const state = await loadAttendanceQueueState();
+    const conflicted = [...state.events.values()].filter(
+      (event) => event.queueStatus === "conflicted"
+    );
+
+    if (conflicted.length === 0) {
+      return { resetCount: 0 };
+    }
+
+    const resetAt = new Date().toISOString();
+
+    for (const event of conflicted) {
+      await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
+        kind: "attendance_conflict_reset",
+        eventId: event.id,
+        resetAt
+      });
+      event.queueStatus = "pending";
+      event.conflictReason = null;
+      event.lastError = null;
+      event.nextRetryAt = null;
+    }
+
+    return { resetCount: conflicted.length };
+  });
 }
 
 // Rewrites the queue file keeping only unresolved events (pending / failed_retryable).
