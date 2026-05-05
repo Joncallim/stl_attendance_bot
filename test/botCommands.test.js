@@ -137,7 +137,7 @@ test("invite command reports missing appointments", async () => {
 test("admin menu description includes the current pre-v1 version", () => {
   const description = __testing.buildAdminMenuDescription();
 
-  assert.match(description, /^Admin Menu \(v0\.9\.11\)/);
+  assert.match(description, /^Admin Menu \(v0\.9\.12\)/);
 });
 
 test("triggerBackgroundSheetRefresh starts a non-blocking refresh when idle", () => {
