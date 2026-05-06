@@ -63,7 +63,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.14";
+export const BOT_VERSION = "v0.9.15";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -3092,11 +3092,12 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
     await deps.ensureNextMonthSheetExists(deps.sheets, config);
     await deps.refreshAdminCache(deps.cache, config);
 
-    // structural:true re-applies weekend/holiday greying and fixes any layout mismatches
-    // (unexpected appointment rows) that would block attendance writes.
+    // Reload snapshots from the sheets that syncRosterState already repaired.
+    // structural:false because ensureMonthlyAttendanceSheet was already run by
+    // syncOnboardingRoster above — no need to pay for layout/formatting writes twice.
     await deps.preloadSheetSnapshots(deps.sheets, config, deps.cache, {
       force: true,
-      structural: true,
+      structural: false,
       normalizeAliases: true
     });
 

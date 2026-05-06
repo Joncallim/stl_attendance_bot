@@ -137,7 +137,7 @@ test("invite command reports missing appointments", async () => {
 test("admin menu description includes the current pre-v1 version", () => {
   const description = __testing.buildAdminMenuDescription();
 
-  assert.match(description, /^Admin Menu \(v0\.9\.14\)/);
+  assert.match(description, /^Admin Menu \(v0\.9\.15\)/);
 });
 
 test("triggerBackgroundSheetRefresh starts a non-blocking refresh when idle", () => {
@@ -186,7 +186,7 @@ test("syncroster admin action refreshes sheets and reports current and next mont
       ensureNextMonthSheetExists: async () => calls.push("ensureNextMonthSheetExists"),
       refreshAdminCache: async () => calls.push("refreshAdminCache"),
       preloadSheetSnapshots: async (_sheets, _config, _cache, options) => {
-        calls.push(`preloadSheetSnapshots:force=${options.force},structural=${options.structural}`);
+        calls.push(`preloadSheetSnapshots:force=${options.force},structural=${options.structural},normalizeAliases=${options.normalizeAliases}`);
       },
       resetConflictedQueueEntries: async () => {
         calls.push("resetConflictedQueueEntries");
@@ -204,7 +204,7 @@ test("syncroster admin action refreshes sheets and reports current and next mont
     "syncRosterState",
     "ensureNextMonthSheetExists",
     "refreshAdminCache",
-    "preloadSheetSnapshots:force=true,structural=true",
+    "preloadSheetSnapshots:force=true,structural=false,normalizeAliases=true",
     "resetConflictedQueueEntries"
   ]);
   assert.equal(
