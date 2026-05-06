@@ -137,7 +137,7 @@ test("invite command reports missing appointments", async () => {
 test("admin menu description includes the current pre-v1 version", () => {
   const description = __testing.buildAdminMenuDescription();
 
-  assert.match(description, /^Admin Menu \(v0\.9\.18\)/);
+  assert.match(description, /^Admin Menu \(v0\.9\.19\)/);
 });
 
 test("triggerBackgroundSheetRefresh starts a non-blocking refresh when idle", () => {
@@ -181,7 +181,7 @@ test("syncroster admin action refreshes sheets and reports current and next mont
     {
       syncRosterState: async () => {
         calls.push("syncRosterState");
-        return { currentMonthTitle: "Mar 26", nextMonthTitle: "Apr 26" };
+        return { prevMonthTitle: "Feb 26", currentMonthTitle: "Mar 26", nextMonthTitle: "Apr 26" };
       },
       ensureNextMonthSheetExists: async () => calls.push("ensureNextMonthSheetExists"),
       refreshAdminCache: async () => calls.push("refreshAdminCache"),
@@ -213,7 +213,7 @@ test("syncroster admin action refreshes sheets and reports current and next mont
   );
   assert.equal(
     messages[1],
-    "Roster synced from ONBOARDING. Current month: Mar 26. Next month: Apr 26."
+    "Roster synced from ONBOARDING. Last month: Feb 26. Current month: Mar 26. Next month: Apr 26."
   );
 });
 
@@ -301,7 +301,7 @@ test("syncroster admin action rejects concurrent sync attempts", async () => {
   );
 
   // Resolve the first sync and let it finish
-  resolveFirst({ currentMonthTitle: "Mar 26", nextMonthTitle: "Apr 26" });
+  resolveFirst({ prevMonthTitle: "Feb 26", currentMonthTitle: "Mar 26", nextMonthTitle: "Apr 26" });
   await firstSync;
 
   assert.equal(
@@ -314,7 +314,7 @@ test("syncroster admin action rejects concurrent sync attempts", async () => {
   );
   assert.equal(
     messages[2],
-    "Roster synced from ONBOARDING. Current month: Mar 26. Next month: Apr 26."
+    "Roster synced from ONBOARDING. Last month: Feb 26. Current month: Mar 26. Next month: Apr 26."
   );
 });
 

@@ -64,7 +64,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.18";
+export const BOT_VERSION = "v0.9.19";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -3112,7 +3112,7 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
 
     await deps.sendOrUpdateAdminMessage(
       ctx,
-      `Roster synced from ${config.onboardingSheetTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.${resetResult.resetCount > 0 ? ` (${resetResult.resetCount} previously stuck attendance ${resetResult.resetCount === 1 ? "entry" : "entries"} re-queued for retry.)` : ""}`
+      `Roster synced from ${config.onboardingSheetTitle}. Last month: ${roster.prevMonthTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.${resetResult.resetCount > 0 ? ` (${resetResult.resetCount} previously stuck attendance ${resetResult.resetCount === 1 ? "entry" : "entries"} re-queued for retry.)` : ""}`
     );
   } catch (error) {
     console.error("Roster sync failed:", error.message);

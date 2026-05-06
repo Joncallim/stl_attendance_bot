@@ -691,10 +691,13 @@ test("existing monthly sheets get protections for the header row and appointment
       .flat()
       .filter((request) => request.addProtectedRange);
 
-    assert.equal(protectionRequests.length, 4);
+    // syncOnboardingRoster now covers prev + current + next month (3 sheets × 2 ranges each = 6)
+    assert.equal(protectionRequests.length, 6);
     assert.deepEqual(
       protectionRequests.map((request) => request.addProtectedRange.protectedRange.description),
       [
+        "attendance-bot:protect-header-row",
+        "attendance-bot:protect-appointment-column",
         "attendance-bot:protect-header-row",
         "attendance-bot:protect-appointment-column",
         "attendance-bot:protect-header-row",
@@ -703,7 +706,11 @@ test("existing monthly sheets get protections for the header row and appointment
     );
     assert.deepEqual(
       protectionRequests.map((request) => request.addProtectedRange.protectedRange.editors?.users ?? []),
-      [["bot@example.com"], ["bot@example.com"], ["bot@example.com"], ["bot@example.com"]]
+      [
+        ["bot@example.com"], ["bot@example.com"],
+        ["bot@example.com"], ["bot@example.com"],
+        ["bot@example.com"], ["bot@example.com"]
+      ]
     );
   });
 });
@@ -861,6 +868,10 @@ test("syncOnboardingRoster bootstraps a blank spreadsheet with onboarding and tw
   await withMockedFetch([], async () => {
     await withTempDataDir(async () => {
       const fake = createInMemorySheets();
+      const prevMonthTitle = __testing.getMonthParts(
+        __testing.shiftMonth(new Date(), "Asia/Singapore", -1),
+        "Asia/Singapore"
+      ).title;
       const currentMonthTitle = __testing.getMonthParts(new Date(), "Asia/Singapore").title;
       const nextMonthTitle = __testing.getMonthParts(
         __testing.shiftMonth(new Date(), "Asia/Singapore", 1),
@@ -876,6 +887,7 @@ test("syncOnboardingRoster bootstraps a blank spreadsheet with onboarding and tw
       });
 
       assert.deepEqual(result.onboardingAppointments, ["USER1", "USER2", "USER3"]);
+      assert.equal(result.prevMonthTitle, prevMonthTitle);
       assert.equal(result.currentMonthTitle, currentMonthTitle);
       assert.equal(result.nextMonthTitle, nextMonthTitle);
       assert.deepEqual(
@@ -887,6 +899,7 @@ test("syncOnboardingRoster bootstraps a blank spreadsheet with onboarding and tw
           ["USER3", ""]
         ]
       );
+      assert.equal(fake.getSheetValues(prevMonthTitle)[1][0], "USER1");
       assert.equal(fake.getSheetValues(currentMonthTitle)[0][0], "Appointment");
       assert.equal(fake.getSheetValues(currentMonthTitle)[1][0], "USER1");
       assert.equal(fake.getSheetValues(nextMonthTitle)[1][0], "USER1");
