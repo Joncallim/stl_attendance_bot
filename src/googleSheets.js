@@ -11,7 +11,7 @@ const SHEET_CACHE_FILE = () => getDataFile("sheet-cache.json");
 const SPREADSHEET_METADATA_TTL_MS = 15 * 60 * 1000;
 const ONBOARDING_SLICE_TTL_MS = 2 * 60 * 1000;
 const MONTH_SLICE_TTL_MS = 60 * 1000;
-const DEFAULT_MAX_MANAGED_ROWS = 1000;
+const DEFAULT_MAX_MANAGED_ROWS = 200;
 // Extra rows beyond the known appointment count: stop-marker row + blank-row drift tolerance.
 const MANAGED_ROW_BUFFER = 5;
 // Monthly sheets have at most 1 appointment col + 31 day cols = 32 cols; cap at 33 for safety.
@@ -25,9 +25,6 @@ const GOOGLE_SHEETS_INITIAL_RETRY_DELAY_MS = 1000;
 const GOOGLE_SHEETS_MIN_RETRY_DELAY_MS = 500;
 const GOOGLE_SHEETS_MAX_RETRY_DELAY_MS = 32000;
 const GOOGLE_SHEETS_REQUEST_TIMEOUT_MS = 15000;
-// Structural writes (row inserts/deletes, layout formatting) are larger payloads
-// that regularly exceed 15 s on the VPS→Google link under load.
-const GOOGLE_SHEETS_WRITE_TIMEOUT_MS = 30000;
 const GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS = 5000;
 // Minimum gap between consecutive Sheets API calls. Google throttles rapid
 // bursts from the same service-account token (not with 429s but with silent
@@ -1233,8 +1230,7 @@ async function writeMonthlySheetRows(
         requestBody: {
           requests
         }
-      }, { signal }),
-      { timeoutMs: GOOGLE_SHEETS_WRITE_TIMEOUT_MS, maxAttempts: 3 }
+      }, { signal })
     );
   }
 
@@ -1397,14 +1393,14 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
   await verifyBatchWrite(sheets, spreadsheetId, data);
 }
 
-function buildAttendanceValidationRequest(sheetId, headerLength, options) {
+function buildAttendanceValidationRequest(sheetId, headerLength, options, rowLimit = DEFAULT_MAX_MANAGED_ROWS) {
   return {
     setDataValidation: {
       range: {
         sheetId,
         startRowIndex: 1,
         startColumnIndex: 1,
-        endRowIndex: DEFAULT_MAX_MANAGED_ROWS,
+        endRowIndex: rowLimit,
         endColumnIndex: headerLength
       },
       rule: {
@@ -1419,7 +1415,7 @@ function buildAttendanceValidationRequest(sheetId, headerLength, options) {
   };
 }
 
-async function buildDisabledDayFormattingRequests(sheetId, date, timezone) {
+async function buildDisabledDayFormattingRequests(sheetId, date, timezone, rowLimit = DEFAULT_MAX_MANAGED_ROWS) {
   const requests = [];
   const holidaySet = await getSingaporePublicHolidaySet(
     Number(
@@ -1452,7 +1448,7 @@ async function buildDisabledDayFormattingRequests(sheetId, date, timezone) {
         range: {
           sheetId,
           startRowIndex: 0,
-          endRowIndex: DEFAULT_MAX_MANAGED_ROWS,
+          endRowIndex: rowLimit,
           startColumnIndex: day,
           endColumnIndex: day + 1
         },
@@ -1469,11 +1465,12 @@ async function buildDisabledDayFormattingRequests(sheetId, date, timezone) {
   return requests;
 }
 
-async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, header, options, timezone) {
+async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, header, options, timezone, rowCount = 0) {
+  const rowLimit = managedRowLimit(rowCount);
   const requests = [
     buildHeaderUpdateRequest(sheetId, header),
-    buildAttendanceValidationRequest(sheetId, header.length, options),
-    ...(await buildDisabledDayFormattingRequests(sheetId, date, timezone))
+    buildAttendanceValidationRequest(sheetId, header.length, options, rowLimit),
+    ...(await buildDisabledDayFormattingRequests(sheetId, date, timezone, rowLimit))
   ];
 
   await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${sheetId}:layout`, (signal) =>
@@ -1482,8 +1479,7 @@ async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, hea
       requestBody: {
         requests
       }
-    }, { signal }),
-    { timeoutMs: GOOGLE_SHEETS_WRITE_TIMEOUT_MS }
+    }, { signal })
   );
 }
 
@@ -1571,7 +1567,7 @@ async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, servi
         }, { signal }),
       {
         maxAttempts: 1,
-        timeoutMs: GOOGLE_SHEETS_WRITE_TIMEOUT_MS
+        timeoutMs: GOOGLE_SHEETS_REQUEST_TIMEOUT_MS
       }
     );
     ensuredMonthlySheetProtectionIds.add(sheetId);
@@ -1717,7 +1713,8 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
       date,
       defaultHeader,
       config.attendanceOptions,
-      config.timezone
+      config.timezone,
+      appointments.length
     );
     monthlySheetValues = [defaultHeader];
   } else {
@@ -2726,9 +2723,12 @@ async function refreshMonthSlice(sheets, config, input, options = {}) {
     throw new Error(`Unable to resolve month slice for ${title}`);
   }
 
+  // The caller (preloadAttendanceSnapshots) always refreshes onboarding into the cache
+  // before calling refreshMonthSlice for each month. Passing force:true here would
+  // re-read ONBOARDING from the API on every month iteration — wasteful.
   const onboardingSlice = await refreshOnboardingSlice(sheets, config, {
     cache,
-    force: options.force === true,
+    force: false,
     persist: false
   });
   // Structural ops (sheet creation, row sync, layout, protections) are expensive.
