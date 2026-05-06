@@ -1083,30 +1083,6 @@ async function readHeaderRow(sheets, spreadsheetId, title, fallbackHeader = []) 
   return hasHeader ? headerRow : fallbackHeader;
 }
 
-async function getStopAwareWriteBoundary(
-  sheets,
-  spreadsheetId,
-  title,
-  stopMarkers = [],
-  maxRow = 1000
-) {
-  const response = await runGoogleSheetsRequest(
-    `spreadsheets.values.get:${title}:A2:A${maxRow}`,
-    (signal) => sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `'${title}'!A2:A${maxRow}`
-    }, { signal })
-  );
-  const rawValues = (response.data.values ?? []).map(([value]) => normalizeAppointmentLabel(value));
-  const stopIndex = rawValues.findIndex((value) => isStopMarker(value, stopMarkers));
-  const stopRowNumber = stopIndex === -1 ? null : stopIndex + 2;
-
-  return {
-    stopRowNumber,
-    managedRangeEndRow: stopRowNumber ? stopRowNumber - 1 : maxRow
-  };
-}
-
 async function writeAppointmentColumn(
   sheets,
   spreadsheetId,
@@ -1118,7 +1094,8 @@ async function writeAppointmentColumn(
   const parsed = parseOnboardingManagedRows(values, options.stopMarkers ?? []);
   const existingCodes = new Map(parsed.managedRows.map((row) => [row.appointment, row.secretCode]));
   const rows = appointments.map((appointment) => [appointment, existingCodes.get(appointment) ?? ""]);
-  await writeOnboardingRows(sheets, spreadsheetId, title, rows, options.stopMarkers ?? [], options);
+  // Pass the values we already read so writeOnboardingRows skips its own read of the same range.
+  await writeOnboardingRows(sheets, spreadsheetId, title, rows, options.stopMarkers ?? [], { ...options, preloadedValues: values });
 }
 
 async function readMonthlySheetRows(
@@ -1314,7 +1291,9 @@ function buildHeaderUpdateRequest(sheetId, header) {
 
 async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarkers = [], options = {}) {
   const sheet = await getSheetByTitle(sheets, spreadsheetId, title, options);
-  const values = await readSheetValues(sheets, spreadsheetId, title, `A1:B${managedRowLimit(rows.length)}`);
+  // Accept pre-read values from the caller (e.g. writeAppointmentColumn) to avoid a duplicate read.
+  const values = options.preloadedValues ??
+    await readSheetValues(sheets, spreadsheetId, title, `A1:B${managedRowLimit(rows.length)}`);
   const parsed = parseOnboardingManagedRows(values, stopMarkers);
   const currentCount = parsed.appointments.length;
   const nextCount = rows.length;
@@ -1725,6 +1704,22 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
       await writeHeaderRow(sheets, config.spreadsheetId, title, defaultHeader);
       monthlySheetValues = [defaultHeader, ...monthlySheetValues.slice(1)];
     }
+
+    // Structural sync ("replace" mode): re-apply layout so that data validation dropdowns
+    // and weekend/holiday greying are always up-to-date on existing sheets, not just new ones.
+    if (mode === "replace") {
+      const layoutHeader = getHeaderRowFromValues(monthlySheetValues, defaultHeader);
+      await applyMonthlySheetLayout(
+        sheets,
+        config.spreadsheetId,
+        sheet.properties.sheetId,
+        date,
+        layoutHeader,
+        config.attendanceOptions,
+        config.timezone,
+        appointments.length
+      );
+    }
   }
   await ensureMonthlySheetProtections(
     sheets,
@@ -1825,18 +1820,6 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     title,
     appointments: nextAppointments
   };
-}
-
-async function readSheetColumnValues(sheets, spreadsheetId, title, columnLabel) {
-  const response = await runGoogleSheetsRequest(
-    `spreadsheets.values.get:${title}:${columnLabel}`,
-    (signal) => sheets.spreadsheets.values.get({
-      spreadsheetId,
-      range: `'${title}'!${columnLabel}2:${columnLabel}${DEFAULT_MAX_MANAGED_ROWS}`
-    }, { signal })
-  );
-
-  return (response.data.values ?? []).map(([value]) => String(value ?? "").trim());
 }
 
 function countStatuses(values, statuses) {
@@ -2574,12 +2557,6 @@ export function buildQueuedAttendanceEventMetadata(snapshotBundle, config, entry
 async function restoreMonthlySheetFromSnapshot(sheets, config, date, snapshot) {
   const cache = await readLocalSheetCache();
   const { title } = getMonthParts(date, config.timezone);
-  const header = await readHeaderRow(
-    sheets,
-    config.spreadsheetId,
-    title,
-    getDefaultHeaderRow(date, config.timezone)
-  );
   const canonicalAppointments = await readCanonicalOnboardingAppointments(sheets, config, {
     cache,
     persist: false
@@ -2593,13 +2570,19 @@ async function restoreMonthlySheetFromSnapshot(sheets, config, date, snapshot) {
 
   await ensureMonthlyAttendanceSheet(sheets, config, date, canonicalAppointments, "replace", { cache });
   const restoredSheet = await getSheetByTitle(sheets, config.spreadsheetId, title, { cache });
-  const existingRows = await readMonthlySheetRows(
-    sheets,
-    config.spreadsheetId,
-    title,
-    header.length,
-    config.rosterStopMarkers
+
+  // Single read covers both header and existing row data — avoids a separate readHeaderRow call.
+  const defaultHeader = getDefaultHeaderRow(date, config.timezone);
+  const rowLimit = managedRowLimit(canonicalAppointments.length);
+  const fullValues = await readSheetValues(
+    sheets, config.spreadsheetId, title,
+    `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${rowLimit}`
   );
+  const header = getHeaderRowFromValues(fullValues, defaultHeader);
+  const existingRows = buildLiveManagedMonthlyRows(
+    fullValues, header.length, config.rosterStopMarkers, canonicalAppointments
+  ).map((entry) => entry.row);
+
   await writeMonthlySheetRows(
     sheets,
     config.spreadsheetId,
@@ -2806,14 +2789,17 @@ async function verifyBatchWrite(sheets, spreadsheetId, writes, options = {}) {
   const logFn = options.logFn ?? console.warn;
   const discrepancies = [];
 
-  for (const write of writes) {
-    const response = await runGoogleSheetsRequest(
-      `spreadsheets.values.get:verify:${write.range}`,
-      (signal) => sheets.spreadsheets.values.get({ spreadsheetId, range: write.range }, { signal })
-    );
+  // Fetch all written ranges in a single batchGet instead of N individual reads.
+  const ranges = writes.map((w) => w.range);
+  const batchResponse = await runGoogleSheetsRequest(
+    `spreadsheets.values.batchGet:verify:${ranges.length}range(s)`,
+    (signal) => sheets.spreadsheets.values.batchGet({ spreadsheetId, ranges }, { signal })
+  );
+  const valueRanges = batchResponse.data.valueRanges ?? [];
 
-    const actual = response.data.values ?? [];
-    const expected = write.values ?? [];
+  for (let i = 0; i < writes.length; i++) {
+    const actual = valueRanges[i]?.values ?? [];
+    const expected = writes[i].values ?? [];
 
     for (let r = 0; r < expected.length; r++) {
       for (let c = 0; c < (expected[r] ?? []).length; c++) {
@@ -2821,7 +2807,7 @@ async function verifyBatchWrite(sheets, spreadsheetId, writes, options = {}) {
         const act = String((actual[r] ?? [])[c] ?? "").trim();
 
         if (exp !== act) {
-          discrepancies.push({ range: write.range, cell: `[${r}][${c}]`, expected: exp, actual: act });
+          discrepancies.push({ range: writes[i].range, cell: `[${r}][${c}]`, expected: exp, actual: act });
         }
       }
     }
@@ -3338,7 +3324,9 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
     entries.map((entry) => entry.targetSheetTitle ?? getMonthParts(entry.date, config.timezone).title)
   )];
 
-  await updateSpreadsheetMetadataCache(sheets, config, localCache, options.force === true);
+  // Metadata (sheet IDs) doesn't change between reconcile cycles; always use cache to avoid
+  // a slow spreadsheets.get on every 5-minute flush.
+  await updateSpreadsheetMetadataCache(sheets, config, localCache, false);
   // Use cached onboarding data; forced refreshes are handled by the sync cycle separately.
   await refreshOnboardingSlice(sheets, config, {
     cache: localCache,
