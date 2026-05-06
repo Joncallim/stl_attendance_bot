@@ -1712,9 +1712,11 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
       monthlySheetValues = [defaultHeader, ...monthlySheetValues.slice(1)];
     }
 
-    // Structural sync ("replace" mode): re-apply layout so that data validation dropdowns
-    // and weekend/holiday greying are always up-to-date on existing sheets, not just new ones.
-    if (mode === "replace") {
+    // Structural sync ("replace" mode) or explicit applyLayout flag: re-apply layout so that
+    // data validation dropdowns and weekend/holiday greying are always up-to-date on existing
+    // sheets, not just new ones. applyLayout is used for the previous month (merge mode)
+    // where we want formatting without touching row structure.
+    if (mode === "replace" || options.applyLayout === true) {
       const layoutHeader = getHeaderRowFromValues(monthlySheetValues, defaultHeader);
       await applyMonthlySheetLayout(
         sheets,
@@ -2432,9 +2434,10 @@ function getDateFromMonthTitle(title) {
 
 function isManagedMonthlyDate(date, timezone, baseDate = new Date()) {
   const targetTitle = getMonthParts(date, timezone).title;
+  const prevTitle = getMonthParts(shiftMonth(baseDate, timezone, -1), timezone).title;
   const currentTitle = getMonthParts(baseDate, timezone).title;
   const nextTitle = getMonthParts(shiftMonth(baseDate, timezone, 1), timezone).title;
-  return targetTitle === currentTitle || targetTitle === nextTitle;
+  return targetTitle === prevTitle || targetTitle === currentTitle || targetTitle === nextTitle;
 }
 
 function countFilledAttendanceCells(snapshot) {
@@ -3010,6 +3013,7 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
   if (driftDetected) {
     return {
       onboardingAppointments,
+      prevMonthTitle: getMonthParts(shiftMonth(new Date(), config.timezone, -1), config.timezone).title,
       currentMonthTitle: getMonthParts(new Date(), config.timezone).title,
       nextMonthTitle: getMonthParts(
         shiftMonth(new Date(), config.timezone, 1),
@@ -3019,6 +3023,16 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
     };
   }
 
+  // Previous month: merge mode (preserves historical rows for ex-members) + applyLayout
+  // so that formatting and data validation are refreshed without row restructuring.
+  const prevMonth = await ensureMonthlyAttendanceSheet(
+    sheets,
+    config,
+    shiftMonth(new Date(), config.timezone, -1),
+    onboardingAppointments,
+    "merge",
+    { cache, applyLayout: true }
+  );
   const currentMonth = await ensureMonthlyAttendanceSheet(
     sheets,
     config,
@@ -3043,12 +3057,14 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
 
   logSheetsSuccess("Onboarding roster synchronized to active monthly sheets.", {
     onboardingCount: onboardingAppointments.length,
+    prevMonthTitle: prevMonth.title,
     currentMonthTitle: currentMonth.title,
     nextMonthTitle: nextMonth.title
   });
 
   return {
     onboardingAppointments,
+    prevMonthTitle: prevMonth.title,
     currentMonthTitle: currentMonth.title,
     nextMonthTitle: nextMonth.title
   };
@@ -3501,6 +3517,7 @@ export async function ensureNextMonthSheetExists(sheets, config) {
 export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
   const baseDate = options.date ?? new Date();
   const targetDates = options.targetDates ?? [
+    shiftMonth(baseDate, config.timezone, -1),
     baseDate,
     shiftMonth(baseDate, config.timezone, 1)
   ];
