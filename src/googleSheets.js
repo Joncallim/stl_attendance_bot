@@ -25,6 +25,9 @@ const GOOGLE_SHEETS_INITIAL_RETRY_DELAY_MS = 1000;
 const GOOGLE_SHEETS_MIN_RETRY_DELAY_MS = 500;
 const GOOGLE_SHEETS_MAX_RETRY_DELAY_MS = 32000;
 const GOOGLE_SHEETS_REQUEST_TIMEOUT_MS = 15000;
+// Structural writes (row inserts/deletes, layout formatting) are larger payloads
+// that regularly exceed 15 s on the VPS→Google link under load.
+const GOOGLE_SHEETS_WRITE_TIMEOUT_MS = 30000;
 const GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS = 5000;
 // Minimum gap between consecutive Sheets API calls. Google throttles rapid
 // bursts from the same service-account token (not with 429s but with silent
@@ -1230,7 +1233,8 @@ async function writeMonthlySheetRows(
         requestBody: {
           requests
         }
-      }, { signal })
+      }, { signal }),
+      { timeoutMs: GOOGLE_SHEETS_WRITE_TIMEOUT_MS, maxAttempts: 3 }
     );
   }
 
@@ -1478,7 +1482,8 @@ async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, hea
       requestBody: {
         requests
       }
-    }, { signal })
+    }, { signal }),
+    { timeoutMs: GOOGLE_SHEETS_WRITE_TIMEOUT_MS }
   );
 }
 
@@ -1566,7 +1571,7 @@ async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, servi
         }, { signal }),
       {
         maxAttempts: 1,
-        timeoutMs: GOOGLE_SHEETS_REQUEST_TIMEOUT_MS
+        timeoutMs: GOOGLE_SHEETS_WRITE_TIMEOUT_MS
       }
     );
     ensuredMonthlySheetProtectionIds.add(sheetId);
