@@ -25,6 +25,9 @@ const GOOGLE_SHEETS_INITIAL_RETRY_DELAY_MS = 1000;
 const GOOGLE_SHEETS_MIN_RETRY_DELAY_MS = 500;
 const GOOGLE_SHEETS_MAX_RETRY_DELAY_MS = 32000;
 const GOOGLE_SHEETS_REQUEST_TIMEOUT_MS = 15000;
+// Row insertions/deletions (batchUpdate:rows) are processed server-side by Google and can
+// take >15 s under load regardless of payload size. Targeted increase for this operation only.
+const GOOGLE_SHEETS_ROW_STRUCTURE_TIMEOUT_MS = 30000;
 const GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS = 5000;
 // Minimum gap between consecutive Sheets API calls. Google throttles rapid
 // bursts from the same service-account token (not with 429s but with silent
@@ -1207,7 +1210,8 @@ async function writeMonthlySheetRows(
         requestBody: {
           requests
         }
-      }, { signal })
+      }, { signal }),
+      { timeoutMs: GOOGLE_SHEETS_ROW_STRUCTURE_TIMEOUT_MS }
     );
   }
 
@@ -1330,7 +1334,8 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
               }
           ]
         }
-      }, { signal })
+      }, { signal }),
+      { timeoutMs: GOOGLE_SHEETS_ROW_STRUCTURE_TIMEOUT_MS }
     );
   }
 
