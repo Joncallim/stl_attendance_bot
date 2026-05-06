@@ -1211,7 +1211,9 @@ async function writeMonthlySheetRows(
           requests
         }
       }, { signal }),
-      { timeoutMs: GOOGLE_SHEETS_ROW_STRUCTURE_TIMEOUT_MS }
+      // maxAttempts:2 — if the API is completely unresponsive, fail in ~62s rather than
+      // burning 5×30s=150s. The midnight cron or next Sync Roster will retry.
+      { timeoutMs: GOOGLE_SHEETS_ROW_STRUCTURE_TIMEOUT_MS, maxAttempts: 2 }
     );
   }
 
@@ -3546,6 +3548,11 @@ export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
 export async function runDailySheetMaintenance(sheets, config) {
   const cache = await readLocalSheetCache();
 
+  // Stamp the attempt time immediately so that if this run fails and the process
+  // restarts, deferred startup maintenance won't re-fire during the same window.
+  cache.lastStructuralMaintenanceAttemptAt = new Date().toISOString();
+  await writeLocalSheetCache(cache);
+
   // Full onboarding + monthly sheet structural sync (row inserts, formatting, protections).
   await syncOnboardingRoster(sheets, config, { cache });
 
@@ -3571,6 +3578,11 @@ export async function runDailySheetMaintenance(sheets, config) {
 export async function getLastStructuralMaintenanceAt() {
   const cache = await readLocalSheetCache();
   return cache.lastStructuralMaintenanceAt ?? null;
+}
+
+export async function getLastStructuralMaintenanceAttemptAt() {
+  const cache = await readLocalSheetCache();
+  return cache.lastStructuralMaintenanceAttemptAt ?? null;
 }
 
 export function summarizeStatusesFromSnapshot(snapshotBundle, config, options = {}) {

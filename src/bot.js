@@ -10,6 +10,7 @@ import {
   DEPARTMENT_BUCKETS,
   ensureNextMonthSheetExists,
   getLastStructuralMaintenanceAt,
+  getLastStructuralMaintenanceAttemptAt,
   loadAttendanceSnapshotsFromLocalCache,
   preloadAttendanceSnapshots,
   reconcilePendingAttendanceWithSheets,
@@ -63,7 +64,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.17";
+export const BOT_VERSION = "v0.9.18";
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -3258,12 +3259,24 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   // If maintenance hasn't run in over 20 hours, schedule it shortly after startup
   // rather than waiting until the next midnight cron.  Wait for the startup sync
   // to finish first so we don't flood the API.
-  getLastStructuralMaintenanceAt()
-    .then((lastMaintenanceAt) => {
+  Promise.all([getLastStructuralMaintenanceAt(), getLastStructuralMaintenanceAttemptAt()])
+    .then(([lastMaintenanceAt, lastAttemptAt]) => {
       const lastMaint = lastMaintenanceAt ? Date.parse(lastMaintenanceAt) : 0;
       const staleMs = 20 * 60 * 60 * 1000; // 20 hours
 
       if (Date.now() - lastMaint > staleMs) {
+        // If a maintenance run was attempted recently (e.g. midnight cron just fired
+        // and failed before this restart), skip deferred startup — the API is likely
+        // still congested and we'd just burn retries. Let the next midnight cron retry.
+        const lastAttempt = lastAttemptAt ? Date.parse(lastAttemptAt) : 0;
+        const attemptCooldownMs = 2 * 60 * 60 * 1000; // 2 hours
+
+        if (Date.now() - lastAttempt < attemptCooldownMs) {
+          console.log("Skipping deferred startup maintenance — a run was attempted at " +
+            lastAttemptAt + ". Next midnight cron will retry.");
+          return;
+        }
+
         console.log("Scheduling deferred startup maintenance (last run: " +
           (lastMaintenanceAt ?? "never") + ")");
         setTimeoutFn(async () => {
