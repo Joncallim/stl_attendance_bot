@@ -6,6 +6,7 @@ export function createSyncManager({
 }) {
   const state = {
     cyclePromise: null,
+    maintenanceRunning: false,
     lastQueueFlushAt: 0,
     lastOnboardingRefreshAt: 0,
     lastMonthRefreshAt: 0,
@@ -13,7 +14,7 @@ export function createSyncManager({
   };
 
   async function runCycle(options = {}) {
-    if (state.cyclePromise) {
+    if (state.cyclePromise || state.maintenanceRunning) {
       return state.cyclePromise;
     }
 
@@ -55,9 +56,13 @@ export function createSyncManager({
 
   return {
     runCycle,
+    setMaintenanceRunning(value) {
+      state.maintenanceRunning = Boolean(value);
+    },
     getStatus() {
       return {
         cycleInProgress: Boolean(state.cyclePromise),
+        maintenanceRunning: state.maintenanceRunning,
         lastQueueFlushAt: state.lastQueueFlushAt,
         lastOnboardingRefreshAt: state.lastOnboardingRefreshAt,
         lastMonthRefreshAt: state.lastMonthRefreshAt,

@@ -21,8 +21,8 @@ const GOOGLE_SHEETS_VERIFY_WRITES = process.env.GOOGLE_SHEETS_VERIFY_WRITES === 
 const DEFAULT_BOOTSTRAP_APPOINTMENTS = ["USER1", "USER2", "USER3"];
 const ATTENDANCE_OPTION_USAGE_MONTH_WINDOW = 2;
 const GOOGLE_SHEETS_MAX_RETRY_ATTEMPTS = 5;
-const GOOGLE_SHEETS_INITIAL_RETRY_DELAY_MS = 1000;
-const GOOGLE_SHEETS_MIN_RETRY_DELAY_MS = 500;
+const GOOGLE_SHEETS_INITIAL_RETRY_DELAY_MS = 2000;
+const GOOGLE_SHEETS_MIN_RETRY_DELAY_MS = 1500;
 const GOOGLE_SHEETS_MAX_RETRY_DELAY_MS = 32000;
 const GOOGLE_SHEETS_REQUEST_TIMEOUT_MS = 15000;
 // Row insertions/deletions (batchUpdate:rows) are processed server-side by Google and can
@@ -33,11 +33,26 @@ const GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS = 5000;
 // bursts from the same service-account token (not with 429s but with silent
 // hangs), so we pace the queue to avoid that during startup.
 const GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS = 250;
+// When ≥3 consecutive timeouts are detected, slow the inter-request gap to
+// reduce pressure on the API and allow in-flight retries to complete.
+const GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS = 2000;
+// Number of consecutive timeouts that triggers congestion mode.
+const GOOGLE_SHEETS_CONGESTION_THRESHOLD = 3;
 const MONTHLY_PROTECTION_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
 const runtimeSheetContext = new WeakMap();
+// Process-level spreadsheet cache: shared across all cache objects that use the same
+// sheets client, so different code paths that each create a fresh cache object from
+// disk can still reuse the already-fetched spreadsheet within the metadata TTL window.
+// Keyed by the sheets client object itself (WeakMap) so tests with fresh client
+// instances are always isolated.
+const processSpreadsheetCache = new WeakMap();
 const ensuredMonthlySheetProtectionIds = new Set();
 const monthlySheetProtectionFailureUntil = new Map();
 let activeGoogleSheetsRequests = 0;
+// Tracks consecutive timeout failures across all queued requests. Drives
+// congestion detection: when this hits GOOGLE_SHEETS_CONGESTION_THRESHOLD,
+// the inter-request delay is increased to GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS.
+let consecutiveTimeouts = 0;
 
 // Semaphore: serialise all outgoing Sheets API calls so only one is in-flight
 // at a time. Google Sheets throttles concurrent requests from the same service
@@ -48,9 +63,15 @@ function acquireSheetsSemaphore(fn) {
   const next = sheetsSemaphorePromise.then(() => fn());
   // Allow the queue to drain even if fn() rejects, then wait the inter-request
   // delay so rapid bursts during startup don't trigger Google's token throttle.
+  // Use a longer delay when consecutive timeouts indicate API congestion.
   sheetsSemaphorePromise = next
     .catch(() => {})
-    .then(() => new Promise((resolve) => setTimeout(resolve, GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS)));
+    .then(() => {
+      const delay = consecutiveTimeouts >= GOOGLE_SHEETS_CONGESTION_THRESHOLD
+        ? GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS
+        : GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS;
+      return new Promise((resolve) => setTimeout(resolve, delay));
+    });
   return next;
 }
 
@@ -64,6 +85,14 @@ function logSheetsWarn(message, details = null) {
   const ts = new Date().toISOString();
   const suffix = details ? ` ${JSON.stringify(details)}` : "";
   console.warn(`[${ts}] [Sheets] ${message}${suffix}`);
+}
+
+const VERBOSE_LOGGING = process.env.VERBOSE === "true";
+function logSheetsVerbose(message, details = null) {
+  if (!VERBOSE_LOGGING) return;
+  const ts = new Date().toISOString();
+  const suffix = details ? ` ${JSON.stringify(details)}` : "";
+  console.log(`[${ts}] [Sheets/Verbose] ${message}${suffix}`);
 }
 const ATTENDANCE_STATUS_ALIAS_MAP = new Map([
   ["PUBLIC HOLIDAY", "PH"],
@@ -627,6 +656,9 @@ async function runGoogleSheetsRequestQueued(operation, request, options = {}) {
         const result = await runGoogleSheetsRequestWithTimeout(operation, request, options);
         const durationMs = Date.now() - startTime;
 
+        // Successful request: clear the congestion counter.
+        consecutiveTimeouts = 0;
+
         if (durationMs >= GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS) {
           logFn(
             `[${new Date().toISOString()}] [Sheets] SLOW ${operation} completed in ${durationMs}ms`
@@ -635,6 +667,20 @@ async function runGoogleSheetsRequestQueued(operation, request, options = {}) {
 
         return result;
       } catch (error) {
+        // Track consecutive timeouts for congestion detection.
+        if (error?.isTimeout === true) {
+          consecutiveTimeouts += 1;
+          if (consecutiveTimeouts >= GOOGLE_SHEETS_CONGESTION_THRESHOLD) {
+            logFn(
+              `[${new Date().toISOString()}] [Sheets] CONGESTION detected` +
+              ` (${consecutiveTimeouts} consecutive timeouts) — inter-request delay raised to` +
+              ` ${GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS}ms`
+            );
+          }
+        } else {
+          consecutiveTimeouts = 0;
+        }
+
         if (!isRetryableGoogleSheetsError(error) || attempt >= maxAttempts) {
           const durationMs = Date.now() - startTime;
           logFn(
@@ -823,6 +869,23 @@ function parseMonthSheetTitle(title) {
 }
 
 async function getSpreadsheet(sheets, spreadsheetId, options = {}) {
+  // Check process-level cache first. This is keyed on the sheets client object so
+  // different code paths that create separate cache objects from disk (and therefore
+  // have separate WeakMap entries in runtimeSheetContext) can still share a single
+  // spreadsheets.get result within the metadata TTL window.
+  if (options.force !== true) {
+    const processEntry = processSpreadsheetCache.get(sheets);
+    if (processEntry?.data && isSliceFresh(processEntry.fetchedAt, SPREADSHEET_METADATA_TTL_MS)) {
+      // Populate the per-object runtime context so subsequent calls within the same
+      // code path skip the WeakMap lookup too.
+      const runtimeContext = getRuntimeSheetContext(options.cache);
+      if (runtimeContext && !runtimeContext.spreadsheet) {
+        runtimeContext.spreadsheet = processEntry.data;
+      }
+      return processEntry.data;
+    }
+  }
+
   const runtimeContext = getRuntimeSheetContext(options.cache);
 
   if (runtimeContext?.spreadsheet && options.force !== true) {
@@ -843,6 +906,8 @@ async function getSpreadsheet(sheets, spreadsheetId, options = {}) {
   if (runtimeContext) {
     runtimeContext.spreadsheet = spreadsheet;
   }
+  // Populate the process-level cache so sibling code paths share this result.
+  processSpreadsheetCache.set(sheets, { data: spreadsheet, fetchedAt: new Date().toISOString() });
 
   return spreadsheet;
 }
@@ -924,13 +989,19 @@ async function ensureSheet(sheets, spreadsheetId, title, options = {}) {
     const runtimeContext = getRuntimeSheetContext(options.cache);
 
     if (runtimeContext?.spreadsheet) {
-      runtimeContext.spreadsheet = {
+      const updatedSpreadsheet = {
         ...runtimeContext.spreadsheet,
         sheets: [
           ...(runtimeContext.spreadsheet.sheets ?? []),
           addedSheet
         ]
       };
+      runtimeContext.spreadsheet = updatedSpreadsheet;
+      // Keep the process-level cache in sync so other code paths see the new sheet.
+      const processEntry = processSpreadsheetCache.get(sheets);
+      if (processEntry?.data) {
+        processSpreadsheetCache.set(sheets, { ...processEntry, data: updatedSpreadsheet });
+      }
     }
   }
 
@@ -1178,6 +1249,21 @@ async function writeMonthlySheetRows(
     existingAppointments,
     nextAppointments
   );
+
+  if (VERBOSE_LOGGING) {
+    const insertOps = operations.filter((op) => op.type === "insert");
+    const deleteOps = operations.filter((op) => op.type === "delete");
+    logSheetsVerbose(`[${title}] Row plan: ${insertOps.length} insertion${insertOps.length !== 1 ? "s" : ""}, ${deleteOps.length} deletion${deleteOps.length !== 1 ? "s" : ""}`);
+    if (operations.length > 0) {
+      const opDescriptions = operations.map((op) => {
+        const name = op.type === "insert"
+          ? (rows[op.index]?.[0] ?? "?")
+          : (existingRows[op.index]?.[0] ?? "?");
+        return `${op.type.toUpperCase()} row ${op.index + 1 + 1} (${name})`;
+      });
+      logSheetsVerbose(`[${title}] ${opDescriptions.join(", ")}`);
+    }
+  }
 
   if (operations.length > 0) {
     const requests = operations.map((operation) => {
@@ -1770,6 +1856,16 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     defaultHeader,
     preferredAppointments
   );
+
+  if (VERBOSE_LOGGING) {
+    const sheetAppointmentSet = new Set(existingAppointments.appointments);
+    const preferredSet = new Set(preferredAppointments);
+    const missingFromSheet = preferredAppointments.filter((a) => !sheetAppointmentSet.has(a));
+    const notInOnboarding = existingAppointments.appointments.filter((a) => !preferredSet.has(a));
+    logSheetsVerbose(`[${title}] ONBOARDING: ${preferredAppointments.length} rows. Sheet: ${existingAppointments.appointments.length} rows.`);
+    logSheetsVerbose(`[${title}] Missing from sheet: ${missingFromSheet.length > 0 ? missingFromSheet.join(", ") : "(none)"}`);
+    logSheetsVerbose(`[${title}] In sheet but not ONBOARDING: ${notInOnboarding.length > 0 ? notInOnboarding.join(", ") : "(none)"}`);
+  }
 
   // Duplicate appointments are a hard block in any mode: the Map lookup in
   // buildManagedMonthlyRows would silently drop one duplicate's attendance data.
@@ -2881,14 +2977,13 @@ async function applyAttendanceAliasCorrections(sheets, spreadsheetId, title, cor
 
 async function seedOnboardingSheet(sheets, config, options = {}) {
   const cache = options.cache ?? (await readLocalSheetCache());
-  await updateSpreadsheetMetadataCache(sheets, config, cache, false);
-  const spreadsheet = await getSpreadsheet(sheets, config.spreadsheetId, { cache });
+  // Use the already-populated metadata cache (sheetIdsByTitle) to avoid a
+  // second spreadsheets.get call — updateSpreadsheetMetadataCache already
+  // fetched the spreadsheet and stored all sheet IDs in the metadata.
+  const metadata = await updateSpreadsheetMetadataCache(sheets, config, cache, false);
   const currentMonthTitle = getMonthParts(new Date(), config.timezone).title;
-  const currentSheet = spreadsheet.sheets?.find(
-    (entry) => entry.properties?.title === currentMonthTitle
-  );
 
-  if (currentSheet) {
+  if (Number.isInteger(metadata.sheetIdsByTitle?.[currentMonthTitle])) {
     return (
       await readAppointmentColumn(
         sheets,
@@ -2899,9 +2994,9 @@ async function seedOnboardingSheet(sheets, config, options = {}) {
     ).appointments;
   }
 
-  const latestMonthSheet = (spreadsheet.sheets ?? [])
-    .map((entry) => entry.properties?.title)
-    .filter(Boolean)
+  // Current month sheet does not exist yet — find the most recent month sheet
+  // from the metadata keys to use as a bootstrap source.
+  const latestMonthSheet = Object.keys(metadata.sheetIdsByTitle ?? {})
     .map(parseMonthSheetTitle)
     .filter(Boolean)
     .sort((left, right) => {
@@ -2929,12 +3024,11 @@ async function seedOnboardingSheet(sheets, config, options = {}) {
 async function readCurrentMonthAppointments(sheets, config, options = {}) {
   const currentMonthTitle = getMonthParts(new Date(), config.timezone).title;
   const cache = options.cache ?? (await readLocalSheetCache());
-  await updateSpreadsheetMetadataCache(sheets, config, cache, false);
-  const currentSheet = await getSheetByTitle(sheets, config.spreadsheetId, currentMonthTitle, {
-    cache
-  });
+  // Use sheetIdsByTitle from the metadata cache instead of calling getSpreadsheet
+  // again through getSheetByTitle — updateSpreadsheetMetadataCache already fetched it.
+  const metadata = await updateSpreadsheetMetadataCache(sheets, config, cache, false);
 
-  if (!currentSheet) {
+  if (!Number.isInteger(metadata.sheetIdsByTitle?.[currentMonthTitle])) {
     return [];
   }
 
@@ -3018,6 +3112,7 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
     });
   }
   const onboardingAppointments = onboardingSlice.appointments;
+  logSheetsVerbose(`syncOnboardingRoster: ONBOARDING has ${onboardingAppointments.length} appointments`);
   const driftDetected =
     onboardingSlice.hasBlankRowDrift ||
     (onboardingSlice.duplicateAppointments?.length ?? 0) > 0 ||
@@ -3540,10 +3635,15 @@ export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
   const localCache = options.cache ?? (await readLocalSheetCache());
   const structural = options.structural === true;
 
-  await updateSpreadsheetMetadataCache(sheets, config, localCache, options.force === true);
+  // Never force-refresh metadata or the onboarding slice here — let their TTLs govern.
+  // The force flag is propagated to refreshMonthSlice (cheap per-sheet reads) only.
+  // Forcing metadata causes an extra spreadsheets.get (10–15 s) on every maintenance run
+  // even when syncOnboardingRoster has just populated the cache; forcing onboarding causes
+  // a duplicate ONBOARDING values.get immediately after the one in syncOnboardingRoster.
+  await updateSpreadsheetMetadataCache(sheets, config, localCache, false);
   await refreshOnboardingSlice(sheets, config, {
     cache: localCache,
-    force: options.force === true,
+    force: false,
     persist: false
   });
 
@@ -3655,14 +3755,14 @@ export async function summarizeStatuses(sheets, config, options = {}) {
 
 export async function summarizeAttendanceOptionUsage(sheets, config) {
   const cache = await readLocalSheetCache();
-  await updateSpreadsheetMetadataCache(sheets, config, cache, false);
-  const spreadsheet = await getSpreadsheet(sheets, config.spreadsheetId, { cache });
+  // Use sheetIdsByTitle from metadata instead of a raw getSpreadsheet call —
+  // updateSpreadsheetMetadataCache already fetches the spreadsheet and stores
+  // all sheet titles, so we only need one API call here.
+  const metadata = await updateSpreadsheetMetadataCache(sheets, config, cache, false);
   const recentMonthTitleSet = new Set(
     getRecentMonthTitles(new Date(), config.timezone, ATTENDANCE_OPTION_USAGE_MONTH_WINDOW)
   );
-  const monthTitles = (spreadsheet.sheets ?? [])
-    .map((entry) => entry.properties?.title)
-    .filter(Boolean)
+  const monthTitles = Object.keys(metadata.sheetIdsByTitle ?? {})
     .map(parseMonthSheetTitle)
     .filter(Boolean)
     .map((entry) => entry.title)
