@@ -1,6 +1,14 @@
 import { mkdir, appendFile } from "node:fs/promises";
 import path from "node:path";
 
+// ── TTY detection ─────────────────────────────────────────────────────────────
+// When running under pm2 (or any process manager) stdout is not a TTY.
+// Emitting ANSI codes in that context either produces invisible output (if pm2
+// strips them) or raw escape sequences in the log files (if it doesn't).
+// FORCE_COLOR=1 overrides the detection for environments that support colour
+// but don't expose a TTY (e.g. some Docker setups with explicit tty allocation).
+const USE_ANSI = process.stdout.isTTY === true || process.env.FORCE_COLOR === "1";
+
 // ── ANSI colour helpers (terminal only) ──────────────────────────────────────
 const ANSI = {
   reset:  "\x1b[0m",
@@ -58,8 +66,17 @@ function formatFileLine(level, message) {
 
 // ── Format a line for the TERMINAL ───────────────────────────────────────────
 function formatTermLine(level, message) {
-  const { termColour } = LEVELS[level] ?? LEVELS.INFO;
   const ts = new Date().toISOString();
+
+  if (!USE_ANSI) {
+    // Plain text — identical to the file format so non-TTY output (pm2, pipes,
+    // Docker without tty) is clean and grep-friendly. No trailing newline;
+    // console.log adds it.
+    const { fileLabel } = LEVELS[level] ?? LEVELS.INFO;
+    return `[${ts}] [${fileLabel}] ${message}`;
+  }
+
+  const { termColour } = LEVELS[level] ?? LEVELS.INFO;
   const dimTs   = `${ANSI.grey}[${ts}]${ANSI.reset}`;
   const label   = `${termColour}[${level.padEnd(5)}]${ANSI.reset}`;
   const coloured = colouriseTerminalMessage(message);
