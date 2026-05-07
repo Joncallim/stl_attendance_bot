@@ -8,6 +8,7 @@ import {
   classifyAppointmentDepartment,
   clearAllSheetProtections,
   createGoogleSheetsClient,
+  runStartupSheetCleanup,
   DEPARTMENT_BUCKETS,
   ensureNextMonthSheetExists,
   getLastStructuralMaintenanceAt,
@@ -3321,12 +3322,23 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   const listUsersFn = deps.listUsersFn ?? listUsers;
   const sendPromptToChatFn = deps.sendPromptToChatFn ?? sendPromptToChat;
   const runDailySheetMaintenanceFn = deps.runDailySheetMaintenanceFn ?? runDailySheetMaintenance;
+  const runStartupSheetCleanupFn = deps.runStartupSheetCleanupFn ?? runStartupSheetCleanup;
 
-  // Startup: lightweight read-only sync (no structural writes), followed by
-  // attendance option sort once the sync finishes — serialized to avoid
-  // hammering the Sheets API with concurrent requests.
-  const startupSyncPromise = adminCache.syncManager
-    .runCycle({ force: false, reason: "startup" })
+  // Startup: clean up the spreadsheet (remove protections + trim trailing blank rows)
+  // BEFORE the first sync cycle so that subsequent spreadsheets.get calls return
+  // less data.  Background sync cycles are blocked while cleanup runs.
+  adminCache.syncManager.setMaintenanceRunning(true);
+  const startupCleanupPromise = runStartupSheetCleanupFn(sheets, config.spreadsheetId)
+    .catch((error) => {
+      logBotError("[Startup] Sheet cleanup failed (non-fatal).", { error: error.message });
+    })
+    .finally(() => {
+      adminCache.syncManager.setMaintenanceRunning(false);
+    });
+
+  // After cleanup, run the normal startup sync + attendance option sort.
+  const startupSyncPromise = startupCleanupPromise
+    .then(() => adminCache.syncManager.runCycle({ force: false, reason: "startup" }))
     .then(() => refreshAttendanceOptionUsageFn(sheets, config, adminCache))
     .catch((error) => {
       logBotError("Initial startup sync/sort failed.", { error: error.message });

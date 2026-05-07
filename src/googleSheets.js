@@ -3887,6 +3887,113 @@ export async function clearAllSheetProtections(sheets, spreadsheetId) {
   return { removedCount: allProtections.length };
 }
 
+/**
+ * runStartupSheetCleanup — called once on bot startup BEFORE the first sync cycle.
+ *
+ * 1. Removes all sheet protections (using cached metadata when available).
+ * 2. Trims trailing blank rows from every sheet by reading all column-A values in
+ *    a single batchGet call and issuing a single batchUpdate with all deleteDimension
+ *    requests.  This keeps the spreadsheet compact so subsequent spreadsheets.get
+ *    calls return less data and run faster.
+ */
+export async function runStartupSheetCleanup(sheets, spreadsheetId) {
+  console.log("[Startup] [Cleanup] Starting sheet cleanup…");
+
+  // Step 1: Remove all protections (prefers cached metadata if available).
+  await clearAllSheetProtections(sheets, spreadsheetId);
+
+  // Step 2: Trim trailing blank rows from all sheets.
+  console.log("[Startup] [Cleanup] Trimming trailing blank rows from all sheets…");
+
+  // Re-use cached metadata when it exists; otherwise fetch it now.
+  let sheetsMeta;
+  const processEntry = processSpreadsheetCache.get(sheets);
+  if (processEntry?.data?.sheets) {
+    sheetsMeta = processEntry.data.sheets;
+    console.log("[Startup] [Cleanup] Using cached sheet metadata.");
+  } else {
+    console.log("[Startup] [Cleanup] Cache empty — fetching sheet metadata.");
+    const response = await runGoogleSheetsRequestQueued(
+      "spreadsheets.get:startupCleanup",
+      (signal) => sheets.spreadsheets.get({
+        spreadsheetId,
+        fields: "sheets(properties(sheetId,title,gridProperties),protectedRanges(protectedRangeId,description))"
+      }, { signal })
+    );
+    sheetsMeta = response.data.sheets ?? [];
+    processSpreadsheetCache.set(sheets, { data: response.data, fetchedAt: new Date().toISOString() });
+  }
+
+  if (sheetsMeta.length === 0) {
+    console.log("[Startup] [Cleanup] No sheets found — nothing to trim.");
+    console.log("[Startup] [Cleanup] Sheet cleanup complete.");
+    return;
+  }
+
+  // Batch-read column A from every sheet in one API call.
+  const ranges = sheetsMeta.map((s) => {
+    const rowCount = s.properties?.gridProperties?.rowCount ?? 1000;
+    const title = s.properties?.title ?? "";
+    // Escape single quotes in sheet titles.
+    const escapedTitle = title.replace(/'/g, "''");
+    return `'${escapedTitle}'!A1:A${rowCount}`;
+  });
+
+  const batchResult = await runGoogleSheetsRequestQueued(
+    "spreadsheets.values.batchGet:startupCleanup",
+    (signal) => sheets.spreadsheets.values.batchGet({ spreadsheetId, ranges }, { signal })
+  );
+  const valueRanges = batchResult.data.valueRanges ?? [];
+
+  // Build deleteDimension requests for every sheet that has trailing blank rows.
+  const trimRequests = [];
+  for (const [index, sheet] of sheetsMeta.entries()) {
+    const sheetId = sheet.properties?.sheetId;
+    const rowCount = sheet.properties?.gridProperties?.rowCount ?? 0;
+    const title = sheet.properties?.title ?? `(sheet ${index})`;
+
+    if (!Number.isInteger(sheetId) || rowCount === 0) continue;
+
+    // The Sheets API omits trailing empty rows from valueRanges, so `.values.length`
+    // is exactly the index of the last non-empty row + 1 (i.e. 1-based last row).
+    const values = valueRanges[index]?.values ?? [];
+    const lastNonEmptyRow = values.length; // 0 means completely empty
+
+    if (lastNonEmptyRow === 0) {
+      // Completely empty sheet — leave it alone; deleting all rows would error.
+      continue;
+    }
+
+    const blankRowsToDelete = rowCount - lastNonEmptyRow;
+    if (blankRowsToDelete > 0) {
+      trimRequests.push({
+        deleteDimension: {
+          range: { sheetId, dimension: "ROWS", startIndex: lastNonEmptyRow, endIndex: rowCount }
+        }
+      });
+      console.log(`[Startup] [Cleanup] "${title}": trimming ${blankRowsToDelete} trailing blank row(s) (rows ${lastNonEmptyRow + 1}–${rowCount}).`);
+    }
+  }
+
+  if (trimRequests.length === 0) {
+    console.log("[Startup] [Cleanup] All sheets already compact — no rows to trim.");
+  } else {
+    await runGoogleSheetsRequestQueued(
+      `spreadsheets.batchUpdate:startupCleanup:trimRows(${trimRequests.length})`,
+      (signal) => sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: { requests: trimRequests }
+      }, { signal })
+    );
+    console.log(`[Startup] [Cleanup] Trimmed trailing rows from ${trimRequests.length} sheet(s).`);
+  }
+
+  // Invalidate the process cache so the next sync cycle sees the updated row counts.
+  processSpreadsheetCache.delete(sheets);
+
+  console.log("[Startup] [Cleanup] Sheet cleanup complete.");
+}
+
 export const __testing = {
   DEFAULT_BOOTSTRAP_APPOINTMENTS,
   ATTENDANCE_OPTION_USAGE_MONTH_WINDOW,

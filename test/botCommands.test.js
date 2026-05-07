@@ -662,7 +662,8 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
       syncManager: {
         runCycle: async (options) => {
           runCycleCalls.push(options);
-        }
+        },
+        setMaintenanceRunning: () => {}
       }
     },
     deps: {
@@ -676,7 +677,8 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
         return { stop() {} };
       },
       refreshAttendanceOptionUsageFn: async () => {},
-      runDailySheetMaintenanceFn: async () => {}
+      runDailySheetMaintenanceFn: async () => {},
+      runStartupSheetCleanupFn: async () => {}
     }
   });
 
@@ -689,6 +691,8 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
   assert.equal(schedules[1].expression, "5 2 * * *");
   assert.ok(schedules.some((entry) => entry.expression === "0 7 * * *"));
   assert.ok(schedules.some((entry) => entry.expression === "0 8 * * *"));
+  // Startup cycle runs after cleanup (async) — drain microtasks before asserting.
+  await new Promise((resolve) => setImmediate(resolve));
   // Startup cycle is now lightweight (force: false).
   assert.deepEqual(runCycleCalls, [{ force: false, reason: "startup" }]);
 });
@@ -710,7 +714,8 @@ test("scheduled reminder forces a sync before sending prompts", async () => {
       syncManager: {
         runCycle: async (options) => {
           runCycleCalls.push(options);
-        }
+        },
+        setMaintenanceRunning: () => {}
       }
     },
     deps: {
@@ -722,6 +727,7 @@ test("scheduled reminder forces a sync before sending prompts", async () => {
       },
       refreshAttendanceOptionUsageFn: async () => {},
       runDailySheetMaintenanceFn: async () => {},
+      runStartupSheetCleanupFn: async () => {},
       isReminderWorkingDayFn: async () => true,
       listUsersFn: async () => [{ chatId: "chat-1", appointment: "ALPHA" }],
       sendPromptToChatFn: async (_bot, _config, chatId) => {
@@ -731,6 +737,11 @@ test("scheduled reminder forces a sync before sending prompts", async () => {
   });
 
   const reminderSchedule = schedules.find((entry) => entry.expression === "0 7 * * *");
+  // Allow the startup cleanup → sync chain to settle before the reminder handler
+  // runs.  The cleanup is 3 microtask steps deep; setImmediate fires after all
+  // pending microtasks have drained so the startup runCycle has already pushed
+  // its entry before the reminder handler starts.
+  await new Promise((resolve) => setImmediate(resolve));
   await reminderSchedule.fn();
 
   assert.deepEqual(runCycleCalls, [
@@ -760,7 +771,8 @@ test("scheduled reminder still sends prompts when pre-send sync fails", async ()
           }
 
           throw new Error("rate limit");
-        }
+        },
+        setMaintenanceRunning: () => {}
       }
     },
     deps: {
@@ -772,6 +784,7 @@ test("scheduled reminder still sends prompts when pre-send sync fails", async ()
       },
       refreshAttendanceOptionUsageFn: async () => {},
       runDailySheetMaintenanceFn: async () => {},
+      runStartupSheetCleanupFn: async () => {},
       isReminderWorkingDayFn: async () => true,
       listUsersFn: async () => [{ chatId: "chat-1", appointment: "ALPHA" }],
       sendPromptToChatFn: async (_bot, _config, chatId) => {
@@ -817,7 +830,8 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
     },
     adminCache: {
       syncManager: {
-        runCycle: async () => {}
+        runCycle: async () => {},
+        setMaintenanceRunning: () => {}
       },
       sheetSnapshots: {
         snapshots: new Map([["Mar 26", {
@@ -836,6 +850,7 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
       },
       refreshAttendanceOptionUsageFn: async () => {},
       runDailySheetMaintenanceFn: async () => {},
+      runStartupSheetCleanupFn: async () => {},
       isReminderWorkingDayFn: async () => true,
       listUsersFn: async () => [
         { chatId: "chat-1", appointment: "ALPHA" },
