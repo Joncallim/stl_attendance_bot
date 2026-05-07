@@ -3354,48 +3354,49 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
   const conflictedEvents = [];
   const cache = await readLocalSheetCache();
 
-  await updateSpreadsheetMetadataCache(sheets, config, cache, false);
-  await refreshOnboardingSlice(sheets, config, {
-    cache,
-    force: false,
-    persist: false
-  });
-
   for (const [sheetTitle, sheetEntries] of entriesBySheet.entries()) {
-    const appointments = [...new Set(sheetEntries.map((entry) => entry.appointment))];
-    await ensureMonthlyAttendanceSheet(sheets, config, sheetEntries[0].date, appointments, "merge", { cache });
-    const liveSlice = await refreshMonthSlice(sheets, config, sheetEntries[0].date, {
-      cache,
-      force: true,
-      persist: false
-    });
-    const appointmentRows = new Map(
-      Object.entries(liveSlice.rowNumbersByAppointment ?? {})
+    // Read the month sheet directly — no ONBOARDING alignment on the write path.
+    // Row positions come from column A of the live sheet; date columns come from
+    // row 1. This avoids the row-insertion/deletion pass that "merge" mode
+    // previously triggered before every write.
+    const values = await readSheetValues(
+      sheets,
+      config.spreadsheetId,
+      sheetTitle,
+      `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${DEFAULT_MAX_MANAGED_ROWS}`
     );
-    const headerRow = liveSlice.headerRow;
-    const data = [];
+    const headerRow = (values[0] ?? []).map((v) => String(v ?? "").trim());
 
-    if ((liveSlice.unexpectedAppointments?.length ?? 0) > 0) {
-      conflictedEvents.push(
-        ...sheetEntries.map((entry) => ({
-          eventId: entry.id,
-          reason: "sheet_layout_changed",
-          error: `Unexpected managed rows found in ${sheetTitle}: ${liveSlice.unexpectedAppointments.join(", ")}`
-        }))
-      );
-      continue;
+    // Build appointment → 1-indexed row number from column A, stopping at the
+    // roster stop marker. Track duplicates so we can report the right reason.
+    const rowNumbersByAppointment = {};
+    const appointmentRowCounts = {};
+    for (let i = 1; i < values.length; i++) {
+      const appointment = normalizeAppointmentLabel(String(values[i]?.[0] ?? "").trim());
+      if (!appointment) {
+        continue;
+      }
+      if (isStopMarker(appointment, config.rosterStopMarkers)) {
+        break;
+      }
+      appointmentRowCounts[appointment] = (appointmentRowCounts[appointment] ?? 0) + 1;
+      if (!rowNumbersByAppointment[appointment]) {
+        rowNumbersByAppointment[appointment] = i + 1; // values is 0-indexed; rows are 1-indexed
+      }
     }
 
+    const data = [];
+
     for (const entry of sheetEntries) {
-      const rowNumber = appointmentRows.get(entry.appointment);
+      const rowNumber = rowNumbersByAppointment[entry.appointment];
 
       if (!rowNumber) {
         conflictedEvents.push({
           eventId: entry.id,
-          reason: liveSlice.duplicateAppointments?.includes(entry.appointment)
+          reason: (appointmentRowCounts[entry.appointment] ?? 0) > 1
             ? "duplicate_appointment_row"
             : "appointment_missing",
-          error: `Appointment row not found for ${entry.appointment}`
+          error: `Appointment row not found for ${entry.appointment} in ${sheetTitle}`
         });
         continue;
       }
@@ -3407,16 +3408,15 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
         conflictedEvents.push({
           eventId: entry.id,
           reason: "date_column_changed",
-          error: `Date column not found for ${expectedDateLabel}`
+          error: `Date column not found for ${expectedDateLabel} in ${sheetTitle}`
         });
         continue;
       }
 
-      const appointmentIndex = liveSlice.snapshot.appointments.findIndex((value) => value === entry.appointment);
-      const liveDay = dayOfMonth(entry.date, config.timezone);
-      const liveValue = appointmentIndex === -1
-        ? ""
-        : String(liveSlice.snapshot.statusesByDay.get(liveDay)?.[appointmentIndex] ?? "").trim();
+      // Optimistic lock: read the live cell value directly from the sheet data
+      // we already fetched and compare to what the bot last knew about.
+      const liveRow = values[rowNumber - 1] ?? [];
+      const liveValue = String(liveRow[columnIndex] ?? "").trim();
 
       if (liveValue === String(entry.status ?? "").trim()) {
         skippedEvents.push({ eventId: entry.id, reason: "noop" });
