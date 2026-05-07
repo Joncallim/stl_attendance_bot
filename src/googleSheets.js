@@ -601,6 +601,36 @@ async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Extract a human-readable detail string from a Google API error.
+ * The googleapis library wraps the HTTP response body inside error.response.data;
+ * that contains the canonical Google error object with a message, status, and
+ * an optional errors array with per-field detail.
+ *
+ * Falls back gracefully so it never throws.
+ */
+function describeGoogleApiError(error) {
+  try {
+    const gError = error?.response?.data?.error;
+    if (!gError) {
+      return error?.message ?? String(error);
+    }
+
+    const status  = gError.status  ?? error?.response?.status ?? error?.status ?? "?";
+    const message = gError.message ?? error.message ?? "unknown error";
+    const details = (gError.errors ?? [])
+      .map((e) => `${e.reason ?? ""}${e.message ? `: ${e.message}` : ""}`)
+      .filter(Boolean)
+      .join("; ");
+
+    return details
+      ? `[${status}] ${message} (${details})`
+      : `[${status}] ${message}`;
+  } catch {
+    return error?.message ?? String(error);
+  }
+}
+
 function createGoogleSheetsTimeoutError(operation, timeoutMs) {
   const error = new Error(
     `Google Sheets request timed out after ${timeoutMs}ms for ${operation}`
@@ -662,11 +692,10 @@ async function runGoogleSheetsRequestQueued(operation, request, options = {}) {
         // Successful request: clear the congestion counter.
         consecutiveTimeouts = 0;
 
-        if (durationMs >= GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS) {
-          logFn(
-            `[${new Date().toISOString()}] [Sheets] SLOW ${operation} completed in ${durationMs}ms`
-          );
-        }
+        const doneTag = durationMs >= GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS ? "SLOW" : "DONE";
+        console.log(
+          `[${new Date().toISOString()}] [Sheets] ${doneTag} ${operation} in ${durationMs}ms`
+        );
 
         return result;
       } catch (error) {
@@ -688,7 +717,7 @@ async function runGoogleSheetsRequestQueued(operation, request, options = {}) {
           const durationMs = Date.now() - startTime;
           logFn(
             `[${new Date().toISOString()}] [Sheets] FAIL ${operation} after ${durationMs}ms` +
-            ` (attempt ${attempt}/${maxAttempts}): ${error.message}`
+            ` (attempt ${attempt}/${maxAttempts}): ${describeGoogleApiError(error)}`
           );
           throw error;
         }
@@ -696,7 +725,7 @@ async function runGoogleSheetsRequestQueued(operation, request, options = {}) {
         const delayMs = getGoogleSheetsRetryDelay(attempt, options);
         logFn(
           `[${new Date().toISOString()}] [Sheets] retry ${attempt}/${maxAttempts}` +
-          ` for ${operation} after ${delayMs}ms: ${error.message}`
+          ` for ${operation} after ${delayMs}ms: ${describeGoogleApiError(error)}`
         );
         await sleepFn(delayMs);
       }
