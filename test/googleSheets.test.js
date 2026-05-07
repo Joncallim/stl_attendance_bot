@@ -745,7 +745,7 @@ test("monthly sheet protection failures are treated as best effort", async () =>
   }
 
   assert.ok(warnings.length >= 1);
-  assert.match(warnings.at(-1), /Skipping monthly sheet protections for sheet 99/);
+  assert.match(warnings.at(-1), /Sheet 99.*protections skipped/);
 });
 
 test("date lookup follows the actual header row instead of fixed column offsets", () => {
@@ -899,7 +899,8 @@ test("syncOnboardingRoster bootstraps a blank spreadsheet with onboarding and tw
           ["USER3", ""]
         ]
       );
-      assert.equal(fake.getSheetValues(prevMonthTitle)[1][0], "USER1");
+      // Previous month uses layoutOnly — sheet is created with default header but no appointment rows.
+      assert.equal(fake.getSheetValues(prevMonthTitle)[0][0], "Appointment");
       assert.equal(fake.getSheetValues(currentMonthTitle)[0][0], "Appointment");
       assert.equal(fake.getSheetValues(currentMonthTitle)[1][0], "USER1");
       assert.equal(fake.getSheetValues(nextMonthTitle)[1][0], "USER1");

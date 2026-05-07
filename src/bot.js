@@ -64,7 +64,25 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.19";
+export const BOT_VERSION = "v0.9.20";
+
+function logBot(message, details = null) {
+  const ts = new Date().toISOString();
+  const suffix = details ? ` ${JSON.stringify(details)}` : "";
+  console.log(`[${ts}] [Bot] ${message}${suffix}`);
+}
+
+function logBotWarn(message, details = null) {
+  const ts = new Date().toISOString();
+  const suffix = details ? ` ${JSON.stringify(details)}` : "";
+  console.warn(`[${ts}] [Bot] ${message}${suffix}`);
+}
+
+function logBotError(message, details = null) {
+  const ts = new Date().toISOString();
+  const suffix = details ? ` ${JSON.stringify(details)}` : "";
+  console.error(`[${ts}] [Bot] ${message}${suffix}`);
+}
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
@@ -2427,7 +2445,7 @@ async function ensureSheetReadiness(sheets, config, cache, options = {}) {
   if (!force) {
     if (!syncStatus.cycleInProgress) {
       cache.syncManager.runCycle({ force: false, reason: "background" }).catch((error) => {
-        console.error("Background sync refresh failed:", error);
+        logBotError("Background sync refresh failed.", { error: error.message });
       });
     }
 
@@ -2817,7 +2835,7 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       sheets,
       cache
     }).catch((error) => {
-      console.error("Background roster sync error:", error.message);
+      logBotError("Background roster sync error.", { error: error.message });
     });
     return;
   }
@@ -2833,7 +2851,7 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       sheets,
       cache
     }).catch((error) => {
-      console.error("Background attendance flush error:", error.message);
+      logBotError("Background attendance flush error.", { error: error.message });
     });
     return;
   }
@@ -2854,7 +2872,7 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
         await sendPromptToChat(bot, config, user.chatId, cache);
         sent += 1;
       } catch (error) {
-        console.error(`Failed to prompt chat ${user.chatId}:`, error.message);
+        logBotError("Failed to send prompt.", { chatId: user.chatId, error: error.message });
       }
     }
 
@@ -3107,7 +3125,7 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
     const resetResult = await deps.resetConflictedQueueEntries();
 
     if (resetResult.resetCount > 0) {
-      console.log(`Roster sync: reset ${resetResult.resetCount} conflicted attendance queue entries for retry.`);
+      logBot("Roster sync: conflicted queue entries re-queued for retry.", { resetCount: resetResult.resetCount });
     }
 
     await deps.sendOrUpdateAdminMessage(
@@ -3115,7 +3133,7 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
       `Roster synced from ${config.onboardingSheetTitle}. Last month: ${roster.prevMonthTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.${resetResult.resetCount > 0 ? ` (${resetResult.resetCount} previously stuck attendance ${resetResult.resetCount === 1 ? "entry" : "entries"} re-queued for retry.)` : ""}`
     );
   } catch (error) {
-    console.error("Roster sync failed:", error.message);
+    logBotError("Roster sync failed.", { error: error.message });
     await deps.sendOrUpdateAdminMessage(
       ctx,
       `Roster sync failed: ${error.message}`
@@ -3188,7 +3206,7 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
 
     await deps.sendOrUpdateAdminMessage(ctx, parts.join("\n"));
   } catch (error) {
-    console.error(`[Admin] Attendance push failed: ${error.message}`);
+    logBotError("[Admin] Attendance push failed.", { error: error.message });
     await deps.sendOrUpdateAdminMessage(
       ctx,
       `❌ Push failed: ${error.message}\n\nThe queue will retry automatically in the background.`
@@ -3253,7 +3271,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
     .runCycle({ force: false, reason: "startup" })
     .then(() => refreshAttendanceOptionUsageFn(sheets, config, adminCache))
     .catch((error) => {
-      console.error("Initial startup sync/sort failed:", error);
+      logBotError("Initial startup sync/sort failed.", { error: error.message });
     });
 
   // If maintenance hasn't run in over 20 hours, schedule it shortly after startup
@@ -3272,13 +3290,16 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         const attemptCooldownMs = 2 * 60 * 60 * 1000; // 2 hours
 
         if (Date.now() - lastAttempt < attemptCooldownMs) {
-          console.log("Skipping deferred startup maintenance — a run was attempted at " +
-            lastAttemptAt + ". Next midnight cron will retry.");
+          logBot("Skipping deferred startup maintenance — recent attempt detected.", {
+            lastAttemptAt,
+            cooldownRemainingSec: Math.round((attemptCooldownMs - (Date.now() - lastAttempt)) / 1000)
+          });
           return;
         }
 
-        console.log("Scheduling deferred startup maintenance (last run: " +
-          (lastMaintenanceAt ?? "never") + ")");
+        logBot("Scheduling deferred startup maintenance.", {
+          lastMaintenanceAt: lastMaintenanceAt ?? "never"
+        });
         setTimeoutFn(async () => {
           try {
             // Wait for the startup sync cycle + option sort to finish before
@@ -3294,7 +3315,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
             await refreshAdminCache(adminCache, config);
             await refreshAttendanceOptionUsageFn(sheets, config, adminCache);
           } catch (error) {
-            console.error("Deferred startup maintenance failed:", error);
+            logBotError("Deferred startup maintenance failed.", { error: error.message });
           }
         }, 10_000);
       }
@@ -3307,7 +3328,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
     try {
       await adminCache.syncManager.runCycle({ force: false, reason: "background" });
     } catch (error) {
-      console.error("Background sheet preload failed:", error);
+      logBotError("Background sheet preload failed.", { error: error.message });
     }
   }, 60 * 1000);
 
@@ -3315,7 +3336,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
     try {
       await adminCache.syncManager.runCycle({ force: true, reason: "five-minute" });
     } catch (error) {
-      console.error("Five-minute sheet reconciliation failed:", error);
+      logBotError("Five-minute sheet reconciliation failed.", { error: error.message });
     }
   }, 5 * 60 * 1000);
 
@@ -3323,6 +3344,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   scheduleFn(
     "0 0 * * *",
     async () => {
+      logBot("[Maint] Midnight sheet maintenance starting.");
       try {
         await runDailySheetMaintenanceFn(sheets, config);
         await syncAppointmentRegistry();
@@ -3333,8 +3355,9 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         );
         await refreshAdminCache(adminCache, config);
         await refreshAttendanceOptionUsageFn(sheets, config, adminCache);
+        logBot("[Maint] Midnight sheet maintenance complete.");
       } catch (error) {
-        console.error("Midnight sheet maintenance failed:", error);
+        logBotError("[Maint] Midnight sheet maintenance failed.", { error: error.message });
       }
     },
     { timezone: config.timezone }
@@ -3348,10 +3371,10 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         const result = await compactAttendanceQueue();
 
         if (result.compacted) {
-          console.log(`Nightly queue compaction removed ${result.removedCount} resolved records.`);
+          logBot("[Maint] Nightly queue compaction complete.", { removedCount: result.removedCount });
         }
       } catch (error) {
-        console.error("Nightly queue compaction failed:", error);
+        logBotError("[Maint] Nightly queue compaction failed.", { error: error.message });
       }
     },
     { timezone: config.timezone }
@@ -3378,7 +3401,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         try {
           await adminCache.syncManager.runCycle({ force: true, reason: "reminder" });
         } catch (error) {
-          console.error(`Unable to refresh sheet state before ${reminderTime} reminder:`, error);
+          logBotWarn(`[Reminder] Sheet refresh failed before ${reminderTime} reminder — using cached data.`, { error: error.message });
         }
 
         const users = (await listUsersFn()).filter((user) => {
@@ -3397,10 +3420,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
           try {
             await sendPromptToChatFn(bot, config, user.chatId, adminCache);
           } catch (error) {
-            console.error(
-              `Failed to send scheduled ${reminderTime} prompt to ${user.chatId}:`,
-              error.message
-            );
+            logBotError(`[Reminder] Failed to send ${reminderTime} prompt.`, { chatId: user.chatId, error: error.message });
           }
         }
       },
@@ -3449,7 +3469,7 @@ export function createAttendanceBot(config) {
   });
 
   refreshAdminCache(adminCache, config).catch((error) => {
-    console.error("Initial admin cache hydrate failed:", error);
+    logBotError("Initial admin cache hydrate failed.", { error: error.message });
   });
   loadAttendanceSnapshotsFromLocalCache()
     .then((snapshotBundle) => {
@@ -3462,7 +3482,7 @@ export function createAttendanceBot(config) {
       adminCache.summaryMemoVersion = snapshotBundle.synchronizedAt ?? null;
     })
     .catch((error) => {
-      console.error("Initial local snapshot hydrate failed:", error);
+      logBotError("Initial local snapshot hydrate failed.", { error: error.message });
     });
 
   bot.use(
@@ -3943,7 +3963,7 @@ export function createAttendanceBot(config) {
   });
 
   bot.catch((error, ctx) => {
-    console.error("Telegram bot error:", error);
+    logBotError("[Telegram] Unhandled bot error.", { error: error.message, stack: error.stack });
     ctx.reply("Something went wrong while processing your request. Try again.");
   });
 
