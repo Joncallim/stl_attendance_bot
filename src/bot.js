@@ -6,6 +6,7 @@ import {
   addAppointmentToSheets,
   buildQueuedAttendanceEventMetadata,
   classifyAppointmentDepartment,
+  clearAllSheetProtections,
   createGoogleSheetsClient,
   DEPARTMENT_BUCKETS,
   ensureNextMonthSheetExists,
@@ -64,7 +65,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.21";
+export const BOT_VERSION = "v0.9.23";
 
 function logBot(message, details = null) {
   const ts = new Date().toISOString();
@@ -578,6 +579,7 @@ function buildAdminRosterMenu() {
       Markup.button.callback("➖ Remove Appointment", "admin:menu:appointments:remove:0")
     ],
     [Markup.button.callback("🔄 Sync Roster", "admin:syncroster")],
+    [Markup.button.callback("🔓 Clear All Protections", "admin:clearprotections")],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
       Markup.button.callback("❌", "admin:close")
@@ -1506,7 +1508,11 @@ function buildAdminMenuDescription() {
     "🧩 Attendance Options: View, add, remove, or reset the allowed attendance codes.",
     "🧾 Deregister Person: Remove another person’s Telegram binding and rotate their code.",
     "📤 Push Attendance: Immediately flush all pending attendance entries to Google Sheets.",
-    "🔙 Back: Return to the main home menu."
+    "🔙 Back: Return to the main home menu.",
+    "",
+    "📋 Roster sub-menu:",
+    "🔄 Sync Roster: Sort ONBOARDING, sync month sheets, add new users, check formatting.",
+    "🔓 Clear All Protections: Remove every sheet protection from the spreadsheet."
   ].join("\n");
 }
 
@@ -2478,8 +2484,9 @@ async function applyAttendanceOptionChange(sheets, config, cache, nextOptions) {
   await withSheetOperation(async () => {
     config.attendanceOptions = nextOptions;
     await setAttendanceOptions(nextOptions);
+    // syncRosterState → syncOnboardingRoster already handles prev/current/next months.
+    // ensureNextMonthSheetExists is intentionally omitted — it would duplicate the sync.
     await syncRosterState(sheets, config);
-    await ensureNextMonthSheetExists(sheets, config);
     await refreshAdminCache(cache, config);
     await preloadSheetSnapshots(sheets, config, cache, { force: true });
   });
@@ -2827,7 +2834,6 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
     // The sync sends its own completion message via ctx when it finishes.
     handleSyncRosterAdminAction(ctx, config, {
       syncRosterState,
-      ensureNextMonthSheetExists,
       refreshAdminCache,
       preloadSheetSnapshots,
       resetConflictedQueueEntries,
@@ -2835,7 +2841,19 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       sheets,
       cache
     }).catch((error) => {
-      logBotError("Background roster sync error.", { error: error.message });
+      logBotError("[Admin] Roster sync error (unhandled).", { error: error.message });
+    });
+    return;
+  }
+
+  if (action === "clearprotections") {
+    // Fire-and-forget: may take several seconds if there are many protections.
+    handleClearProtectionsAdminAction(ctx, config, {
+      clearAllSheetProtections,
+      sendOrUpdateAdminMessage,
+      sheets
+    }).catch((error) => {
+      logBotError("[Admin] Clear protections error (unhandled).", { error: error.message });
     });
     return;
   }
@@ -3103,12 +3121,20 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
   rosterSyncInProgress = true;
 
   try {
+    logBot("[Admin] Roster sync started.");
     await deps.sendOrUpdateAdminMessage(
       ctx,
       "Syncing roster with Google Sheets. This may take a minute with a large roster — please wait."
     );
+
+    // syncRosterState → syncOnboardingRoster runs all 4 sync steps:
+    //   1. Sort ONBOARDING column A to canonical order
+    //   2–3. Sort + add new users in current and next month sheets
+    //   4. Check sheet formatting (prev month layout-only)
+    // ensureNextMonthSheetExists is intentionally NOT called here — it would
+    // trigger a second full syncOnboardingRoster run (all 4 steps again).
     const roster = await deps.syncRosterState(deps.sheets, config);
-    await deps.ensureNextMonthSheetExists(deps.sheets, config);
+
     await deps.refreshAdminCache(deps.cache, config);
 
     // Reload snapshots from the sheets that syncRosterState already repaired.
@@ -3128,12 +3154,18 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
       logBot("Roster sync: conflicted queue entries re-queued for retry.", { resetCount: resetResult.resetCount });
     }
 
+    logBot("[Admin] Roster sync complete.", {
+      prevMonth: roster.prevMonthTitle,
+      currentMonth: roster.currentMonthTitle,
+      nextMonth: roster.nextMonthTitle
+    });
+
     await deps.sendOrUpdateAdminMessage(
       ctx,
       `Roster synced from ${config.onboardingSheetTitle}. Last month: ${roster.prevMonthTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.${resetResult.resetCount > 0 ? ` (${resetResult.resetCount} previously stuck attendance ${resetResult.resetCount === 1 ? "entry" : "entries"} re-queued for retry.)` : ""}`
     );
   } catch (error) {
-    logBotError("Roster sync failed.", { error: error.message });
+    logBotError("[Admin] Roster sync failed.", { error: error.message });
     await deps.sendOrUpdateAdminMessage(
       ctx,
       `Roster sync failed: ${error.message}`
@@ -3141,6 +3173,32 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
     throw error;
   } finally {
     rosterSyncInProgress = false;
+  }
+}
+
+async function handleClearProtectionsAdminAction(ctx, config, deps) {
+  logBot("[Admin] Clear all protections started.");
+  await deps.sendOrUpdateAdminMessage(
+    ctx,
+    "Removing all sheet protections from the spreadsheet. Please wait…"
+  );
+
+  try {
+    const { removedCount } = await deps.clearAllSheetProtections(deps.sheets, config.spreadsheetId);
+    logBot("[Admin] Clear all protections complete.", { removedCount });
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      removedCount === 0
+        ? "✅ No protections found — the spreadsheet is already unprotected."
+        : `✅ Removed ${removedCount} protection${removedCount === 1 ? "" : "s"} from the spreadsheet.`
+    );
+  } catch (error) {
+    logBotError("[Admin] Clear all protections failed.", { error: error.message });
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      `❌ Failed to clear protections: ${error.message}`
+    );
+    throw error;
   }
 }
 
@@ -3157,6 +3215,8 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
     );
     return;
   }
+
+  logBot(`[Admin] Attendance push started.`, { queueDepth: status.queueDepth });
 
   await deps.sendOrUpdateAdminMessage(
     ctx,
@@ -3175,10 +3235,7 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
     const conflictedCount = outcome?.conflictedEvents?.length ?? 0;
     const skippedCount = outcome?.skippedEvents?.length ?? 0;
 
-    console.log(
-      `[Admin] Attendance push complete: ${writtenCount} written, ` +
-      `${skippedCount} skipped, ${conflictedCount} conflicted.`
-    );
+    logBot("[Admin] Attendance push complete.", { written: writtenCount, skipped: skippedCount, conflicted: conflictedCount });
 
     // Refresh in-memory snapshot so summary view reflects the newly written data.
     await deps.preloadSheetSnapshots(deps.sheets, config, deps.cache, {});
@@ -3228,8 +3285,9 @@ async function handleOptionsResetAction(ctx, config, deps) {
       async () => {
         await deps.resetAttendanceOptions();
         config.attendanceOptions = [...config.onboardingAttendanceOptions];
+        // syncRosterState → syncOnboardingRoster covers prev/current/next months.
+        // ensureNextMonthSheetExists omitted — it would trigger a duplicate full sync.
         await deps.syncRosterState(deps.sheets, config);
-        await deps.ensureNextMonthSheetExists(deps.sheets, config);
         await deps.refreshAdminCache(deps.adminCache, config);
         await deps.preloadSheetSnapshots(deps.sheets, config, deps.adminCache, { force: true });
       },
@@ -4792,7 +4850,6 @@ export function createAttendanceBot(config) {
       await handleOptionsResetAction(ctx, config, {
         resetAttendanceOptions,
         syncRosterState,
-        ensureNextMonthSheetExists,
         refreshAdminCache,
         preloadSheetSnapshots,
         sendOrUpdateAdminMessage,

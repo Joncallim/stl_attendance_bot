@@ -3066,9 +3066,9 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
       persist: false
     });
   }
-  // Normalise ONBOARDING row order to the canonical rank/department ordering.
-  // This runs on every maintenance cycle so newly added appointments (which land
-  // at the bottom) are sorted into the correct position automatically.
+  // Step 1: Sort Column A of ONBOARDING to canonical rank/department order so newly
+  // added appointments (which land at the bottom) are sorted into place automatically.
+  console.log(`[Sync] Step 1/4: Sorting ONBOARDING column A to canonical order…`);
   const rawOnboardingAppointments = onboardingSlice.appointments;
   const sortedOnboardingAppointments = orderAppointmentsCanonically(rawOnboardingAppointments);
   const orderChanged = rawOnboardingAppointments.some(
@@ -3089,6 +3089,8 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
       force: true,
       persist: false
     });
+  } else {
+    console.log(`[Sync] Step 1/4: ONBOARDING already in canonical order (${rawOnboardingAppointments.length} appointments).`);
   }
 
   const onboardingAppointments = onboardingSlice.appointments;
@@ -3111,17 +3113,26 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
     };
   }
 
-  // Previous month: layoutOnly — refresh formatting + protections without any row writes.
-  // Row-structure API calls on past sheets can timeout under load and would abort
-  // processing of the current and next month sheets that follow.
+  // Step 2 & 3: Sort month sheets by ONBOARDING order and include any new users.
+  // Previous month: layoutOnly — refresh formatting without any row writes (past sheets
+  // can timeout under load and would abort processing of current/next month sheets).
+  const prevMonthDate  = shiftMonth(new Date(), config.timezone, -1);
+  const nextMonthDate  = shiftMonth(new Date(), config.timezone, 1);
+  const prevMonthTitle = getMonthParts(prevMonthDate, config.timezone).title;
+  const currentMonthTitle = getMonthParts(new Date(), config.timezone).title;
+  const nextMonthTitle = getMonthParts(nextMonthDate, config.timezone).title;
+
+  console.log(`[Sync] Step 2/4: Checking formatting for previous month (${prevMonthTitle})…`);
   const prevMonth = await ensureMonthlyAttendanceSheet(
     sheets,
     config,
-    shiftMonth(new Date(), config.timezone, -1),
+    prevMonthDate,
     onboardingAppointments,
     "replace",
     { cache, layoutOnly: true }
   );
+
+  console.log(`[Sync] Step 3/4: Syncing current month (${currentMonthTitle}) — rows + formatting…`);
   const currentMonth = await ensureMonthlyAttendanceSheet(
     sheets,
     config,
@@ -3130,10 +3141,12 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
     "replace",
     { cache }
   );
+
+  console.log(`[Sync] Step 4/4: Syncing next month (${nextMonthTitle}) — rows + formatting…`);
   const nextMonth = await ensureMonthlyAttendanceSheet(
     sheets,
     config,
-    shiftMonth(new Date(), config.timezone, 1),
+    nextMonthDate,
     onboardingAppointments,
     "replace",
     { cache }
@@ -3787,6 +3800,53 @@ export async function summarizeAttendanceOptionUsage(sheets, config) {
       return left[0].localeCompare(right[0]);
     })
   );
+}
+
+/**
+ * Removes every protected range from the spreadsheet in a single batchUpdate.
+ * Useful as a one-shot admin action to clear any lingering bot-managed or
+ * manually-added protections after the protection-tracking code was removed.
+ */
+export async function clearAllSheetProtections(sheets, spreadsheetId) {
+  const spreadsheetData = await runGoogleSheetsRequestQueued(
+    "spreadsheets.get:clearProtections",
+    (signal) => sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: "sheets(properties(sheetId,title),protectedRanges(protectedRangeId,description))"
+    }, { signal })
+  );
+
+  const allProtections = (spreadsheetData.data.sheets ?? [])
+    .flatMap((sheet) => (sheet.protectedRanges ?? []).map((p) => ({
+      ...p,
+      sheetTitle: sheet.properties?.title ?? "(unknown)"
+    })))
+    .filter((p) => Number.isInteger(p.protectedRangeId));
+
+  if (allProtections.length === 0) {
+    logSheetsSuccess("clearAllSheetProtections: no protections found.");
+    return { removedCount: 0 };
+  }
+
+  logSheetsSuccess(`clearAllSheetProtections: removing ${allProtections.length} protection(s)…`);
+
+  const requests = allProtections.map((p) => ({
+    deleteProtectedRange: { protectedRangeId: p.protectedRangeId }
+  }));
+
+  await runGoogleSheetsRequestQueued(
+    `spreadsheets.batchUpdate:clearAllProtections(${requests.length})`,
+    (signal) => sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: { requests }
+    }, { signal })
+  );
+
+  logSheetsSuccess(`clearAllSheetProtections: removed ${allProtections.length} protection(s).`, {
+    sheets: [...new Set(allProtections.map((p) => p.sheetTitle))]
+  });
+
+  return { removedCount: allProtections.length };
 }
 
 export const __testing = {
