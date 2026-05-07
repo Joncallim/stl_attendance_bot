@@ -873,3 +873,67 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
 
   assert.deepEqual(prompts, ["chat-2"]);
 });
+
+test("queue status shows empty message when nothing is outstanding", async () => {
+  const messages = [];
+
+  await __testing.handleQueueStatusAdminAction(
+    {},
+    {
+      getAttendanceQueueStatus: async () => ({ queueDepth: 0, conflictedCount: 0, nextRetryAt: null }),
+      listPendingAttendanceEvents: async () => [],
+      sendOrUpdateAdminMessage: async (_ctx, message) => { messages.push(message); },
+      buildAdminMenu: () => ({})
+    }
+  );
+
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /No outstanding attendance/);
+});
+
+test("queue status lists pending entries grouped by date newest-first", async () => {
+  const messages = [];
+
+  await __testing.handleQueueStatusAdminAction(
+    {},
+    {
+      getAttendanceQueueStatus: async () => ({ queueDepth: 3, conflictedCount: 0, nextRetryAt: null }),
+      listPendingAttendanceEvents: async () => [
+        { appointment: "ALPHA", status: "PRESENT", date: "2026-05-06" },
+        { appointment: "BRAVO", status: "WFH", date: "2026-05-07" },
+        { appointment: "CHARLIE", status: "OS", date: "2026-05-06" }
+      ],
+      sendOrUpdateAdminMessage: async (_ctx, message) => { messages.push(message); },
+      buildAdminMenu: () => ({})
+    }
+  );
+
+  assert.equal(messages.length, 1);
+  const msg = messages[0];
+  // Should mention count
+  assert.match(msg, /3 outstanding/);
+  // Newest date (2026-05-07) should appear before older date (2026-05-06)
+  assert.ok(msg.indexOf("2026-05-07") < msg.indexOf("2026-05-06"));
+  // Each entry should appear
+  assert.match(msg, /ALPHA.*PRESENT/s);
+  assert.match(msg, /BRAVO.*WFH/s);
+  assert.match(msg, /CHARLIE.*OS/s);
+});
+
+test("queue status surfaces conflicted entries with sync reminder", async () => {
+  const messages = [];
+
+  await __testing.handleQueueStatusAdminAction(
+    {},
+    {
+      getAttendanceQueueStatus: async () => ({ queueDepth: 0, conflictedCount: 2, nextRetryAt: null }),
+      listPendingAttendanceEvents: async () => [],
+      sendOrUpdateAdminMessage: async (_ctx, message) => { messages.push(message); },
+      buildAdminMenu: () => ({})
+    }
+  );
+
+  assert.equal(messages.length, 1);
+  assert.match(messages[0], /2 conflicted/);
+  assert.match(messages[0], /Sync Roster/);
+});

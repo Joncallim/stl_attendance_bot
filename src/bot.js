@@ -561,12 +561,11 @@ function buildAdminMenu() {
       Markup.button.callback("🧾 Deregister Person", "admin:menu:deregister:0")
     ],
     [
-      Markup.button.callback("📤 Push Attendance", "admin:flushqueue")
+      Markup.button.callback("📤 Push Attendance", "admin:flushqueue"),
+      Markup.button.callback("📬 Outstanding", "admin:queue")
     ],
     [
-      Markup.button.callback("🔙 Back", "home:main")
-    ],
-    [
+      Markup.button.callback("🔙 Back", "home:main"),
       Markup.button.callback("❌ Close", "admin:close")
     ],
   ]);
@@ -574,12 +573,14 @@ function buildAdminMenu() {
 
 function buildAdminRosterMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("🕓 Pending", "admin:pending")],
+    [
+      Markup.button.callback("🕓 Pending", "admin:pending"),
+      Markup.button.callback("🔄 Sync Roster", "admin:syncroster")
+    ],
     [
       Markup.button.callback("➕ Add Appointment", "admin:appointments:add"),
       Markup.button.callback("➖ Remove Appointment", "admin:menu:appointments:remove:0")
     ],
-    [Markup.button.callback("🔄 Sync Roster", "admin:syncroster")],
     [Markup.button.callback("🔓 Clear All Protections", "admin:clearprotections")],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
@@ -2875,6 +2876,16 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
     return;
   }
 
+  if (action === "queue") {
+    await handleQueueStatusAdminAction(ctx, {
+      getAttendanceQueueStatus,
+      listPendingAttendanceEvents,
+      sendOrUpdateAdminMessage,
+      buildAdminMenu
+    });
+    return;
+  }
+
   if (action === "promptall") {
     await ensureSheetReadiness(sheets, config, cache);
     const users = (await listUsers()).filter((user) => user.appointment);
@@ -3270,6 +3281,62 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
       `❌ Push failed: ${error.message}\n\nThe queue will retry automatically in the background.`
     );
   }
+}
+
+/**
+ * Shows all attendance entries that are queued locally but not yet pushed to
+ * Google Sheets.  Groups them by date (newest-first) with a per-row breakdown
+ * of appointment → status so the admin can see exactly what will be written on
+ * the next push.  Also surfaces any conflicted entries so the admin knows a
+ * Sync Roster is needed before those can be pushed.
+ */
+async function handleQueueStatusAdminAction(ctx, deps) {
+  const [status, events] = await Promise.all([
+    deps.getAttendanceQueueStatus(),
+    deps.listPendingAttendanceEvents()
+  ]);
+
+  const pendingCount = status.queueDepth;
+  const conflictedCount = status.conflictedCount;
+
+  if (pendingCount === 0 && conflictedCount === 0) {
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      "✅ No outstanding attendance entries — the queue is empty.",
+      deps.buildAdminMenu()
+    );
+    return;
+  }
+
+  const lines = [];
+
+  if (pendingCount > 0) {
+    lines.push(`📬 *${pendingCount} outstanding attendance ${pendingCount === 1 ? "entry" : "entries"}*`);
+
+    // Group by date (YYYY-MM-DD strings), sort newest-first.
+    const byDate = new Map();
+    for (const event of events) {
+      if (!byDate.has(event.date)) byDate.set(event.date, []);
+      byDate.get(event.date).push(event);
+    }
+
+    const sortedDates = [...byDate.keys()].sort((a, b) => b.localeCompare(a));
+    for (const date of sortedDates) {
+      lines.push(`\n📅 *${date}*`);
+      for (const event of byDate.get(date)) {
+        lines.push(`• ${event.appointment} → ${event.status}`);
+      }
+    }
+  }
+
+  if (conflictedCount > 0) {
+    if (lines.length > 0) lines.push("");
+    lines.push(
+      `⚠️ *${conflictedCount} conflicted ${conflictedCount === 1 ? "entry" : "entries"}* — run 🔄 Sync Roster to fix the sheet layout, then push again.`
+    );
+  }
+
+  await deps.sendOrUpdateAdminMessage(ctx, lines.join("\n"), deps.buildAdminMenu());
 }
 
 async function handleOptionsResetAction(ctx, config, deps) {
@@ -5111,6 +5178,7 @@ export const __testing = {
   handleOnboardCommand,
   handleOptionsResetAction,
   handleFlushAttendanceAdminAction,
+  handleQueueStatusAdminAction,
   handleSyncRosterAdminAction,
   triggerBackgroundSheetRefresh,
   renderInviteSubmenu,
