@@ -8,7 +8,11 @@ import { getSingaporePublicHolidaySet } from "./holidays.js";
 import { ipv4HttpsAgent } from "./network.js";
 
 const SHEET_CACHE_FILE = () => getDataFile("sheet-cache.json");
-const SPREADSHEET_METADATA_TTL_MS = 15 * 60 * 1000;
+// spreadsheets.get (metadata) takes 10–109 s from this VPS under load.  Refreshing
+// every 15 min means the 1-minute background cycle will hammer the API the moment the
+// TTL expires, spiralling into consecutive timeouts.  45 min keeps the data fresh
+// enough for structural decisions while cutting the call frequency by 3×.
+const SPREADSHEET_METADATA_TTL_MS = 45 * 60 * 1000;
 const ONBOARDING_SLICE_TTL_MS = 2 * 60 * 1000;
 const MONTH_SLICE_TTL_MS = 60 * 1000;
 const DEFAULT_MAX_MANAGED_ROWS = 200;
@@ -1817,6 +1821,15 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     mode
   });
 
+  // Detect and log when the row order in the month sheet differs from ONBOARDING
+  // (pure reorder — no inserts or deletes). The rows ARE rewritten correctly via
+  // value-swap in writeMonthlySheetRows; this log just makes it visible.
+  const orderMismatch = existingAppointments.appointments.length === nextAppointments.length &&
+    existingAppointments.appointments.some((apt, i) => apt !== nextAppointments[i]);
+  if (orderMismatch) {
+    logSheetsSuccess(`[${title}] Row order differs from ONBOARDING — resorting rows to canonical order.`);
+  }
+
   await writeMonthlySheetRows(
     sheets,
     config.spreadsheetId,
@@ -3053,11 +3066,15 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
       persist: false
     });
   } else if (onboardingSlice.stopMarkerMissing) {
+    // Sort before writing the stop-marker fix so only ONE write is needed.
+    // Writing unsorted then sorting separately causes two batchUpdate calls,
+    // doubling the quota usage and timeout risk.
+    const sortedForStopMarker = orderAppointmentsCanonically(onboardingSlice.appointments);
     await writeAppointmentColumn(
       sheets,
       config.spreadsheetId,
       title,
-      onboardingSlice.appointments,
+      sortedForStopMarker,
       { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
     );
     onboardingSlice = await refreshOnboardingSlice(sheets, config, {
@@ -3068,6 +3085,8 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
   }
   // Step 1: Sort Column A of ONBOARDING to canonical rank/department order so newly
   // added appointments (which land at the bottom) are sorted into place automatically.
+  // When the stop-marker write above already sorted, orderChanged will be false here
+  // and no second write is needed.
   console.log(`[Sync] Step 1/4: Sorting ONBOARDING column A to canonical order…`);
   const rawOnboardingAppointments = onboardingSlice.appointments;
   const sortedOnboardingAppointments = orderAppointmentsCanonically(rawOnboardingAppointments);
@@ -3806,17 +3825,36 @@ export async function summarizeAttendanceOptionUsage(sheets, config) {
  * Removes every protected range from the spreadsheet in a single batchUpdate.
  * Useful as a one-shot admin action to clear any lingering bot-managed or
  * manually-added protections after the protection-tracking code was removed.
+ *
+ * Uses the process-level metadata cache (populated by the background sync cycle)
+ * rather than making a fresh spreadsheets.get call — that call can take 30–120 s
+ * under API congestion and would reliably time out.  If the cache is empty (very
+ * first bot run before the first successful sync), it falls back to a live call.
  */
 export async function clearAllSheetProtections(sheets, spreadsheetId) {
-  const spreadsheetData = await runGoogleSheetsRequestQueued(
-    "spreadsheets.get:clearProtections",
-    (signal) => sheets.spreadsheets.get({
-      spreadsheetId,
-      fields: "sheets(properties(sheetId,title),protectedRanges(protectedRangeId,description))"
-    }, { signal })
-  );
+  // Prefer cached spreadsheet metadata so we don't need a live spreadsheets.get.
+  // The metadata TTL is 45 min; protections change far less often than that.
+  let sheetsMeta;
+  const processEntry = processSpreadsheetCache.get(sheets);
 
-  const allProtections = (spreadsheetData.data.sheets ?? [])
+  if (processEntry?.data?.sheets) {
+    logSheetsSuccess("clearAllSheetProtections: reading protections from cached metadata.");
+    sheetsMeta = processEntry.data.sheets;
+  } else {
+    logSheetsSuccess("clearAllSheetProtections: cache empty — fetching live metadata.");
+    const result = await runGoogleSheetsRequestQueued(
+      "spreadsheets.get:clearProtections",
+      (signal) => sheets.spreadsheets.get({
+        spreadsheetId,
+        fields: "sheets(properties(sheetId,title),protectedRanges(protectedRangeId,description))"
+      }, { signal })
+    );
+    sheetsMeta = result.data.sheets ?? [];
+    // Update the process cache so subsequent calls (e.g. ensureSheet) benefit too.
+    processSpreadsheetCache.set(sheets, { data: result.data, fetchedAt: new Date().toISOString() });
+  }
+
+  const allProtections = (sheetsMeta ?? [])
     .flatMap((sheet) => (sheet.protectedRanges ?? []).map((p) => ({
       ...p,
       sheetTitle: sheet.properties?.title ?? "(unknown)"
