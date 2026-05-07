@@ -137,7 +137,7 @@ test("invite command reports missing appointments", async () => {
 test("admin menu description includes the current pre-v1 version", () => {
   const description = __testing.buildAdminMenuDescription();
 
-  assert.match(description, /^Admin Menu \(v0\.9\.20\)/);
+  assert.match(description, /^Admin Menu \(v0\.9\.21\)/);
 });
 
 test("triggerBackgroundSheetRefresh starts a non-blocking refresh when idle", () => {
@@ -688,9 +688,9 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
     intervals.map((entry) => entry.delay),
     [60 * 1000, 5 * 60 * 1000]
   );
-  // First cron is midnight structural maintenance; second is 00:05 queue compaction.
-  assert.equal(schedules[0].expression, "0 0 * * *");
-  assert.equal(schedules[1].expression, "5 0 * * *");
+  // First cron is 2 AM structural maintenance; second is 02:05 queue compaction.
+  assert.equal(schedules[0].expression, "0 2 * * *");
+  assert.equal(schedules[1].expression, "5 2 * * *");
   assert.ok(schedules.some((entry) => entry.expression === "0 7 * * *"));
   assert.ok(schedules.some((entry) => entry.expression === "0 8 * * *"));
   // Startup cycle is now lightweight (force: false).

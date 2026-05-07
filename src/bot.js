@@ -64,7 +64,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.20";
+export const BOT_VERSION = "v0.9.21";
 
 function logBot(message, details = null) {
   const ts = new Date().toISOString();
@@ -3274,13 +3274,13 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
       logBotError("Initial startup sync/sort failed.", { error: error.message });
     });
 
-  // If maintenance hasn't run in over 20 hours, schedule it shortly after startup
-  // rather than waiting until the next midnight cron.  Wait for the startup sync
+  // If maintenance hasn't run in over 22 hours, schedule it shortly after startup
+  // rather than waiting until the next 2 AM cron.  Wait for the startup sync
   // to finish first so we don't flood the API.
   Promise.all([getLastStructuralMaintenanceAt(), getLastStructuralMaintenanceAttemptAt()])
     .then(([lastMaintenanceAt, lastAttemptAt]) => {
       const lastMaint = lastMaintenanceAt ? Date.parse(lastMaintenanceAt) : 0;
-      const staleMs = 20 * 60 * 60 * 1000; // 20 hours
+      const staleMs = 22 * 60 * 60 * 1000; // 22 hours — matches the 2 AM maintenance window
 
       if (Date.now() - lastMaint > staleMs) {
         // If a maintenance run was attempted recently (e.g. midnight cron just fired
@@ -3321,7 +3321,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
       }
     })
     .catch(() => {
-      // Non-fatal; the midnight cron will run maintenance at the next opportunity.
+      // Non-fatal; the 2 AM cron will run maintenance at the next opportunity.
     });
 
   setIntervalFn(async () => {
@@ -3340,11 +3340,15 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
     }
   }, 5 * 60 * 1000);
 
-  // Midnight: full structural maintenance (sheet creation, row sync, layout, protections).
+  // 2 AM SGT (18:00 UTC): full structural maintenance (sheet creation, row sync, layout, protections).
+  // Runs at 2 AM rather than midnight to avoid peak Google API congestion.
   scheduleFn(
-    "0 0 * * *",
+    "0 2 * * *",
     async () => {
-      logBot("[Maint] Midnight sheet maintenance starting.");
+      logBot("[Maint] 2 AM sheet maintenance starting.");
+      // Block background sync cycles for the duration of maintenance so they don't
+      // fire a redundant preload while runDailySheetMaintenance is running.
+      adminCache.syncManager.setMaintenanceRunning(true);
       try {
         await runDailySheetMaintenanceFn(sheets, config);
         await syncAppointmentRegistry();
@@ -3355,17 +3359,19 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         );
         await refreshAdminCache(adminCache, config);
         await refreshAttendanceOptionUsageFn(sheets, config, adminCache);
-        logBot("[Maint] Midnight sheet maintenance complete.");
+        logBot("[Maint] 2 AM sheet maintenance complete.");
       } catch (error) {
-        logBotError("[Maint] Midnight sheet maintenance failed.", { error: error.message });
+        logBotError("[Maint] 2 AM sheet maintenance failed.", { error: error.message });
+      } finally {
+        adminCache.syncManager.setMaintenanceRunning(false);
       }
     },
     { timezone: config.timezone }
   );
 
-  // 00:05: queue compaction only (cheap local file operation).
+  // 02:05 SGT: queue compaction only (cheap local file operation).
   scheduleFn(
-    "5 0 * * *",
+    "5 2 * * *",
     async () => {
       try {
         const result = await compactAttendanceQueue();
