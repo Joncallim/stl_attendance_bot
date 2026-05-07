@@ -41,7 +41,8 @@ const GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS = 1000;
 const GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS = 3000;
 // Number of consecutive timeouts that triggers congestion mode.
 const GOOGLE_SHEETS_CONGESTION_THRESHOLD = 3;
-const MONTHLY_PROTECTION_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
+// Dark background applied to pre-join-date cells for appointments inserted mid-month.
+const JOIN_DATE_BLACKOUT_COLOUR = { red: 0.15, green: 0.15, blue: 0.15 };
 const runtimeSheetContext = new WeakMap();
 // Process-level spreadsheet cache: shared across all cache objects that use the same
 // sheets client, so different code paths that each create a fresh cache object from
@@ -49,8 +50,6 @@ const runtimeSheetContext = new WeakMap();
 // Keyed by the sheets client object itself (WeakMap) so tests with fresh client
 // instances are always isolated.
 const processSpreadsheetCache = new WeakMap();
-const ensuredMonthlySheetProtectionIds = new Set();
-const monthlySheetProtectionFailureUntil = new Map();
 let activeGoogleSheetsRequests = 0;
 // Tracks consecutive timeout failures across all queued requests. Drives
 // congestion detection: when this hits GOOGLE_SHEETS_CONGESTION_THRESHOLD,
@@ -537,7 +536,6 @@ function buildDefaultSheetCache() {
   return {
     updatedAt: null,
     lastStructuralMaintenanceAt: null,
-    maintainedSheetProtectionIds: [],
     spreadsheetMetadata: {
       fetchedAt: null,
       sheetIdsByTitle: {}
@@ -1572,12 +1570,31 @@ async function buildDisabledDayFormattingRequests(sheetId, date, timezone, rowLi
   return requests;
 }
 
-async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, header, options, timezone, rowCount = 0) {
+async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, header, options, timezone, rowCount = 0, existingProtections = []) {
   const rowLimit = managedRowLimit(rowCount);
+
+  // Remove any bot-managed protections that were added by earlier versions.
+  // Protections are identified by the "attendance-bot:" description prefix.
+  const removeProtectionRequests = existingProtections
+    .filter((p) => String(p.description ?? "").startsWith("attendance-bot:") && Number.isInteger(p.protectedRangeId))
+    .map((p) => ({ deleteProtectedRange: { protectedRangeId: p.protectedRangeId } }));
+
   const requests = [
+    ...removeProtectionRequests,
     buildHeaderUpdateRequest(sheetId, header),
     buildAttendanceValidationRequest(sheetId, header.length, options, rowLimit),
-    ...(await buildDisabledDayFormattingRequests(sheetId, date, timezone, rowLimit))
+    ...(await buildDisabledDayFormattingRequests(sheetId, date, timezone, rowLimit)),
+    // Auto-fit column A width to the longest appointment name on each layout refresh.
+    {
+      autoResizeDimensions: {
+        dimensions: {
+          sheetId,
+          dimension: "COLUMNS",
+          startIndex: 0,
+          endIndex: 1
+        }
+      }
+    }
   ];
 
   await runGoogleSheetsRequest(`spreadsheets.batchUpdate:${sheetId}:layout`, (signal) =>
@@ -1588,148 +1605,6 @@ async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, hea
       }
     }, { signal })
   );
-}
-
-function buildMonthlySheetProtectionRequests(sheet, serviceAccountEmail) {
-  const protectedRanges = sheet?.protectedRanges ?? [];
-  const existingDescriptions = new Set(
-    protectedRanges
-      .map((range) => String(range.description ?? "").trim())
-      .filter(Boolean)
-  );
-  const editors = serviceAccountEmail ? { users: [serviceAccountEmail] } : undefined;
-  const requests = [];
-
-  if (!existingDescriptions.has("attendance-bot:protect-header-row")) {
-    requests.push({
-      addProtectedRange: {
-        protectedRange: {
-          description: "attendance-bot:protect-header-row",
-          range: {
-            sheetId: sheet.properties.sheetId,
-            startRowIndex: 0,
-            endRowIndex: 1
-          },
-          editors,
-          warningOnly: false
-        }
-      }
-    });
-  }
-
-  if (!existingDescriptions.has("attendance-bot:protect-appointment-column")) {
-    requests.push({
-      addProtectedRange: {
-        protectedRange: {
-          description: "attendance-bot:protect-appointment-column",
-          range: {
-            sheetId: sheet.properties.sheetId,
-            startColumnIndex: 0,
-            endColumnIndex: 1
-          },
-          editors,
-          warningOnly: false
-        }
-      }
-    });
-  }
-
-  return requests;
-}
-
-async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, serviceAccountEmail, options = {}) {
-  const sheetId = Number(sheet?.properties?.sheetId);
-
-  if (!Number.isFinite(sheetId)) {
-    return;
-  }
-
-  if (ensuredMonthlySheetProtectionIds.has(sheetId)) {
-    return;
-  }
-
-  const failureUntil = monthlySheetProtectionFailureUntil.get(sheetId) ?? 0;
-
-  if (failureUntil > Date.now()) {
-    return;
-  }
-
-  const requests = buildMonthlySheetProtectionRequests(sheet, serviceAccountEmail);
-
-  if (requests.length === 0) {
-    ensuredMonthlySheetProtectionIds.add(sheetId);
-    await persistProtectionId(sheetId, options.cache);
-    return;
-  }
-
-  try {
-    await runGoogleSheetsRequest(
-      `spreadsheets.batchUpdate:${sheetId}:protections`,
-      (signal) =>
-        sheets.spreadsheets.batchUpdate({
-          spreadsheetId,
-          requestBody: {
-            requests
-          }
-        }, { signal }),
-      {
-        maxAttempts: 1,
-        timeoutMs: GOOGLE_SHEETS_REQUEST_TIMEOUT_MS
-      }
-    );
-    ensuredMonthlySheetProtectionIds.add(sheetId);
-    monthlySheetProtectionFailureUntil.delete(sheetId);
-    await persistProtectionId(sheetId, options.cache);
-    logSheetsSuccess("Monthly sheet protections ensured.", {
-      title: sheet?.properties?.title ?? null,
-      sheetId,
-      requestCount: requests.length
-    });
-  } catch (error) {
-    monthlySheetProtectionFailureUntil.set(
-      sheetId,
-      Date.now() + MONTHLY_PROTECTION_FAILURE_COOLDOWN_MS
-    );
-    logSheetsWarn(`Sheet ${sheetId}: protections skipped after failure (cooldown 30 min).`, { error: error.message });
-  }
-}
-
-async function persistProtectionId(sheetId, cache) {
-  // Persist the sheetId so future process restarts skip re-running the batchUpdate.
-  // If a cache object is provided, mutate it in-place and let the caller persist;
-  // otherwise do a targeted read-modify-write on the local cache file.
-  const MAX_MAINTAINED_IDS = 24; // ~2 years of monthly sheets
-
-  if (cache) {
-    if (!Array.isArray(cache.maintainedSheetProtectionIds)) {
-      cache.maintainedSheetProtectionIds = [];
-    }
-    if (!cache.maintainedSheetProtectionIds.includes(sheetId)) {
-      cache.maintainedSheetProtectionIds = [
-        ...cache.maintainedSheetProtectionIds.slice(-(MAX_MAINTAINED_IDS - 1)),
-        sheetId
-      ];
-    }
-    return;
-  }
-
-  // No cache object in scope — read-modify-write the file directly.
-  try {
-    const existing = await readLocalSheetCache();
-    const ids = Array.isArray(existing.maintainedSheetProtectionIds)
-      ? existing.maintainedSheetProtectionIds
-      : [];
-
-    if (!ids.includes(sheetId)) {
-      existing.maintainedSheetProtectionIds = [
-        ...ids.slice(-(MAX_MAINTAINED_IDS - 1)),
-        sheetId
-      ];
-      await writeLocalSheetCache(existing);
-    }
-  } catch {
-    // Non-fatal — we already have the in-memory set populated.
-  }
 }
 
 async function ensureHeaderRowIfBlank(sheets, spreadsheetId, title, header) {
@@ -1810,6 +1685,10 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
   const defaultHeader = getDefaultHeaderRow(date, config.timezone);
   let monthlySheetValues = null;
 
+  // Existing protections on the sheet — used by applyMonthlySheetLayout to issue
+  // deleteProtectedRange requests for any bot-managed ranges in the same batchUpdate.
+  const existingProtections = sheet.protectedRanges ?? [];
+
   if (ensuredSheet.created) {
     await applyMonthlySheetLayout(
       sheets,
@@ -1819,7 +1698,8 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
       defaultHeader,
       config.attendanceOptions,
       config.timezone,
-      appointments.length
+      appointments.length,
+      [] // new sheet has no protections to remove
     );
     monthlySheetValues = [defaultHeader];
   } else {
@@ -1846,19 +1726,13 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
         layoutHeader,
         config.attendanceOptions,
         config.timezone,
-        appointments.length
+        appointments.length,
+        existingProtections // remove any lingering bot-managed protections
       );
     }
   }
-  await ensureMonthlySheetProtections(
-    sheets,
-    config.spreadsheetId,
-    sheet,
-    config.googleServiceAccountEmail,
-    { cache: options.cache }
-  );
 
-  // layoutOnly: layout + protections applied above; skip all row reads/writes.
+  // layoutOnly: layout applied above; skip all row reads/writes.
   // Used for the previous month to avoid row-structure API calls that can timeout
   // and abort processing of the current and next month.
   if (options.layoutOnly === true) {
@@ -1955,6 +1829,64 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     nextRows,
     config.rosterStopMarkers
   );
+
+  // Join-date blackout: when new appointments are inserted into the current month
+  // mid-month, shade the date columns before their join day with a dark background
+  // so it's visually clear those days predate their enrolment.
+  // Only applies to the current month (future months have no past days; previous
+  // month uses layoutOnly and never reaches this point).
+  const thisMonthTitle = getMonthParts(new Date(), config.timezone).title;
+
+  if (title === thisMonthTitle) {
+    const today = dayOfMonth(new Date(), config.timezone);
+
+    if (today > 1) {
+      const existingApptSet = new Set(existingAppointments.appointments);
+      const newAppts = nextAppointments.filter((apt) => !existingApptSet.has(apt));
+
+      if (newAppts.length > 0) {
+        const dateColMap = buildDateColumnMap(header, date, config.timezone);
+        const startCol = dateColMap.get(1);
+        const endCol = dateColMap.get(today - 1); // last day to shade (inclusive)
+
+        if (startCol !== undefined && endCol !== undefined) {
+          const blackoutRequests = newAppts.map((apt) => {
+            const rowIndex = nextAppointments.indexOf(apt) + 1; // 0-indexed; +1 skips header row
+            return {
+              repeatCell: {
+                range: {
+                  sheetId: sheet.properties.sheetId,
+                  startRowIndex: rowIndex,
+                  endRowIndex: rowIndex + 1,
+                  startColumnIndex: startCol,
+                  endColumnIndex: endCol + 1 // exclusive
+                },
+                cell: {
+                  userEnteredFormat: {
+                    backgroundColor: JOIN_DATE_BLACKOUT_COLOUR
+                  }
+                },
+                fields: "userEnteredFormat.backgroundColor"
+              }
+            };
+          });
+
+          await runGoogleSheetsRequest(
+            `spreadsheets.batchUpdate:${sheet.properties.sheetId}:joinBlackout`,
+            (signal) => sheets.spreadsheets.batchUpdate({
+              spreadsheetId: config.spreadsheetId,
+              requestBody: { requests: blackoutRequests }
+            }, { signal })
+          );
+
+          logSheetsSuccess(`[${title}] Join-date blackout applied.`, {
+            appointments: newAppts,
+            daysBlanked: today - 1
+          });
+        }
+      }
+    }
+  }
 
   logSheetsSuccess("Monthly attendance sheet synchronized.", {
     title,
@@ -2351,17 +2283,8 @@ async function readLocalSheetCache() {
       ...(cache?.spreadsheetMetadata ?? {})
     },
     monthSlices: { ...(cache?.monthSlices ?? {}) },
-    snapshots: { ...(cache?.snapshots ?? {}) },
-    maintainedSheetProtectionIds: Array.isArray(cache?.maintainedSheetProtectionIds)
-      ? cache.maintainedSheetProtectionIds
-      : []
+    snapshots: { ...(cache?.snapshots ?? {}) }
   };
-
-  // Hydrate the in-memory protection set from the persisted list so cold restarts
-  // don't re-fire batchUpdate protection requests on already-protected sheets.
-  for (const sheetId of merged.maintainedSheetProtectionIds) {
-    ensuredMonthlySheetProtectionIds.add(Number(sheetId));
-  }
 
   return merged;
 }
@@ -3143,6 +3066,31 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
       persist: false
     });
   }
+  // Normalise ONBOARDING row order to the canonical rank/department ordering.
+  // This runs on every maintenance cycle so newly added appointments (which land
+  // at the bottom) are sorted into the correct position automatically.
+  const rawOnboardingAppointments = onboardingSlice.appointments;
+  const sortedOnboardingAppointments = orderAppointmentsCanonically(rawOnboardingAppointments);
+  const orderChanged = rawOnboardingAppointments.some(
+    (apt, i) => apt !== sortedOnboardingAppointments[i]
+  );
+
+  if (orderChanged) {
+    logSheetsSuccess(`[ONBOARDING] Normalising row order (${rawOnboardingAppointments.length} appointments).`);
+    await writeAppointmentColumn(
+      sheets,
+      config.spreadsheetId,
+      title,
+      sortedOnboardingAppointments,
+      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
+    );
+    onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+      cache,
+      force: true,
+      persist: false
+    });
+  }
+
   const onboardingAppointments = onboardingSlice.appointments;
   logSheetsVerbose(`syncOnboardingRoster: ONBOARDING has ${onboardingAppointments.length} appointments`);
   const driftDetected =
@@ -3861,13 +3809,9 @@ export const __testing = {
   parseOnboardingManagedRows,
   runGoogleSheetsRequest,
   ensureHeaderRowIfBlank,
-  ensureMonthlySheetProtections,
   getExpectedDateHeaderLabel,
   getMonthParts,
   shiftMonth,
   writeMonthlySheetRows,
-  writeAppointmentColumn,
-  clearEnsuredMonthlySheetProtectionIds() {
-    ensuredMonthlySheetProtectionIds.clear();
-  }
+  writeAppointmentColumn
 };
