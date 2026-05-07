@@ -29,13 +29,16 @@ const GOOGLE_SHEETS_REQUEST_TIMEOUT_MS = 15000;
 // take >15 s under load regardless of payload size. Targeted increase for this operation only.
 const GOOGLE_SHEETS_ROW_STRUCTURE_TIMEOUT_MS = 30000;
 const GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS = 5000;
-// Minimum gap between consecutive Sheets API calls. Google throttles rapid
-// bursts from the same service-account token (not with 429s but with silent
-// hangs), so we pace the queue to avoid that during startup.
-const GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS = 250;
-// When ≥3 consecutive timeouts are detected, slow the inter-request gap to
-// reduce pressure on the API and allow in-flight retries to complete.
-const GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS = 2000;
+// Minimum gap between consecutive Sheets API calls.
+// Google Sheets enforces a quota of 60 read/write requests per minute per user
+// (service account). At 1000 ms spacing the semaphore queue fires at most
+// ~60 req/min, staying safely within that limit. Values below ~1000 ms risk
+// silently exceeding the quota and triggering throttling that manifests as
+// 15-second hangs rather than explicit 429 errors.
+const GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS = 1000;
+// When ≥3 consecutive timeouts are detected, slow the inter-request gap further
+// to give the API time to recover before the next request is queued.
+const GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS = 3000;
 // Number of consecutive timeouts that triggers congestion mode.
 const GOOGLE_SHEETS_CONGESTION_THRESHOLD = 3;
 const MONTHLY_PROTECTION_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
