@@ -55,12 +55,15 @@ function acquireSheetsSemaphore(fn) {
 }
 
 function logSheetsSuccess(message, details = null) {
-  if (details) {
-    console.log(`${message} ${JSON.stringify(details)}`);
-    return;
-  }
+  const ts = new Date().toISOString();
+  const suffix = details ? ` ${JSON.stringify(details)}` : "";
+  console.log(`[${ts}] [Sheets] ${message}${suffix}`);
+}
 
-  console.log(message);
+function logSheetsWarn(message, details = null) {
+  const ts = new Date().toISOString();
+  const suffix = details ? ` ${JSON.stringify(details)}` : "";
+  console.warn(`[${ts}] [Sheets] ${message}${suffix}`);
 }
 const ATTENDANCE_STATUS_ALIAS_MAP = new Map([
   ["PUBLIC HOLIDAY", "PH"],
@@ -1569,9 +1572,7 @@ async function ensureMonthlySheetProtections(sheets, spreadsheetId, sheet, servi
       sheetId,
       Date.now() + MONTHLY_PROTECTION_FAILURE_COOLDOWN_MS
     );
-    console.warn(
-      `Skipping monthly sheet protections for sheet ${sheetId} after failure: ${error.message}`
-    );
+    logSheetsWarn(`Sheet ${sheetId}: protections skipped after failure (cooldown 30 min).`, { error: error.message });
   }
 }
 
@@ -1712,11 +1713,12 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
       monthlySheetValues = [defaultHeader, ...monthlySheetValues.slice(1)];
     }
 
-    // Structural sync ("replace" mode) or explicit applyLayout flag: re-apply layout so that
-    // data validation dropdowns and weekend/holiday greying are always up-to-date on existing
-    // sheets, not just new ones. applyLayout is used for the previous month (merge mode)
-    // where we want formatting without touching row structure.
-    if (mode === "replace" || options.applyLayout === true) {
+    // Structural sync ("replace" mode), explicit applyLayout, or layoutOnly flag: re-apply
+    // layout so that data validation dropdowns and weekend/holiday greying are always
+    // up-to-date on existing sheets, not just new ones.
+    // layoutOnly is used for the previous month where we want formatting refreshed but must
+    // never touch row structure (avoids row-insert timeouts that block current/next months).
+    if (mode === "replace" || options.applyLayout === true || options.layoutOnly === true) {
       const layoutHeader = getHeaderRowFromValues(monthlySheetValues, defaultHeader);
       await applyMonthlySheetLayout(
         sheets,
@@ -1737,6 +1739,15 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     config.googleServiceAccountEmail,
     { cache: options.cache }
   );
+
+  // layoutOnly: layout + protections applied above; skip all row reads/writes.
+  // Used for the previous month to avoid row-structure API calls that can timeout
+  // and abort processing of the current and next month.
+  if (options.layoutOnly === true) {
+    logSheetsSuccess(`[${title}] Layout refreshed (layout-only — row structure preserved).`);
+    return { title, appointments: [...appointments], layoutOnly: true };
+  }
+
   const onboardingAppointments = await readCanonicalOnboardingAppointments(sheets, config, {
     cache: options.cache,
     force: options.forceOnboarding === true,
@@ -1790,10 +1801,9 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
   }
 
   if ((liveSlice.unexpectedAppointments?.length ?? 0) > 0) {
-    console.warn(
-      `[${title}] Structural sync: removing ${liveSlice.unexpectedAppointments.length} unexpected row(s) ` +
-      `not in ONBOARDING: ${liveSlice.unexpectedAppointments.join(", ")}`
-    );
+    logSheetsWarn(`[${title}] Structural sync: removing ${liveSlice.unexpectedAppointments.length} unexpected row(s) not in ONBOARDING.`, {
+      removed: liveSlice.unexpectedAppointments
+    });
   }
 
   const { nextAppointments, nextRows } = buildManagedMonthlyRows({
@@ -2726,14 +2736,17 @@ async function refreshMonthSlice(sheets, config, input, options = {}) {
   });
   // Structural ops (sheet creation, row sync, layout, protections) are expensive.
   // Only run when explicitly requested (e.g. runDailySheetMaintenance or admin actions).
+  // Previous month uses layoutOnly to avoid row-structure changes on historical data.
   if (options.structural === true && isManagedMonthlyDate(date, config.timezone)) {
+    const prevTitle = getMonthParts(shiftMonth(new Date(), config.timezone, -1), config.timezone).title;
+    const isPrevMonth = getMonthParts(date, config.timezone).title === prevTitle;
     await ensureMonthlyAttendanceSheet(
       sheets,
       config,
       date,
       onboardingSlice.appointments,
       "replace",
-      { cache }
+      { cache, ...(isPrevMonth ? { layoutOnly: true } : {}) }
     );
   }
   const rowLimit = managedRowLimit(onboardingSlice.appointments.length);
@@ -3023,15 +3036,16 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
     };
   }
 
-  // Previous month: merge mode (preserves historical rows for ex-members) + applyLayout
-  // so that formatting and data validation are refreshed without row restructuring.
+  // Previous month: layoutOnly — refresh formatting + protections without any row writes.
+  // Row-structure API calls on past sheets can timeout under load and would abort
+  // processing of the current and next month sheets that follow.
   const prevMonth = await ensureMonthlyAttendanceSheet(
     sheets,
     config,
     shiftMonth(new Date(), config.timezone, -1),
     onboardingAppointments,
-    "merge",
-    { cache, applyLayout: true }
+    "replace",
+    { cache, layoutOnly: true }
   );
   const currentMonth = await ensureMonthlyAttendanceSheet(
     sheets,

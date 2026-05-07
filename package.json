@@ -1,6 +1,6 @@
 {
   "name": "attendance-bot",
-  "version": "0.9.19",
+  "version": "0.9.20",
   "description": "Telegram bot that collects attendance and writes responses to Google Sheets.",
   "type": "module",
   "main": "src/index.js",
