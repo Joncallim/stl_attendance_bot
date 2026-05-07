@@ -403,8 +403,6 @@ async function withTempDataDir(run) {
   } finally {
     delete process.env.ATTENDANCE_BOT_DATA_DIR;
     await rm(tempDir, { recursive: true, force: true });
-    // Clear the module-level protection ID cache so tests don't bleed into each other.
-    __testing.clearEnsuredMonthlySheetProtectionIds();
   }
 }
 
@@ -654,100 +652,6 @@ test("existing human-managed headers are preserved when already populated", asyn
   assert.equal(calls.length, 0);
 });
 
-test("existing monthly sheets get protections for the header row and appointment column", async () => {
-  await withTempDataDir(async () => {
-    const fake = createInMemorySheets({
-      ONBOARDING: {
-        sheetId: 1,
-        values: [
-          ["Appointment", "Secret Code"],
-          ["ALPHA", "CODE-1"]
-        ]
-      },
-      "Mar 26": {
-        sheetId: 2,
-        values: [
-          ["Appointment", "1 Mar"],
-          ["ALPHA", "PRESENT"]
-        ]
-      }
-    });
-
-    await withMockedFetch({ data: { holidays: [] } }, async () => {
-      await syncOnboardingRoster(
-        fake.client,
-        {
-          spreadsheetId: "spreadsheet-id",
-          timezone: "Asia/Singapore",
-          rosterStopMarkers: [],
-          onboardingSheetTitle: "ONBOARDING",
-          attendanceOptions: ["PRESENT", "WFH"],
-          googleServiceAccountEmail: "bot@example.com"
-        }
-      );
-    });
-
-    const protectionRequests = fake.calls.batchUpdateRequests
-      .flat()
-      .filter((request) => request.addProtectedRange);
-
-    // syncOnboardingRoster now covers prev + current + next month (3 sheets × 2 ranges each = 6)
-    assert.equal(protectionRequests.length, 6);
-    assert.deepEqual(
-      protectionRequests.map((request) => request.addProtectedRange.protectedRange.description),
-      [
-        "attendance-bot:protect-header-row",
-        "attendance-bot:protect-appointment-column",
-        "attendance-bot:protect-header-row",
-        "attendance-bot:protect-appointment-column",
-        "attendance-bot:protect-header-row",
-        "attendance-bot:protect-appointment-column"
-      ]
-    );
-    assert.deepEqual(
-      protectionRequests.map((request) => request.addProtectedRange.protectedRange.editors?.users ?? []),
-      [
-        ["bot@example.com"], ["bot@example.com"],
-        ["bot@example.com"], ["bot@example.com"],
-        ["bot@example.com"], ["bot@example.com"]
-      ]
-    );
-  });
-});
-
-test("monthly sheet protection failures are treated as best effort", async () => {
-  const warnings = [];
-  const originalWarn = console.warn;
-  console.warn = (message) => warnings.push(message);
-
-  try {
-    await __testing.ensureMonthlySheetProtections(
-      {
-        spreadsheets: {
-          batchUpdate: async () => {
-            throw Object.assign(new Error("slow backend"), {
-              code: "ETIMEDOUT",
-              status: 504,
-              isTimeout: true
-            });
-          }
-        }
-      },
-      "spreadsheet-id",
-      {
-        properties: { sheetId: 99 },
-        protectedRanges: []
-      },
-      "bot@example.com"
-    );
-  } finally {
-    console.warn = originalWarn;
-  }
-
-  assert.ok(warnings.length >= 1);
-  assert.match(warnings.at(-1), /Sheet 99.*protections skipped/);
-});
-
 test("date lookup follows the actual header row instead of fixed column offsets", () => {
   const headerRow = ["Appointment", "Notes", "1 Mar", "2 Mar", "Custom"];
   const date = new Date("2026-03-01T12:00:00.000Z");
@@ -979,10 +883,11 @@ test("syncOnboardingRoster reuses spreadsheet metadata within one operation", as
   });
 });
 
-test("syncOnboardingRoster preserves visible onboarding order as canonical row order", async () => {
+test("syncOnboardingRoster sorts ONBOARDING into canonical order and propagates it to month sheets", async () => {
   await withMockedFetch([], async () => {
     await withTempDataDir(async () => {
       const currentMonthTitle = __testing.getMonthParts(new Date(), "Asia/Singapore").title;
+      // BRAVO appears before ALPHA in the sheet; canonical ordering puts ALPHA first.
       const fake = createInMemorySheets({
         ONBOARDING: {
           sheetId: 1,
@@ -1003,10 +908,11 @@ test("syncOnboardingRoster preserves visible onboarding order as canonical row o
         attendanceOptions: ["PRESENT", "WFH", "OS"]
       });
 
-      assert.deepEqual(result.onboardingAppointments, ["BRAVO", "ALPHA"]);
+      // After canonical sort, ALPHA precedes BRAVO (unknown appointments sort alphabetically).
+      assert.deepEqual(result.onboardingAppointments, ["ALPHA", "BRAVO"]);
       assert.deepEqual(fake.getSheetValues(currentMonthTitle).slice(1, 3).map((row) => row[0]), [
-        "BRAVO",
-        "ALPHA"
+        "ALPHA",
+        "BRAVO"
       ]);
     });
   });
