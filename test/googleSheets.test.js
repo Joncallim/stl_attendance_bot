@@ -5,7 +5,6 @@ import path from "node:path";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import {
   __testing,
-  fetchAndSaveConditionalFormattingRules,
   preloadAttendanceSnapshots,
   reconcilePendingAttendanceWithSheets,
   summarizeAttendanceOptionUsage,
@@ -1891,80 +1890,3 @@ test("syncOnboardingRoster reuses one live month snapshot per active sheet refre
   });
 });
 
-// ---------------------------------------------------------------------------
-// Conditional formatting fetch + cache
-// ---------------------------------------------------------------------------
-
-test("fetchAndSaveConditionalFormattingRules extracts attendance-column rules from ONBOARDING", async () => {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "cf-test-"));
-
-  try {
-    process.env.ATTENDANCE_BOT_DATA_DIR = tmpDir;
-    __testing.resetCachedConditionalRules();
-
-    const booleanRule = {
-      condition: { type: "TEXT_EQ", values: [{ userEnteredValue: "PRESENT" }] },
-      format: { backgroundColor: { red: 0, green: 0.8, blue: 0 } }
-    };
-
-    // One rule covering attendance columns (startColumnIndex: 2 = column C).
-    // One rule covering only column A — should be filtered out.
-    const sheets = {
-      spreadsheets: {
-        get: async () => ({
-          data: {
-            sheets: [
-              {
-                properties: { sheetId: 1, title: "ONBOARDING" },
-                conditionalFormats: [
-                  {
-                    ranges: [{ sheetId: 1, startRowIndex: 1, startColumnIndex: 2, endRowIndex: 100, endColumnIndex: 33 }],
-                    booleanRule
-                  },
-                  {
-                    ranges: [{ sheetId: 1, startRowIndex: 0, startColumnIndex: 0, endRowIndex: 100, endColumnIndex: 1 }],
-                    booleanRule: { condition: { type: "NOT_BLANK" }, format: { textFormat: { bold: true } } }
-                  }
-                ]
-              }
-            ]
-          }
-        })
-      }
-    };
-
-    const rules = await fetchAndSaveConditionalFormattingRules(sheets, "spreadsheet-id", "ONBOARDING");
-
-    // Only the attendance column rule should be included.
-    assert.equal(rules.length, 1);
-    assert.deepEqual(rules[0].booleanRule, booleanRule);
-    // Ranges must be stripped from the saved rule.
-    assert.ok(!("ranges" in rules[0]));
-
-    // Should now be loadable from disk (in-memory cache was reset after save).
-    __testing.resetCachedConditionalRules();
-    const loaded = await __testing.loadConditionalFormattingRules();
-    assert.equal(loaded.length, 1);
-    assert.deepEqual(loaded[0].booleanRule, booleanRule);
-  } finally {
-    delete process.env.ATTENDANCE_BOT_DATA_DIR;
-    __testing.resetCachedConditionalRules();
-    await rm(tmpDir, { recursive: true, force: true });
-  }
-});
-
-test("loadConditionalFormattingRules returns null when no file exists", async () => {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), "cf-test-"));
-
-  try {
-    process.env.ATTENDANCE_BOT_DATA_DIR = tmpDir;
-    __testing.resetCachedConditionalRules();
-
-    const result = await __testing.loadConditionalFormattingRules();
-    assert.equal(result, null);
-  } finally {
-    delete process.env.ATTENDANCE_BOT_DATA_DIR;
-    __testing.resetCachedConditionalRules();
-    await rm(tmpDir, { recursive: true, force: true });
-  }
-});

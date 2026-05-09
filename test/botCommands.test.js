@@ -329,16 +329,16 @@ test("manage admins description keeps default admins ordered and marks not onboa
     ["SCSE", "Coxn", "CO", "XO", "OPS 1"]
   );
 
-  assert.match(description, /• CO \(default, onboarded\)/);
-  assert.match(description, /• XO \(default, not onboarded\)/);
-  assert.match(description, /• COXN \(default, not onboarded\)/);
-  assert.match(description, /• SCSE \(default, onboarded\)/);
-  assert.match(description, /• OPS 1 \(default, not onboarded\)/);
-  assert.match(description, /• ALPHA \(custom, onboarded\)/);
-  assert.ok(description.indexOf("• CO (default, onboarded)") < description.indexOf("• XO (default, not onboarded)"));
-  assert.ok(description.indexOf("• XO (default, not onboarded)") < description.indexOf("• COXN (default, not onboarded)"));
-  assert.ok(description.indexOf("• COXN (default, not onboarded)") < description.indexOf("• SCSE (default, onboarded)"));
-  assert.ok(description.indexOf("• SCSE (default, onboarded)") < description.indexOf("• OPS 1 (default, not onboarded)"));
+  assert.match(description, /• CO \(default, registered\)/);
+  assert.match(description, /• XO \(default, not registered\)/);
+  assert.match(description, /• COXN \(default, not registered\)/);
+  assert.match(description, /• SCSE \(default, registered\)/);
+  assert.match(description, /• OPS 1 \(default, not registered\)/);
+  assert.match(description, /• ALPHA \(custom, registered\)/);
+  assert.ok(description.indexOf("• CO (default, registered)") < description.indexOf("• XO (default, not registered)"));
+  assert.ok(description.indexOf("• XO (default, not registered)") < description.indexOf("• COXN (default, not registered)"));
+  assert.ok(description.indexOf("• COXN (default, not registered)") < description.indexOf("• SCSE (default, registered)"));
+  assert.ok(description.indexOf("• SCSE (default, registered)") < description.indexOf("• OPS 1 (default, not registered)"));
 });
 
 test("attendance options description uses canonical order and aligned labels", () => {
@@ -502,15 +502,15 @@ test("attendance options menu is sent with HTML parse mode", async () => {
 });
 
 test("invitation admin description includes non-onboarded count", () => {
-  const removeTip = "💡 To remove a pending person from the roster entirely, use ➖ Remove Appointment instead.";
+  const removeTip = "💡 To remove someone from the roster entirely, use ➖ Remove Appointment instead.";
 
   assert.equal(
     __testing.buildInvitationAdminDescription(1),
     [
       "Send Invitation",
       "",
-      "1 person is currently not onboarded.",
-      "Select a person to generate and send a forwardable invitation message.",
+      "1 person has not yet registered.",
+      "Select a name to generate a forwardable invitation.",
       "",
       removeTip
     ].join("\n")
@@ -521,8 +521,8 @@ test("invitation admin description includes non-onboarded count", () => {
     [
       "Send Invitation",
       "",
-      "3 people are currently not onboarded.",
-      "Select a person to generate and send a forwardable invitation message.",
+      "3 people have not yet registered.",
+      "Select a name to generate a forwardable invitation.",
       "",
       removeTip
     ].join("\n")
@@ -541,8 +541,8 @@ test("invite submenu shows the current non-onboarded count in the admin message"
   }, 0);
 
   assert.equal(ctx.replies.length, 1);
-  assert.match(ctx.replies[0].message, /3 people are currently not onboarded\./);
-  assert.match(ctx.replies[0].message, /Select a person to generate and send a forwardable invitation message\./);
+  assert.match(ctx.replies[0].message, /3 people have not yet registered\./);
+  assert.match(ctx.replies[0].message, /Select a name to generate a forwardable invitation\./);
 });
 
 test("summary message uses grouped headers and can hide unaccounted", () => {

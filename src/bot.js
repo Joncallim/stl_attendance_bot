@@ -8,7 +8,6 @@ import {
   classifyAppointmentDepartment,
   clearAllSheetProtections,
   createGoogleSheetsClient,
-  fetchAndSaveConditionalFormattingRules,
   runStartupSheetCleanup,
   DEPARTMENT_BUCKETS,
   ensureNextMonthSheetExists,
@@ -583,12 +582,11 @@ function buildAdminRosterMenu() {
       Markup.button.callback("➖ Remove Appointment", "admin:menu:appointments:remove:0")
     ],
     [
-      Markup.button.callback("🔓 Clear All Protections", "admin:clearprotections"),
-      Markup.button.callback("🎨 Cell Colours", "admin:fetchcellcolours")
+      Markup.button.callback("🔓 Clear All Protections", "admin:clearprotections")
     ],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
-      Markup.button.callback("❌", "admin:close")
+      Markup.button.callback("❌ Close", "admin:close")
     ]
   ]);
 }
@@ -622,10 +620,10 @@ function buildHomeMenu(isAdminUser, timezone) {
 
 function buildSelfDeregisterMenu() {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("Yes, Deregister Me", "home:deregister:confirm")],
+    [Markup.button.callback("✅ Yes, Deregister Me", "home:deregister:confirm")],
     [
       Markup.button.callback("🔙 Back", "home:main"),
-      Markup.button.callback("❌", "home:close")
+      Markup.button.callback("❌ Close", "home:close")
     ]
   ]);
 }
@@ -666,7 +664,7 @@ function buildSummaryMenu(date, timezone, backTarget = "admin:menu:roster", opti
   const namespace = backTarget.startsWith("home:") ? "home" : "admin";
   const rows = [[
     Markup.button.callback("⬅️ Previous Day", `${namespace}:summary:${previousDate}`),
-    Markup.button.callback("Next Day ➡️", `${namespace}:summary:${nextDate}`)
+    Markup.button.callback("➡️ Next Day", `${namespace}:summary:${nextDate}`)
   ]];
 
   if (options.includeUnaccounted !== false) {
@@ -678,7 +676,7 @@ function buildSummaryMenu(date, timezone, backTarget = "admin:menu:roster", opti
   rows.push(
     [
       Markup.button.callback("🔙 Back", backTarget),
-      Markup.button.callback("❌", `${namespace}:close`)
+      Markup.button.callback("❌ Close", `${namespace}:close`)
     ]
   );
 
@@ -693,7 +691,7 @@ function buildAdminManageMenu() {
     ],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
-      Markup.button.callback("❌", "admin:close")
+      Markup.button.callback("❌ Close", "admin:close")
     ]
   ]);
 }
@@ -709,7 +707,7 @@ function buildAttendanceOptionsMenu() {
     ],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
-      Markup.button.callback("❌", "admin:close")
+      Markup.button.callback("❌ Close", "admin:close")
     ]
   ]);
 }
@@ -718,7 +716,7 @@ function buildAppointmentManagementBackMenu() {
   return Markup.inlineKeyboard([
     [
       Markup.button.callback("🔙 Back", "admin:menu:roster"),
-      Markup.button.callback("❌", "admin:close")
+      Markup.button.callback("❌ Close", "admin:close")
     ]
   ]);
 }
@@ -726,8 +724,10 @@ function buildAppointmentManagementBackMenu() {
 function buildUnaccountedMenu(date, timezone, rows, backTarget, namespace) {
   return Markup.inlineKeyboard([
     ...rows,
-    [Markup.button.callback("🔙 Back", `${namespace}:summary:${toIsoDateString(date, timezone)}`)],
-    [Markup.button.callback("❌", `${namespace}:close`)]
+    [
+      Markup.button.callback("🔙 Back", `${namespace}:summary:${toIsoDateString(date, timezone)}`),
+      Markup.button.callback("❌ Close", `${namespace}:close`)
+    ]
   ]);
 }
 
@@ -750,20 +750,21 @@ function buildPagedSelectionMenu(items, page, itemPrefix, pageCallbackPrefix, ba
   const navRow = [];
 
   if (safePage > 0) {
-    navRow.push(
-      Markup.button.callback("⬅️ Prev", `${pageCallbackPrefix}:${safePage - 1}`)
-    );
+    navRow.push(Markup.button.callback("⬅️ Prev", `${pageCallbackPrefix}:${safePage - 1}`));
   }
 
   if (safePage < totalPages - 1) {
-    navRow.push(
-      Markup.button.callback("Next ➡️", `${pageCallbackPrefix}:${safePage + 1}`)
-    );
+    navRow.push(Markup.button.callback("➡️ Next", `${pageCallbackPrefix}:${safePage + 1}`));
   }
 
-  navRow.push(Markup.button.callback("❌", "admin:close"));
-  rows.push(navRow);
-  rows.push([Markup.button.callback("🔙 Back", backTarget)]);
+  if (navRow.length > 0) {
+    rows.push(navRow);
+  }
+
+  rows.push([
+    Markup.button.callback("🔙 Back", backTarget),
+    Markup.button.callback("❌ Close", "admin:close")
+  ]);
 
   return Markup.inlineKeyboard(rows);
 }
@@ -798,12 +799,17 @@ function buildInlineAttendanceMenu(
   }
 
   if (safePage < totalPages - 1) {
-    navRow.push(Markup.button.callback("Next ➡️", `${pagePrefix}:${safePage + 1}`));
+    navRow.push(Markup.button.callback("➡️ Next", `${pagePrefix}:${safePage + 1}`));
   }
 
-  navRow.push(Markup.button.callback("❌ Close", "home:close"));
-  rows.push(navRow);
-  rows.push([Markup.button.callback("🔙 Back", backTarget)]);
+  if (navRow.length > 0) {
+    rows.push(navRow);
+  }
+
+  rows.push([
+    Markup.button.callback("🔙 Back", backTarget),
+    Markup.button.callback("❌ Close", "home:close")
+  ]);
 
   return Markup.inlineKeyboard(rows);
 }
@@ -939,7 +945,7 @@ function buildInviteReplyMarkup(invite, bot, backCallback = null) {
   if (backCallback) {
     inlineKeyboard.push([
       { text: "🔙 Back", callback_data: backCallback },
-      { text: "❌", callback_data: "admin:close" }
+      { text: "❌ Close", callback_data: "admin:close" }
     ]);
   }
 
@@ -1358,7 +1364,7 @@ function buildDepartmentMenu(viewModel) {
 
   rows.push([
     Markup.button.callback("🔙 Back", "home:main"),
-    Markup.button.callback("❌", "home:close")
+    Markup.button.callback("❌ Close", "home:close")
   ]);
 
   return Markup.inlineKeyboard(rows);
@@ -1409,7 +1415,7 @@ function buildDepartmentPickerMenu(departmentOptions, weekOffset, backDepartment
       "🔙 Back",
       `home:department:view:${backDepartmentKey}:${weekOffset}:${backPage}`
     ),
-    Markup.button.callback("❌", "home:close")
+    Markup.button.callback("❌ Close", "home:close")
   ]);
 
   return Markup.inlineKeyboard(rows);
@@ -1493,7 +1499,6 @@ function buildHomeMenuText({ greeting, name, isAdminUser, timezone, syncStatus }
     lines.push(
       "",
       "---",
-      "",
       `Last Synchronisation: ${formatHomeSynchronizationTimestamp(latestSynchronizationAt, timezone)}`
     );
   }
@@ -1505,20 +1510,16 @@ function buildAdminMenuDescription() {
   return [
     `Admin Menu (${BOT_VERSION})`,
     "",
-    "Use this menu to manage roster operations and onboarding support.",
+    "Manage roster, onboarding, admins, and attendance.",
     "",
-    "📋 Roster: View onboarding gaps and run a manual roster sync.",
-    "✉️ Send Invitation: Generate and forward an invitation for personnel who have not onboarded.",
-    "👮 Manage Admins: Review current admins and add or remove admin appointments.",
-    "📣 Prompt All: Send the attendance prompt to all currently bound users.",
-    "🧩 Attendance Options: View, add, remove, or reset the allowed attendance codes.",
-    "🧾 Deregister Person: Remove another person’s Telegram binding and rotate their code.",
-    "📤 Push Attendance: Immediately flush all pending attendance entries to Google Sheets.",
-    "🔙 Back: Return to the main home menu.",
-    "",
-    "📋 Roster sub-menu:",
-    "🔄 Sync Roster: Sort ONBOARDING, sync month sheets, add new users, check formatting.",
-    "🔓 Clear All Protections: Remove every sheet protection from the spreadsheet."
+    "📋 Roster — Sync the roster and manage appointments.",
+    "✉️ Send Invitation — Generate an invite for unregistered personnel.",
+    "👮 Manage Admins — Add or remove admin appointments.",
+    "📣 Prompt All — Send the attendance prompt to all bound users.",
+    "🧩 Attendance Options — View and update the allowed attendance codes.",
+    "🧾 Deregister Person — Remove a user’s Telegram binding and rotate their code.",
+    "📤 Push Attendance — Flush all queued entries to Google Sheets immediately.",
+    "📬 Outstanding — View attendance entries queued but not yet pushed."
   ].join("\n");
 }
 
@@ -1576,8 +1577,8 @@ function buildAttendanceOptionsDescription(
   const lines = [
     "Attendance Options",
     "",
-    "These codes appear in Telegram and in the Google Sheets dropdown validation.",
-    "The default list comes from settings.yaml, and Telegram changes are saved in local storage.",
+    "These codes appear in the Telegram attendance prompt and in the Google Sheets dropdown.",
+    "Defaults are loaded from settings.yaml. Changes made here are saved locally.",
     ""
   ];
 
@@ -1613,7 +1614,7 @@ function buildAttendanceOptionsDescription(
   }
 
   lines.push("");
-  lines.push("Use the buttons below to add, remove, or reset the list back to the Onboarding defaults.");
+  lines.push("Use the buttons below to add, remove, or reset to defaults.");
   return lines.join("\n");
 }
 
@@ -1660,25 +1661,27 @@ function buildManageAdminsDescription(admins, activeCodes = [], defaultAdminAppo
     lines.push("None");
   } else {
     lines.push(...visibleRows.map((entry) => {
-      const onboardingStatus = entry.onboarded ? "onboarded" : "not onboarded";
+      const onboardingStatus = entry.onboarded ? "registered" : "not registered";
       return `• ${entry.appointment} (${entry.source}, ${onboardingStatus})`;
     }));
   }
 
   lines.push("");
-  lines.push("Choose whether to add or remove admin appointments below.");
+  lines.push("Use the buttons below to add or remove admin appointments.");
   return lines.join("\n");
 }
 
 function buildRosterDescription() {
   return [
-    "Roster Menu",
+    "Roster",
     "",
-    "Use this section to manage the onboarding roster.",
-    "🕓 Pending shows active personnel who have not onboarded yet.",
-    "➕ Add Appointment inserts a new appointment into the managed roster and generates a fresh onboarding code.",
-    "➖ Remove Appointment removes a managed appointment from the active roster and clears any existing binding.",
-    "🔄 Sync Roster refreshes the ONBOARDING sheet, secret codes, and monthly attendance sheets."
+    "Manage the onboarding roster and attendance sheets.",
+    "",
+    "🕓 Pending — Personnel who have not yet onboarded.",
+    "🔄 Sync Roster — Sort ONBOARDING and sync monthly attendance sheets.",
+    "➕ Add Appointment — Add a new appointment and generate a registration code.",
+    "➖ Remove Appointment — Remove an appointment and clear their Telegram binding.",
+    "🔓 Clear All Protections — Remove all sheet protections from the spreadsheet."
   ].join("\n");
 }
 
@@ -1687,11 +1690,11 @@ function buildInvitationAdminDescription(pendingCount) {
     "Send Invitation",
     "",
     pendingCount === 1
-      ? "1 person is currently not onboarded."
-      : `${pendingCount} people are currently not onboarded.`,
-    "Select a person to generate and send a forwardable invitation message.",
+      ? "1 person has not yet registered."
+      : `${pendingCount} people have not yet registered.`,
+    "Select a name to generate a forwardable invitation.",
     "",
-    "💡 To remove a pending person from the roster entirely, use ➖ Remove Appointment instead."
+    "💡 To remove someone from the roster entirely, use ➖ Remove Appointment instead."
   ].join("\n");
 }
 
@@ -2304,7 +2307,7 @@ async function renderDepartmentView(ctx, config, cache, viewer, options = {}) {
       Markup.inlineKeyboard([
         [
           Markup.button.callback("🔙 Back", "home:main"),
-          Markup.button.callback("❌", "home:close")
+          Markup.button.callback("❌ Close", "home:close")
         ]
       ])
     );
@@ -2569,7 +2572,7 @@ async function renderCodesSubmenu(ctx, cache) {
       Markup.inlineKeyboard([
         [
           Markup.button.callback("🔙 Back", "admin:main"),
-          Markup.button.callback("❌", "admin:close")
+          Markup.button.callback("❌ Close", "admin:close")
         ]
       ])
     );
@@ -2609,7 +2612,7 @@ async function renderCodesSubmenuPage(ctx, cache, page) {
 
   await sendOrUpdateAdminMessage(
     ctx,
-    "Select a person to generate and send a forwardable invitation message.",
+    buildInvitationAdminDescription(pending.length),
     buildPagedSelectionMenu(
       items,
       page,
@@ -2630,7 +2633,7 @@ async function renderAddAdminSubmenu(ctx, cache, page = 0) {
       Markup.inlineKeyboard([
         [
           Markup.button.callback("🔙 Back", "admin:menu:admins"),
-          Markup.button.callback("❌", "admin:close")
+          Markup.button.callback("❌ Close", "admin:close")
         ]
       ])
     );
@@ -2639,7 +2642,7 @@ async function renderAddAdminSubmenu(ctx, cache, page = 0) {
 
   await sendOrUpdateAdminMessage(
     ctx,
-    "Select an appointment to add as admin.",
+    "Select an appointment to grant admin access.",
     buildPagedSelectionMenu(
       candidates,
       page,
@@ -2660,7 +2663,7 @@ async function renderRemoveAdminSubmenu(ctx, cache, page = 0) {
       Markup.inlineKeyboard([
         [
           Markup.button.callback("🔙 Back", "admin:menu:admins"),
-          Markup.button.callback("❌", "admin:close")
+          Markup.button.callback("❌ Close", "admin:close")
         ]
       ])
     );
@@ -2690,7 +2693,7 @@ async function renderInviteSubmenu(ctx, cache, page = 0) {
       Markup.inlineKeyboard([
         [
           Markup.button.callback("🔙 Back", "admin:main"),
-          Markup.button.callback("❌", "admin:close")
+          Markup.button.callback("❌ Close", "admin:close")
         ]
       ])
     );
@@ -2716,11 +2719,11 @@ async function renderDeregisterSubmenu(ctx, cache, page = 0) {
   if (candidates.length === 0) {
     await sendOrUpdateAdminMessage(
       ctx,
-      "There are no onboarded personnel to deregister.",
+      "There are no registered users to deregister.",
       Markup.inlineKeyboard([
         [
           Markup.button.callback("🔙 Back", "admin:main"),
-          Markup.button.callback("❌", "admin:close")
+          Markup.button.callback("❌ Close", "admin:close")
         ]
       ])
     );
@@ -2729,7 +2732,7 @@ async function renderDeregisterSubmenu(ctx, cache, page = 0) {
 
   await sendOrUpdateAdminMessage(
     ctx,
-    "Select a person to deregister.",
+    "Select a person to deregister. This removes their Telegram binding and rotates their registration code.",
     buildPagedSelectionMenu(
       candidates,
       page,
@@ -2860,19 +2863,6 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       sheets
     }).catch((error) => {
       logBotError("[Admin] Clear protections error (unhandled).", { error: error.message });
-    });
-    return;
-  }
-
-  if (action === "fetchcellcolours") {
-    // Fire-and-forget: makes a spreadsheets.get call which can take several seconds.
-    handleFetchCellColoursAdminAction(ctx, config, {
-      fetchAndSaveConditionalFormattingRules,
-      sendOrUpdateAdminMessage,
-      buildAdminRosterMenu,
-      sheets
-    }).catch((error) => {
-      logBotError("[Admin] Fetch cell colours error (unhandled).", { error: error.message });
     });
     return;
   }
@@ -3231,38 +3221,6 @@ async function handleClearProtectionsAdminAction(ctx, config, deps) {
   }
 }
 
-async function handleFetchCellColoursAdminAction(ctx, config, deps) {
-  logBot("[Admin] Fetch cell colours started.");
-  await deps.sendOrUpdateAdminMessage(
-    ctx,
-    `Fetching conditional formatting from cell C1 of "${config.onboardingSheetTitle}". Please wait…`
-  );
-
-  try {
-    const rules = await deps.fetchAndSaveConditionalFormattingRules(
-      deps.sheets,
-      config.spreadsheetId,
-      config.onboardingSheetTitle
-    );
-    logBot("[Admin] Fetch cell colours complete.", { ruleCount: rules.length });
-    await deps.sendOrUpdateAdminMessage(
-      ctx,
-      rules.length === 0
-        ? `⚠️ No conditional formatting found in the attendance columns of "${config.onboardingSheetTitle}". Set up colour rules there first, then try again.`
-        : `✅ Saved ${rules.length} colour rule${rules.length === 1 ? "" : "s"} from "${config.onboardingSheetTitle}". They will be applied automatically on the next Sync Roster.`,
-      deps.buildAdminRosterMenu()
-    );
-  } catch (error) {
-    logBotError("[Admin] Fetch cell colours failed.", { error: error.message });
-    await deps.sendOrUpdateAdminMessage(
-      ctx,
-      `❌ Failed to fetch cell colours: ${error.message}`,
-      deps.buildAdminRosterMenu()
-    );
-    throw error;
-  }
-}
-
 async function handleFlushAttendanceAdminAction(ctx, config, deps) {
   const status = await deps.getAttendanceQueueStatus();
 
@@ -3360,7 +3318,7 @@ async function handleQueueStatusAdminAction(ctx, deps) {
   const lines = [];
 
   if (pendingCount > 0) {
-    lines.push(`📬 *${pendingCount} outstanding attendance ${pendingCount === 1 ? "entry" : "entries"}*`);
+    lines.push(`📬 ${pendingCount} outstanding attendance ${pendingCount === 1 ? "entry" : "entries"}`);
 
     // Group by date (YYYY-MM-DD strings), sort newest-first.
     const byDate = new Map();
@@ -3371,7 +3329,7 @@ async function handleQueueStatusAdminAction(ctx, deps) {
 
     const sortedDates = [...byDate.keys()].sort((a, b) => b.localeCompare(a));
     for (const date of sortedDates) {
-      lines.push(`\n📅 *${date}*`);
+      lines.push(`\n📅 ${date}`);
       for (const event of byDate.get(date)) {
         lines.push(`• ${event.appointment} → ${event.status}`);
       }
@@ -3381,7 +3339,7 @@ async function handleQueueStatusAdminAction(ctx, deps) {
   if (conflictedCount > 0) {
     if (lines.length > 0) lines.push("");
     lines.push(
-      `⚠️ *${conflictedCount} conflicted ${conflictedCount === 1 ? "entry" : "entries"}* — run 🔄 Sync Roster to fix the sheet layout, then push again.`
+      `⚠️ ${conflictedCount} conflicted ${conflictedCount === 1 ? "entry" : "entries"} — run 🔄 Sync Roster to fix the sheet layout, then push again.`
     );
   }
 
@@ -4042,7 +4000,7 @@ export function createAttendanceBot(config) {
           Markup.inlineKeyboard([
             [
               Markup.button.callback("🔙 Back", "admin:menu:options"),
-              Markup.button.callback("❌", "admin:close")
+              Markup.button.callback("❌ Close", "admin:close")
             ]
           ])
         );
@@ -4745,7 +4703,7 @@ export function createAttendanceBot(config) {
           Markup.inlineKeyboard([
             [
               Markup.button.callback("🔙 Back", "home:main"),
-              Markup.button.callback("❌", "home:close")
+              Markup.button.callback("❌ Close", "home:close")
             ]
           ])
         );
@@ -4763,7 +4721,7 @@ export function createAttendanceBot(config) {
         Markup.inlineKeyboard([
           [
             Markup.button.callback("🔙 Back", "home:main"),
-            Markup.button.callback("❌", "home:close")
+            Markup.button.callback("❌ Close", "home:close")
           ]
         ])
       );
@@ -4962,7 +4920,7 @@ export function createAttendanceBot(config) {
         Markup.inlineKeyboard([
           [
             Markup.button.callback("🔙 Back", "admin:menu:options"),
-            Markup.button.callback("❌", "admin:close")
+            Markup.button.callback("❌ Close", "admin:close")
           ]
         ])
       );
@@ -5080,7 +5038,7 @@ export function createAttendanceBot(config) {
         Markup.inlineKeyboard([
           [
             Markup.button.callback("🔙 Back", "admin:menu:admins"),
-            Markup.button.callback("❌", "admin:close")
+            Markup.button.callback("❌ Close", "admin:close")
           ]
         ])
       );
@@ -5106,7 +5064,7 @@ export function createAttendanceBot(config) {
         Markup.inlineKeyboard([
           [
             Markup.button.callback("🔙 Back", "admin:menu:deregister:0"),
-            Markup.button.callback("❌", "admin:close")
+            Markup.button.callback("❌ Close", "admin:close")
           ]
         ])
       );
@@ -5160,7 +5118,7 @@ export function createAttendanceBot(config) {
         Markup.inlineKeyboard([
           [
             Markup.button.callback("🔙 Back", "admin:menu:admins"),
-            Markup.button.callback("❌", "admin:close")
+            Markup.button.callback("❌ Close", "admin:close")
           ]
         ])
       );

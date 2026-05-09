@@ -13,7 +13,6 @@ const SHEET_CACHE_FILE = () => getDataFile("sheet-cache.json");
 // refresh; only re-fetched when the file is absent or via an explicit admin action.
 const CONDITIONAL_FORMAT_RULES_FILE = () => getDataFile("conditional-format-rules.json");
 // Module-level in-memory cache so we only hit disk once per process lifetime.
-// Reset to null by fetchAndSaveConditionalFormattingRules() after a fresh fetch.
 let cachedConditionalRules = undefined; // undefined = not yet loaded; null = loaded but empty
 // spreadsheets.get (metadata) takes 10–109 s from this VPS under load.  Refreshing
 // every 15 min means the 1-minute background cycle will hammer the API the moment the
@@ -1583,8 +1582,7 @@ async function buildDisabledDayFormattingRequests(sheetId, date, timezone, rowLi
 
 /**
  * Returns the cached conditional format rule definitions, loading from disk on
- * first call.  Returns null when no rules have been saved yet (run
- * fetchAndSaveConditionalFormattingRules to populate the file).
+ * first call.  Returns null when no rules have been saved yet.
  *
  * Each element in the returned array is a rule object with either a
  * `booleanRule` or `gradientRule` key — identical to the Google Sheets API
@@ -1605,69 +1603,6 @@ async function loadConditionalFormattingRules() {
 
   cachedConditionalRules = saved.rules;
   return cachedConditionalRules;
-}
-
-/**
- * Fetches conditional format rules from cell C1 of the ONBOARDING sheet
- * (i.e., rules whose ranges cover column C, the first attendance column),
- * strips the sheet-specific range information, and saves the rule definitions
- * to conditional-format-rules.json.  Subsequent layout refreshes read from
- * that file rather than making a live API call.
- *
- * Call this once to bootstrap the local cache, then again whenever the
- * ONBOARDING conditional formatting is updated.
- */
-export async function fetchAndSaveConditionalFormattingRules(sheets, spreadsheetId, onboardingTitle) {
-  logSheetsSuccess(`[ConditionalFormat] Fetching rules from "${onboardingTitle}" C1…`);
-
-  // Targeted fetch — only the fields we need, not the full spreadsheet metadata.
-  const response = await runGoogleSheetsRequestQueued(
-    "spreadsheets.get:conditionalFormats",
-    (signal) => sheets.spreadsheets.get({
-      spreadsheetId,
-      includeGridData: false,
-      fields: "sheets(properties(sheetId,title),conditionalFormats)"
-    }, { signal })
-  );
-
-  const sheetData = (response.data.sheets ?? []).find(
-    (s) => s.properties?.title === onboardingTitle
-  );
-
-  if (!sheetData) {
-    throw new Error(`Sheet "${onboardingTitle}" not found in spreadsheet.`);
-  }
-
-  const allRules = sheetData.conditionalFormats ?? [];
-
-  // Keep rules that cover at least one cell in the attendance area of ONBOARDING:
-  // column C (index 2) onwards — the first attendance column.  This excludes any
-  // rules applied only to column A (appointments) or B (codes).
-  const attendanceRules = allRules.filter((rule) =>
-    (rule.ranges ?? []).some((range) => (range.startColumnIndex ?? 0) >= 2 || (range.endColumnIndex ?? 0) > 2)
-  );
-
-  if (attendanceRules.length === 0) {
-    logSheetsSuccess(`[ConditionalFormat] No conditional format rules found in attendance columns of "${onboardingTitle}".`);
-  }
-
-  // Strip the sheet-specific `ranges` field; ranges are re-built per sheet at apply time.
-  const ruleDefinitions = attendanceRules.map(({ ranges: _ranges, ...rule }) => rule);
-
-  const saved = {
-    fetchedAt: new Date().toISOString(),
-    sourceSheet: onboardingTitle,
-    rules: ruleDefinitions
-  };
-
-  await writeJsonFile(CONDITIONAL_FORMAT_RULES_FILE(), saved);
-
-  // Invalidate the in-memory cache so the next layout refresh uses the new rules.
-  cachedConditionalRules = undefined;
-
-  logSheetsSuccess(`[ConditionalFormat] Saved ${ruleDefinitions.length} rule(s) to conditional-format-rules.json.`);
-
-  return ruleDefinitions;
 }
 
 async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, header, options, timezone, rowCount = 0, existingProtections = [], existingConditionalFormats = []) {
@@ -4151,7 +4086,5 @@ export const __testing = {
   getMonthParts,
   shiftMonth,
   writeMonthlySheetRows,
-  writeAppointmentColumn,
-  loadConditionalFormattingRules,
-  resetCachedConditionalRules() { cachedConditionalRules = undefined; }
+  writeAppointmentColumn
 };
