@@ -8,6 +8,7 @@ import {
   classifyAppointmentDepartment,
   clearAllSheetProtections,
   createGoogleSheetsClient,
+  fetchAndSaveConditionalFormattingRules,
   runStartupSheetCleanup,
   DEPARTMENT_BUCKETS,
   ensureNextMonthSheetExists,
@@ -581,7 +582,10 @@ function buildAdminRosterMenu() {
       Markup.button.callback("➕ Add Appointment", "admin:appointments:add"),
       Markup.button.callback("➖ Remove Appointment", "admin:menu:appointments:remove:0")
     ],
-    [Markup.button.callback("🔓 Clear All Protections", "admin:clearprotections")],
+    [
+      Markup.button.callback("🔓 Clear All Protections", "admin:clearprotections"),
+      Markup.button.callback("🎨 Cell Colours", "admin:fetchcellcolours")
+    ],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
       Markup.button.callback("❌", "admin:close")
@@ -2860,6 +2864,19 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
     return;
   }
 
+  if (action === "fetchcellcolours") {
+    // Fire-and-forget: makes a spreadsheets.get call which can take several seconds.
+    handleFetchCellColoursAdminAction(ctx, config, {
+      fetchAndSaveConditionalFormattingRules,
+      sendOrUpdateAdminMessage,
+      buildAdminRosterMenu,
+      sheets
+    }).catch((error) => {
+      logBotError("[Admin] Fetch cell colours error (unhandled).", { error: error.message });
+    });
+    return;
+  }
+
   if (action === "flushqueue") {
     // Fire-and-forget: flush can take tens of seconds; Telegraf 90 s limit would kill it.
     handleFlushAttendanceAdminAction(ctx, config, {
@@ -3209,6 +3226,38 @@ async function handleClearProtectionsAdminAction(ctx, config, deps) {
     await deps.sendOrUpdateAdminMessage(
       ctx,
       `❌ Failed to clear protections: ${error.message}`
+    );
+    throw error;
+  }
+}
+
+async function handleFetchCellColoursAdminAction(ctx, config, deps) {
+  logBot("[Admin] Fetch cell colours started.");
+  await deps.sendOrUpdateAdminMessage(
+    ctx,
+    `Fetching conditional formatting from cell C1 of "${config.onboardingSheetTitle}". Please wait…`
+  );
+
+  try {
+    const rules = await deps.fetchAndSaveConditionalFormattingRules(
+      deps.sheets,
+      config.spreadsheetId,
+      config.onboardingSheetTitle
+    );
+    logBot("[Admin] Fetch cell colours complete.", { ruleCount: rules.length });
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      rules.length === 0
+        ? `⚠️ No conditional formatting found in the attendance columns of "${config.onboardingSheetTitle}". Set up colour rules there first, then try again.`
+        : `✅ Saved ${rules.length} colour rule${rules.length === 1 ? "" : "s"} from "${config.onboardingSheetTitle}". They will be applied automatically on the next Sync Roster.`,
+      deps.buildAdminRosterMenu()
+    );
+  } catch (error) {
+    logBotError("[Admin] Fetch cell colours failed.", { error: error.message });
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      `❌ Failed to fetch cell colours: ${error.message}`,
+      deps.buildAdminRosterMenu()
     );
     throw error;
   }

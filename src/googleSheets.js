@@ -8,6 +8,13 @@ import { getSingaporePublicHolidaySet } from "./holidays.js";
 import { ipv4HttpsAgent } from "./network.js";
 
 const SHEET_CACHE_FILE = () => getDataFile("sheet-cache.json");
+// Cached copy of conditional format rule definitions fetched from ONBOARDING's C1 area.
+// Stored locally so the bot never needs to re-fetch from Google Sheets on every layout
+// refresh; only re-fetched when the file is absent or via an explicit admin action.
+const CONDITIONAL_FORMAT_RULES_FILE = () => getDataFile("conditional-format-rules.json");
+// Module-level in-memory cache so we only hit disk once per process lifetime.
+// Reset to null by fetchAndSaveConditionalFormattingRules() after a fresh fetch.
+let cachedConditionalRules = undefined; // undefined = not yet loaded; null = loaded but empty
 // spreadsheets.get (metadata) takes 10–109 s from this VPS under load.  Refreshing
 // every 15 min means the 1-minute background cycle will hammer the API the moment the
 // TTL expires, spiralling into consecutive timeouts.  45 min keeps the data fresh
@@ -932,7 +939,7 @@ async function getSpreadsheet(sheets, spreadsheetId, options = {}) {
     sheets.spreadsheets.get({
       spreadsheetId,
       includeGridData: false,
-      fields: "spreadsheetId,sheets(properties,protectedRanges)"
+      fields: "spreadsheetId,sheets(properties,protectedRanges,conditionalFormats)"
     }, { signal })
   , { timeoutMs: 20000 });
   const spreadsheet = response.data;
@@ -1574,7 +1581,96 @@ async function buildDisabledDayFormattingRequests(sheetId, date, timezone, rowLi
   return requests;
 }
 
-async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, header, options, timezone, rowCount = 0, existingProtections = []) {
+/**
+ * Returns the cached conditional format rule definitions, loading from disk on
+ * first call.  Returns null when no rules have been saved yet (run
+ * fetchAndSaveConditionalFormattingRules to populate the file).
+ *
+ * Each element in the returned array is a rule object with either a
+ * `booleanRule` or `gradientRule` key — identical to the Google Sheets API
+ * ConditionalFormatRule shape, but WITHOUT the `ranges` field (those are
+ * injected per-sheet at apply time).
+ */
+async function loadConditionalFormattingRules() {
+  if (cachedConditionalRules !== undefined) {
+    return cachedConditionalRules;
+  }
+
+  const saved = await readJsonFile(CONDITIONAL_FORMAT_RULES_FILE(), null);
+
+  if (!saved?.rules || saved.rules.length === 0) {
+    cachedConditionalRules = null;
+    return null;
+  }
+
+  cachedConditionalRules = saved.rules;
+  return cachedConditionalRules;
+}
+
+/**
+ * Fetches conditional format rules from cell C1 of the ONBOARDING sheet
+ * (i.e., rules whose ranges cover column C, the first attendance column),
+ * strips the sheet-specific range information, and saves the rule definitions
+ * to conditional-format-rules.json.  Subsequent layout refreshes read from
+ * that file rather than making a live API call.
+ *
+ * Call this once to bootstrap the local cache, then again whenever the
+ * ONBOARDING conditional formatting is updated.
+ */
+export async function fetchAndSaveConditionalFormattingRules(sheets, spreadsheetId, onboardingTitle) {
+  logSheetsSuccess(`[ConditionalFormat] Fetching rules from "${onboardingTitle}" C1…`);
+
+  // Targeted fetch — only the fields we need, not the full spreadsheet metadata.
+  const response = await runGoogleSheetsRequestQueued(
+    "spreadsheets.get:conditionalFormats",
+    (signal) => sheets.spreadsheets.get({
+      spreadsheetId,
+      includeGridData: false,
+      fields: "sheets(properties(sheetId,title),conditionalFormats)"
+    }, { signal })
+  );
+
+  const sheetData = (response.data.sheets ?? []).find(
+    (s) => s.properties?.title === onboardingTitle
+  );
+
+  if (!sheetData) {
+    throw new Error(`Sheet "${onboardingTitle}" not found in spreadsheet.`);
+  }
+
+  const allRules = sheetData.conditionalFormats ?? [];
+
+  // Keep rules that cover at least one cell in the attendance area of ONBOARDING:
+  // column C (index 2) onwards — the first attendance column.  This excludes any
+  // rules applied only to column A (appointments) or B (codes).
+  const attendanceRules = allRules.filter((rule) =>
+    (rule.ranges ?? []).some((range) => (range.startColumnIndex ?? 0) >= 2 || (range.endColumnIndex ?? 0) > 2)
+  );
+
+  if (attendanceRules.length === 0) {
+    logSheetsSuccess(`[ConditionalFormat] No conditional format rules found in attendance columns of "${onboardingTitle}".`);
+  }
+
+  // Strip the sheet-specific `ranges` field; ranges are re-built per sheet at apply time.
+  const ruleDefinitions = attendanceRules.map(({ ranges: _ranges, ...rule }) => rule);
+
+  const saved = {
+    fetchedAt: new Date().toISOString(),
+    sourceSheet: onboardingTitle,
+    rules: ruleDefinitions
+  };
+
+  await writeJsonFile(CONDITIONAL_FORMAT_RULES_FILE(), saved);
+
+  // Invalidate the in-memory cache so the next layout refresh uses the new rules.
+  cachedConditionalRules = undefined;
+
+  logSheetsSuccess(`[ConditionalFormat] Saved ${ruleDefinitions.length} rule(s) to conditional-format-rules.json.`);
+
+  return ruleDefinitions;
+}
+
+async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, header, options, timezone, rowCount = 0, existingProtections = [], existingConditionalFormats = []) {
   const rowLimit = managedRowLimit(rowCount);
 
   // Remove any bot-managed protections that were added by earlier versions.
@@ -1583,11 +1679,44 @@ async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, hea
     .filter((p) => String(p.description ?? "").startsWith("attendance-bot:") && Number.isInteger(p.protectedRangeId))
     .map((p) => ({ deleteProtectedRange: { protectedRangeId: p.protectedRangeId } }));
 
+  // Load saved conditional format rule definitions (fetched once from ONBOARDING
+  // and cached in conditional-format-rules.json).  Null means no rules saved yet.
+  const conditionalRules = await loadConditionalFormattingRules();
+
+  // Delete all existing conditional format rules on this sheet before re-adding.
+  // Rules are indexed from 0; delete in reverse order so earlier indices stay valid.
+  const deleteConditionalFormatRequests = existingConditionalFormats
+    .map((_, index) => existingConditionalFormats.length - 1 - index)
+    .map((index) => ({ deleteConditionalFormatRule: { sheetId, index } }));
+
+  // Apply each saved rule to the full attendance data range (column B onwards,
+  // rows 2+).  Each rule is added at position 0 so they end up in the same order
+  // as the original — the last rule added becomes index 0, which inverts the list,
+  // so we reverse before adding.
+  const attendanceRange = {
+    sheetId,
+    startRowIndex: 1,       // row 2 (skip header)
+    startColumnIndex: 1,    // column B (first day/data column on monthly sheets)
+    endRowIndex: rowLimit,
+    endColumnIndex: header.length
+  };
+
+  const addConditionalFormatRequests = conditionalRules
+    ? [...conditionalRules].reverse().map((rule) => ({
+        addConditionalFormatRule: {
+          rule: { ...rule, ranges: [attendanceRange] },
+          index: 0
+        }
+      }))
+    : [];
+
   const requests = [
     ...removeProtectionRequests,
+    ...deleteConditionalFormatRequests,
     buildHeaderUpdateRequest(sheetId, header),
     buildAttendanceValidationRequest(sheetId, header.length, options, rowLimit),
     ...(await buildDisabledDayFormattingRequests(sheetId, date, timezone, rowLimit)),
+    ...addConditionalFormatRequests,
     // Auto-fit column A width to the longest appointment name on each layout refresh.
     {
       autoResizeDimensions: {
@@ -1689,9 +1818,11 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
   const defaultHeader = getDefaultHeaderRow(date, config.timezone);
   let monthlySheetValues = null;
 
-  // Existing protections on the sheet — used by applyMonthlySheetLayout to issue
-  // deleteProtectedRange requests for any bot-managed ranges in the same batchUpdate.
+  // Existing protections and conditional formats on the sheet — passed to
+  // applyMonthlySheetLayout so it can issue deleteProtectedRange and
+  // deleteConditionalFormatRule requests in the same batchUpdate.
   const existingProtections = sheet.protectedRanges ?? [];
+  const existingConditionalFormats = sheet.conditionalFormats ?? [];
 
   if (ensuredSheet.created) {
     await applyMonthlySheetLayout(
@@ -1703,7 +1834,8 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
       config.attendanceOptions,
       config.timezone,
       appointments.length,
-      [] // new sheet has no protections to remove
+      [], // new sheet has no protections to remove
+      []  // new sheet has no conditional formats to remove
     );
     monthlySheetValues = [defaultHeader];
   } else {
@@ -1731,7 +1863,8 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
         config.attendanceOptions,
         config.timezone,
         appointments.length,
-        existingProtections // remove any lingering bot-managed protections
+        existingProtections,       // remove any lingering bot-managed protections
+        existingConditionalFormats // replace any stale conditional format rules
       );
     }
   }
@@ -4018,5 +4151,7 @@ export const __testing = {
   getMonthParts,
   shiftMonth,
   writeMonthlySheetRows,
-  writeAppointmentColumn
+  writeAppointmentColumn,
+  loadConditionalFormattingRules,
+  resetCachedConditionalRules() { cachedConditionalRules = undefined; }
 };
