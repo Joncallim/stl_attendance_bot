@@ -1402,6 +1402,8 @@ async function writeHeaderRow(sheets, spreadsheetId, title, header) {
   );
 }
 
+const SHEET_FONT_FAMILY = "Roboto";
+
 function buildHeaderUpdateRequest(sheetId, header) {
   return {
     updateCells: {
@@ -1412,14 +1414,21 @@ function buildHeaderUpdateRequest(sheetId, header) {
       },
       rows: [
         {
-          values: header.map((value) => ({
+          values: header.map((value, colIndex) => ({
             userEnteredValue: {
               stringValue: String(value ?? "")
+            },
+            userEnteredFormat: {
+              textFormat: {
+                fontFamily: SHEET_FONT_FAMILY,
+                // Column A ("Appointment") is not a date header — only columns 1+ are bolded.
+                bold: colIndex > 0
+              }
             }
           }))
         }
       ],
-      fields: "userEnteredValue"
+      fields: "userEnteredValue,userEnteredFormat.textFormat.fontFamily,userEnteredFormat.textFormat.bold"
     }
   };
 }
@@ -1648,6 +1657,25 @@ async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, hea
   const requests = [
     ...removeProtectionRequests,
     ...deleteConditionalFormatRequests,
+    // Apply consistent font family to the entire managed range first, so the header
+    // update below can layer bold on top without needing to repeat the font name.
+    {
+      repeatCell: {
+        range: {
+          sheetId,
+          startRowIndex: 0,
+          endRowIndex: rowLimit,
+          startColumnIndex: 0,
+          endColumnIndex: header.length
+        },
+        cell: {
+          userEnteredFormat: {
+            textFormat: { fontFamily: SHEET_FONT_FAMILY }
+          }
+        },
+        fields: "userEnteredFormat.textFormat.fontFamily"
+      }
+    },
     buildHeaderUpdateRequest(sheetId, header),
     buildAttendanceValidationRequest(sheetId, header.length, options, rowLimit),
     ...(await buildDisabledDayFormattingRequests(sheetId, date, timezone, rowLimit)),
