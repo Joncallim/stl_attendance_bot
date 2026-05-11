@@ -1890,3 +1890,58 @@ test("syncOnboardingRoster reuses one live month snapshot per active sheet refre
   });
 });
 
+// --- reconcileOnboardingWithConfig ---
+
+test("reconcileOnboardingWithConfig: no-op when configuredAppointments is empty", () => {
+  const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
+    ["WS 6", "ECS 4", "Chef 2"],
+    []
+  );
+  assert.deepEqual(reconciled, ["WS 6", "ECS 4", "Chef 2"]);
+  assert.equal(changed, false);
+});
+
+test("reconcileOnboardingWithConfig: reorders matched appointments to yaml order", () => {
+  const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
+    ["ECS 4", "WS 6", "CO"],
+    ["CO", "WS 6", "ECS 4"]
+  );
+  assert.deepEqual(reconciled, ["CO", "WS 6", "ECS 4"]);
+  assert.equal(changed, true);
+});
+
+test("reconcileOnboardingWithConfig: renames appointment to canonical settings.yaml casing", () => {
+  const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
+    ["electronic specialist", "WS 6"],
+    ["Electronic Specialist", "WS 6"]
+  );
+  assert.deepEqual(reconciled, ["Electronic Specialist", "WS 6"]);
+  assert.equal(changed, true);
+});
+
+test("reconcileOnboardingWithConfig: unmatched appointments are pushed to the bottom", () => {
+  const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
+    ["CO", "WS 6", "Unknown Appt", "ECS 4"],
+    ["CO", "ECS 4", "WS 6"]
+  );
+  assert.deepEqual(reconciled, ["CO", "ECS 4", "WS 6", "Unknown Appt"]);
+  assert.equal(changed, true);
+});
+
+test("reconcileOnboardingWithConfig: no change when already consistent", () => {
+  const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
+    ["CO", "WS 6", "ECS 4"],
+    ["CO", "WS 6", "ECS 4"]
+  );
+  assert.deepEqual(reconciled, ["CO", "WS 6", "ECS 4"]);
+  assert.equal(changed, false);
+});
+
+test("reconcileOnboardingWithConfig: configured appointments not in ONBOARDING are excluded", () => {
+  const { reconciled } = __testing.reconcileOnboardingWithConfig(
+    ["WS 6", "ECS 4"],
+    ["CO", "WS 6", "ECS 4", "XO"] // CO and XO not in ONBOARDING
+  );
+  assert.deepEqual(reconciled, ["WS 6", "ECS 4"]);
+});
+

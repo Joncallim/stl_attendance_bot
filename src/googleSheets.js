@@ -436,6 +436,58 @@ function orderAppointmentsCanonically(appointments = []) {
     .map((entry) => entry.value);
 }
 
+/**
+ * Reconciles the appointments currently in the ONBOARDING sheet against the
+ * canonical list from settings.yaml.
+ *
+ * - Appointments whose normalised identity (trim + toUpperCase) matches a
+ *   configured appointment are renamed to the canonical settings.yaml name and
+ *   placed first, in settings.yaml order.
+ * - Appointments that do not match any configured appointment are pushed to the
+ *   bottom of the list unchanged.
+ * - If configuredAppointments is empty the original list is returned as-is.
+ *
+ * Returns { reconciled: string[], changed: boolean }.
+ */
+function reconcileOnboardingWithConfig(onboardingAppointments, configuredAppointments) {
+  if (configuredAppointments.length === 0) {
+    return { reconciled: onboardingAppointments, changed: false };
+  }
+
+  // Map: normalised identity → canonical name from settings.yaml
+  const canonicalByIdentity = new Map(
+    configuredAppointments.map((name) => [normalizeAppointmentIdentity(name), name])
+  );
+
+  // Partition ONBOARDING appointments into matched and unmatched.
+  // De-duplicate matched entries by identity (first wins).
+  const matchedIdentities = new Set();
+  const unmatched = [];
+
+  for (const appt of onboardingAppointments) {
+    const identity = normalizeAppointmentIdentity(appt);
+    if (canonicalByIdentity.has(identity)) {
+      matchedIdentities.add(identity);
+    } else {
+      unmatched.push(appt);
+    }
+  }
+
+  // Reconciled = configured (in yaml order, only those that matched) + unmatched at bottom.
+  const reconciled = [
+    ...configuredAppointments.filter((name) =>
+      matchedIdentities.has(normalizeAppointmentIdentity(name))
+    ),
+    ...unmatched
+  ];
+
+  const changed =
+    reconciled.length !== onboardingAppointments.length ||
+    reconciled.some((name, i) => name !== onboardingAppointments[i]);
+
+  return { reconciled, changed };
+}
+
 async function readJsonFile(filePath, fallbackValue) {
   return readJsonFileFromStore(filePath, fallbackValue);
 }
@@ -1209,8 +1261,13 @@ async function writeAppointmentColumn(
 ) {
   const values = await readSheetValues(sheets, spreadsheetId, title, `A1:B${managedRowLimit(appointments.length)}`);
   const parsed = parseOnboardingManagedRows(values, options.stopMarkers ?? []);
-  const existingCodes = new Map(parsed.managedRows.map((row) => [row.appointment, row.secretCode]));
-  const rows = appointments.map((appointment) => [appointment, existingCodes.get(appointment) ?? ""]);
+  const existingCodesByIdentity = new Map(
+    parsed.managedRows.map((row) => [normalizeAppointmentIdentity(row.appointment), row.secretCode])
+  );
+  const rows = appointments.map((appointment) => [
+    appointment,
+    existingCodesByIdentity.get(normalizeAppointmentIdentity(appointment)) ?? ""
+  ]);
   // Pass the values we already read so writeOnboardingRows skips its own read of the same range.
   await writeOnboardingRows(sheets, spreadsheetId, title, rows, options.stopMarkers ?? [], { ...options, preloadedValues: values });
 }
@@ -3179,33 +3236,67 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
       persist: false
     });
   }
-  // Step 1: Sort Column A of ONBOARDING to canonical rank/department order so newly
-  // added appointments (which land at the bottom) are sorted into place automatically.
-  // When the stop-marker write above already sorted, orderChanged will be false here
-  // and no second write is needed.
+  // Step 1: Reconcile with settings.yaml configured appointments when available;
+  // otherwise fall back to the canonical pattern-based sort.
   console.log(`[Sync] Step 1/4: Sorting ONBOARDING column A to canonical order…`);
   const rawOnboardingAppointments = onboardingSlice.appointments;
-  const sortedOnboardingAppointments = orderAppointmentsCanonically(rawOnboardingAppointments);
-  const orderChanged = rawOnboardingAppointments.some(
-    (apt, i) => apt !== sortedOnboardingAppointments[i]
-  );
 
-  if (orderChanged) {
-    logSheetsSuccess(`[ONBOARDING] Normalising row order (${rawOnboardingAppointments.length} appointments).`);
-    await writeAppointmentColumn(
-      sheets,
-      config.spreadsheetId,
-      title,
-      sortedOnboardingAppointments,
-      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
+  if ((config.configuredAppointments ?? []).length > 0) {
+    // settings.yaml defines the canonical order.  Rename matching appointments
+    // to their settings.yaml name; push non-matching ones to the bottom.
+    const { reconciled, changed } = reconcileOnboardingWithConfig(
+      rawOnboardingAppointments,
+      config.configuredAppointments
     );
-    onboardingSlice = await refreshOnboardingSlice(sheets, config, {
-      cache,
-      force: true,
-      persist: false
-    });
+
+    if (changed) {
+      logSheetsSuccess(
+        `[ONBOARDING] Reconciling with settings.yaml: ${reconciled.length} appointments ` +
+        `(${reconciled.length - rawOnboardingAppointments.filter((a) =>
+          config.configuredAppointments.some(
+            (c) => normalizeAppointmentIdentity(c) === normalizeAppointmentIdentity(a)
+          )
+        ).length} unmatched moved to bottom).`
+      );
+      await writeAppointmentColumn(
+        sheets,
+        config.spreadsheetId,
+        title,
+        reconciled,
+        { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
+      );
+      onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+        cache,
+        force: true,
+        persist: false
+      });
+    } else {
+      console.log(`[Sync] Step 1/4: ONBOARDING already consistent with settings.yaml (${rawOnboardingAppointments.length} appointments).`);
+    }
   } else {
-    console.log(`[Sync] Step 1/4: ONBOARDING already in canonical order (${rawOnboardingAppointments.length} appointments).`);
+    // No configured appointments — fall back to pattern-based canonical sort.
+    const sortedOnboardingAppointments = orderAppointmentsCanonically(rawOnboardingAppointments);
+    const orderChanged = rawOnboardingAppointments.some(
+      (apt, i) => apt !== sortedOnboardingAppointments[i]
+    );
+
+    if (orderChanged) {
+      logSheetsSuccess(`[ONBOARDING] Normalising row order (${rawOnboardingAppointments.length} appointments).`);
+      await writeAppointmentColumn(
+        sheets,
+        config.spreadsheetId,
+        title,
+        sortedOnboardingAppointments,
+        { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
+      );
+      onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+        cache,
+        force: true,
+        persist: false
+      });
+    } else {
+      console.log(`[Sync] Step 1/4: ONBOARDING already in canonical order (${rawOnboardingAppointments.length} appointments).`);
+    }
   }
 
   const onboardingAppointments = onboardingSlice.appointments;
@@ -3303,7 +3394,10 @@ export async function syncOnboardingCodeColumn(sheets, config, codeEntries) {
     force: true,
     persist: false
   });
-  const codeMap = new Map(codeEntries.map((entry) => [entry.appointment, entry.secretCode]));
+  const codeMap = new Map(codeEntries.map((entry) => [
+    entry.appointment,
+    entry.boundChatId ? "IN-USE" : entry.secretCode
+  ]));
   const rows = onboardingSlice.appointments.map((appointment) => [
     appointment,
     codeMap.get(appointment) ?? ""
@@ -4114,5 +4208,6 @@ export const __testing = {
   getMonthParts,
   shiftMonth,
   writeMonthlySheetRows,
-  writeAppointmentColumn
+  writeAppointmentColumn,
+  reconcileOnboardingWithConfig
 };
