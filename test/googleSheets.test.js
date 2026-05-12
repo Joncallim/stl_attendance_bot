@@ -1919,12 +1919,13 @@ test("reconcileOnboardingWithConfig: renames appointment to canonical settings.y
   assert.equal(changed, true);
 });
 
-test("reconcileOnboardingWithConfig: unmatched appointments are pushed to the bottom", () => {
+test("reconcileOnboardingWithConfig: unmatched appointments are dropped (settings.yaml is authoritative)", () => {
   const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
     ["CO", "WS 6", "Unknown Appt", "ECS 4"],
     ["CO", "ECS 4", "WS 6"]
   );
-  assert.deepEqual(reconciled, ["CO", "ECS 4", "WS 6", "Unknown Appt"]);
+  // "Unknown Appt" is not in settings.yaml so it must be removed from the result.
+  assert.deepEqual(reconciled, ["CO", "ECS 4", "WS 6"]);
   assert.equal(changed, true);
 });
 

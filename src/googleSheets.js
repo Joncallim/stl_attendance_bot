@@ -440,11 +440,12 @@ function orderAppointmentsCanonically(appointments = []) {
  * Reconciles the appointments currently in the ONBOARDING sheet against the
  * canonical list from settings.yaml.
  *
+ * When configuredAppointments is non-empty, settings.yaml is authoritative:
  * - Appointments whose normalised identity (trim + toUpperCase) matches a
  *   configured appointment are renamed to the canonical settings.yaml name and
- *   placed first, in settings.yaml order.
- * - Appointments that do not match any configured appointment are pushed to the
- *   bottom of the list unchanged.
+ *   placed in settings.yaml order.
+ * - Appointments that do not match any configured appointment are DROPPED —
+ *   they have been removed from settings.yaml and should be removed from ONBOARDING.
  * - If configuredAppointments is empty the original list is returned as-is.
  *
  * Returns { reconciled: string[], changed: boolean }.
@@ -459,29 +460,22 @@ function reconcileOnboardingWithConfig(onboardingAppointments, configuredAppoint
     configuredAppointments.map((name) => [normalizeAppointmentIdentity(name), name])
   );
 
-  // Partition ONBOARDING appointments into matched and unmatched.
-  // De-duplicate matched entries by identity (first wins).
+  // Collect matched identities (de-duplicated; first occurrence wins).
   const matchedIdentities = new Set();
-  const unmatched = [];
 
   for (const appt of onboardingAppointments) {
     const identity = normalizeAppointmentIdentity(appt);
     if (canonicalByIdentity.has(identity)) {
       matchedIdentities.add(identity);
-    } else {
-      unmatched.push(appt);
     }
+    // Unmatched appointments are intentionally dropped — settings.yaml is authoritative.
   }
 
-  // Reconciled = configured (in yaml order, only those that matched) + unmatched at bottom.
-  // Unmatched appointments are canonically sorted among themselves so they retain a
-  // predictable order even when not covered by settings.yaml.
-  const reconciled = [
-    ...configuredAppointments.filter((name) =>
-      matchedIdentities.has(normalizeAppointmentIdentity(name))
-    ),
-    ...orderAppointmentsCanonically(unmatched)
-  ];
+  // Reconciled = configured appointments (in yaml order) that exist in ONBOARDING.
+  // Appointments removed from settings.yaml are not included.
+  const reconciled = configuredAppointments.filter((name) =>
+    matchedIdentities.has(normalizeAppointmentIdentity(name))
+  );
 
   const changed =
     reconciled.length !== onboardingAppointments.length ||
@@ -3240,6 +3234,38 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
       persist: false
     });
   }
+  // Pre-Step 1: Physically delete any blank rows from the ONBOARDING sheet.
+  // Blank rows cause hasBlankRowDrift=true which triggers the driftDetected early
+  // return at the end of Step 1, preventing month-sheet updates.  writeOnboardingRows
+  // does not delete rows — it compares by sequential index — so we must use
+  // deleteDimension requests to remove them before reconciliation.
+  if (onboardingSlice.hasBlankRowDrift && (onboardingSlice.blankRowNumbers?.length ?? 0) > 0) {
+    const { sheetId: onboardingSheetId, blankRowNumbers } = onboardingSlice;
+    logSheetsSuccess(
+      `[ONBOARDING] Removing ${blankRowNumbers.length} blank row(s) before reconciliation…`
+    );
+    // Delete in reverse (highest row first) so earlier row indices stay valid.
+    const deleteRequests = [...blankRowNumbers]
+      .sort((a, b) => b - a)
+      .map((rowNumber) => ({
+        deleteDimension: {
+          range: {
+            sheetId: onboardingSheetId,
+            dimension: "ROWS",
+            startIndex: rowNumber - 1,   // 0-based inclusive
+            endIndex: rowNumber           // 0-based exclusive
+          }
+        }
+      }));
+    await runGoogleSheetsRequest(`batchUpdate:${title}:cleanBlankRows`, (signal) =>
+      sheets.spreadsheets.batchUpdate(
+        { spreadsheetId: config.spreadsheetId, requestBody: { requests: deleteRequests } },
+        { signal }
+      )
+    );
+    onboardingSlice = await refreshOnboardingSlice(sheets, config, { cache, force: true, persist: false });
+  }
+
   // Step 1: Reconcile with settings.yaml configured appointments when available;
   // otherwise fall back to the canonical pattern-based sort.
   console.log(`[Sync] Step 1/4: Sorting ONBOARDING column A to canonical order…`);
@@ -3247,20 +3273,17 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
 
   if ((config.configuredAppointments ?? []).length > 0) {
     // settings.yaml defines the canonical order.  Rename matching appointments
-    // to their settings.yaml name; push non-matching ones to the bottom.
+    // to their settings.yaml name; appointments removed from settings.yaml are dropped.
     const { reconciled, changed } = reconcileOnboardingWithConfig(
       rawOnboardingAppointments,
       config.configuredAppointments
     );
 
     if (changed) {
+      const dropped = rawOnboardingAppointments.length - reconciled.length;
       logSheetsSuccess(
-        `[ONBOARDING] Reconciling with settings.yaml: ${reconciled.length} appointments ` +
-        `(${reconciled.length - rawOnboardingAppointments.filter((a) =>
-          config.configuredAppointments.some(
-            (c) => normalizeAppointmentIdentity(c) === normalizeAppointmentIdentity(a)
-          )
-        ).length} unmatched moved to bottom).`
+        `[ONBOARDING] Reconciling with settings.yaml: ${reconciled.length} appointments` +
+        (dropped > 0 ? ` (${dropped} removed — no longer in settings.yaml).` : ".")
       );
       await writeAppointmentColumn(
         sheets,
