@@ -474,11 +474,13 @@ function reconcileOnboardingWithConfig(onboardingAppointments, configuredAppoint
   }
 
   // Reconciled = configured (in yaml order, only those that matched) + unmatched at bottom.
+  // Unmatched appointments are canonically sorted among themselves so they retain a
+  // predictable order even when not covered by settings.yaml.
   const reconciled = [
     ...configuredAppointments.filter((name) =>
       matchedIdentities.has(normalizeAppointmentIdentity(name))
     ),
-    ...unmatched
+    ...orderAppointmentsCanonically(unmatched)
   ];
 
   const changed =
@@ -1485,7 +1487,7 @@ function buildHeaderUpdateRequest(sheetId, header) {
           }))
         }
       ],
-      fields: "userEnteredValue,userEnteredFormat.textFormat.fontFamily,userEnteredFormat.textFormat.bold"
+      fields: "userEnteredValue,userEnteredFormat.textFormat"
     }
   };
 }
@@ -1873,13 +1875,15 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     // layoutOnly is used for the previous month where we want formatting refreshed but must
     // never touch row structure (avoids row-insert timeouts that block current/next months).
     if (mode === "replace" || options.applyLayout === true || options.layoutOnly === true) {
-      const layoutHeader = getHeaderRowFromValues(monthlySheetValues, defaultHeader);
+      // Always use the computed defaultHeader for layout so that the column count,
+      // validation range, and bold-date-header requests are never truncated by a
+      // sheet whose last column happens to be empty/sparse.
       await applyMonthlySheetLayout(
         sheets,
         config.spreadsheetId,
         sheet.properties.sheetId,
         date,
-        layoutHeader,
+        defaultHeader,
         config.attendanceOptions,
         config.timezone,
         appointments.length,
