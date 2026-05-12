@@ -1946,3 +1946,78 @@ test("reconcileOnboardingWithConfig: configured appointments not in ONBOARDING a
   assert.deepEqual(reconciled, ["WS 6", "ECS 4"]);
 });
 
+// --- reconcileOnboardingWithConfig with officer type patterns ---
+
+function makePatterns(...prefixes) {
+  return prefixes.map((prefix) => ({
+    prefix: prefix.toUpperCase(),
+    pattern: new RegExp(`^${prefix.toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s+\\d+)?$`)
+  }));
+}
+
+test("reconcileOnboardingWithConfig: officer type pattern keeps unlisted numbered variant", () => {
+  // OPS 1 is explicit; OPS 2 only exists in ONBOARDING — should be kept via pattern.
+  const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
+    ["CO", "OPS 1", "OPS 2"],
+    ["CO", "OPS 1"],
+    makePatterns("OPS")
+  );
+  // Canonical order: CO (top-block 0), OPS 1 (top-block 2, number 1), OPS 2 (top-block 2, number 2)
+  assert.deepEqual(reconciled, ["CO", "OPS 1", "OPS 2"]);
+  assert.equal(changed, false); // order and count already correct
+});
+
+test("reconcileOnboardingWithConfig: officer type pattern keeps bare prefix (no number)", () => {
+  const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
+    ["CO", "AOPS", "OPS 1"],
+    ["CO", "OPS 1"],
+    makePatterns("OPS", "AOPS")
+  );
+  // Canonical order: CO (0), OPS 1 (OPS bucket, number 1), AOPS (AOPS bucket)
+  assert.ok(reconciled.includes("AOPS"), "AOPS must be kept via pattern");
+  assert.ok(reconciled.includes("CO"), "CO must be kept (explicit)");
+  assert.ok(reconciled.includes("OPS 1"), "OPS 1 must be kept (explicit)");
+  assert.equal(reconciled.length, 3);
+  assert.equal(changed, true); // AOPS was added to the list
+});
+
+test("reconcileOnboardingWithConfig: non-officer unmatched appointment is still dropped with patterns active", () => {
+  const { reconciled } = __testing.reconcileOnboardingWithConfig(
+    ["CO", "OPS 1", "ECS UNKNOWN", "OPS 2"],
+    ["CO", "OPS 1"],
+    makePatterns("OPS")
+  );
+  // "ECS UNKNOWN" does not match OPS pattern → dropped
+  assert.ok(!reconciled.includes("ECS UNKNOWN"), "ECS UNKNOWN must be dropped");
+  assert.ok(reconciled.includes("OPS 2"), "OPS 2 must be kept via pattern");
+});
+
+test("reconcileOnboardingWithConfig: duplicate pattern-matched entry is de-duplicated", () => {
+  const { reconciled } = __testing.reconcileOnboardingWithConfig(
+    ["CO", "OPS 1", "OPS 1", "OPS 2"], // OPS 1 duplicated
+    ["CO"],
+    makePatterns("OPS")
+  );
+  const ops1Count = reconciled.filter((a) => a.toUpperCase() === "OPS 1").length;
+  assert.equal(ops1Count, 1, "OPS 1 must appear only once");
+});
+
+test("reconcileOnboardingWithConfig: officer type pattern is case-insensitive", () => {
+  const { reconciled } = __testing.reconcileOnboardingWithConfig(
+    ["CO", "ops 2"], // lowercase in sheet
+    ["CO"],
+    makePatterns("OPS")
+  );
+  assert.ok(reconciled.includes("ops 2"), "lowercase ops 2 must be kept");
+});
+
+test("reconcileOnboardingWithConfig: no patterns — unchanged drop behaviour", () => {
+  // Without patterns the function must still drop non-explicit appointments.
+  const { reconciled } = __testing.reconcileOnboardingWithConfig(
+    ["CO", "OPS 2"],
+    ["CO"],
+    [] // no patterns
+  );
+  assert.deepEqual(reconciled, ["CO"]);
+});
+

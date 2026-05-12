@@ -244,6 +244,37 @@ async function loadSettingsDocument() {
     }
   }
 
+  // ── Officer appointment types ─────────────────────────────────────────────────
+  // Each entry is a role prefix (string) that matches appointments of the form
+  // PREFIX  or  PREFIX <number>  (case-insensitive).  Appointments in ONBOARDING
+  // that match a pattern here are kept during reconciliation even if they are not
+  // explicitly listed in the `appointments` section.
+  const officerTypeEntries = Array.isArray(document.officerAppointmentTypes)
+    ? document.officerAppointmentTypes
+    : [];
+
+  const officerAppointmentTypePatterns = [];
+
+  for (const [index, entry] of officerTypeEntries.entries()) {
+    const rawPrefix = typeof entry === "string"
+      ? entry
+      : ensureNonEmptyString(entry?.prefix, `officerAppointmentTypes[${index}].prefix`);
+
+    const prefix = rawPrefix.trim().toUpperCase();
+
+    if (!prefix) {
+      throw new Error(`officerAppointmentTypes[${index}] must be a non-empty string.`);
+    }
+
+    // Escape any regex metacharacters in the prefix (e.g. a literal dot or plus).
+    const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Matches: PREFIX  or  PREFIX <one-or-more-digits>
+    officerAppointmentTypePatterns.push({
+      prefix,
+      pattern: new RegExp(`^${escaped}(\\s+\\d+)?$`)
+    });
+  }
+
   const attendance = ensureObject(document.attendance, "attendance");
   const groups = Array.isArray(attendance.groups) ? attendance.groups : [];
 
@@ -332,6 +363,7 @@ async function loadSettingsDocument() {
     hierarchyNodeByKey,
     appointmentMetadataByName,
     configuredAppointments,
+    officerAppointmentTypePatterns,
     defaultAdminAppointments,
     attendanceGroups,
     attendanceOptions,
@@ -360,6 +392,7 @@ const runtimeConfig = {
   hierarchyNodeByKey: new Map(),
   appointmentMetadataByName: new Map(),
   configuredAppointments: [],
+  officerAppointmentTypePatterns: [],
   appointmentOrderIndex: new Map(),
   defaultAdminAppointments: [],
   attendanceGroups: [],
@@ -373,6 +406,7 @@ function applyUnitSettings(config, unitSettings) {
   config.hierarchyNodeByKey = unitSettings.hierarchyNodeByKey;
   config.appointmentMetadataByName = unitSettings.appointmentMetadataByName;
   config.configuredAppointments = unitSettings.configuredAppointments;
+  config.officerAppointmentTypePatterns = unitSettings.officerAppointmentTypePatterns;
   config.appointmentOrderIndex = unitSettings.appointmentOrderIndex;
   config.defaultAdminAppointments = unitSettings.defaultAdminAppointments;
   config.attendanceGroups = unitSettings.attendanceGroups;

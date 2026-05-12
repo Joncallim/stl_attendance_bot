@@ -444,13 +444,25 @@ function orderAppointmentsCanonically(appointments = []) {
  * - Appointments whose normalised identity (trim + toUpperCase) matches a
  *   configured appointment are renamed to the canonical settings.yaml name and
  *   placed in settings.yaml order.
- * - Appointments that do not match any configured appointment are DROPPED —
- *   they have been removed from settings.yaml and should be removed from ONBOARDING.
+ * - Appointments that match an officer type pattern (officerTypePatterns) are
+ *   KEPT even if they are not explicitly listed in configuredAppointments.  When
+ *   pattern-matched appointments are present the merged set is sorted canonically
+ *   (officers block first, then departments) so that dynamic entries like "OPS 2"
+ *   slot into the correct position.
+ * - Appointments that neither match a configured name nor an officer type pattern
+ *   are DROPPED — they have been removed from settings.yaml.
  * - If configuredAppointments is empty the original list is returned as-is.
  *
+ * @param {string[]} onboardingAppointments  Current ONBOARDING appointment names.
+ * @param {string[]} configuredAppointments  Explicit appointments from settings.yaml.
+ * @param {{ prefix: string, pattern: RegExp }[]} [officerTypePatterns]  Officer type patterns.
  * Returns { reconciled: string[], changed: boolean }.
  */
-function reconcileOnboardingWithConfig(onboardingAppointments, configuredAppointments) {
+function reconcileOnboardingWithConfig(
+  onboardingAppointments,
+  configuredAppointments,
+  officerTypePatterns = []
+) {
   if (configuredAppointments.length === 0) {
     return { reconciled: onboardingAppointments, changed: false };
   }
@@ -460,22 +472,46 @@ function reconcileOnboardingWithConfig(onboardingAppointments, configuredAppoint
     configuredAppointments.map((name) => [normalizeAppointmentIdentity(name), name])
   );
 
-  // Collect matched identities (de-duplicated; first occurrence wins).
+  // Partition ONBOARDING appointments into three buckets:
+  //   matchedIdentities   — explicitly in configuredAppointments (use canonical name/order)
+  //   patternMatched      — match an officer type pattern but not explicitly listed (keep as-is)
+  //   (everything else)   — dropped
+  // De-duplicate by normalised identity throughout (first occurrence wins).
   const matchedIdentities = new Set();
+  const patternMatched = [];
+  const seenIdentities = new Set();
 
   for (const appt of onboardingAppointments) {
     const identity = normalizeAppointmentIdentity(appt);
+
+    if (seenIdentities.has(identity)) {
+      continue; // skip duplicates
+    }
+    seenIdentities.add(identity);
+
     if (canonicalByIdentity.has(identity)) {
       matchedIdentities.add(identity);
+    } else if (
+      officerTypePatterns.length > 0 &&
+      officerTypePatterns.some((p) => p.pattern.test(identity))
+    ) {
+      patternMatched.push(appt);
     }
-    // Unmatched appointments are intentionally dropped — settings.yaml is authoritative.
+    // Unmatched, non-pattern appointments are intentionally dropped.
   }
 
-  // Reconciled = configured appointments (in yaml order) that exist in ONBOARDING.
-  // Appointments removed from settings.yaml are not included.
-  const reconciled = configuredAppointments.filter((name) =>
+  // Build the reconciled list.
+  const explicitReconciled = configuredAppointments.filter((name) =>
     matchedIdentities.has(normalizeAppointmentIdentity(name))
   );
+
+  // When pattern-matched appointments exist, merge with explicitly reconciled
+  // and re-sort canonically so dynamic entries (e.g. "OPS 2") land in the
+  // right position within the officer block.
+  const reconciled =
+    patternMatched.length > 0
+      ? orderAppointmentsCanonically([...explicitReconciled, ...patternMatched])
+      : explicitReconciled;
 
   const changed =
     reconciled.length !== onboardingAppointments.length ||
@@ -3274,9 +3310,12 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
   if ((config.configuredAppointments ?? []).length > 0) {
     // settings.yaml defines the canonical order.  Rename matching appointments
     // to their settings.yaml name; appointments removed from settings.yaml are dropped.
+    // officerAppointmentTypePatterns (if any) extend coverage to dynamic variants
+    // like "OPS 2" that are not explicitly listed.
     const { reconciled, changed } = reconcileOnboardingWithConfig(
       rawOnboardingAppointments,
-      config.configuredAppointments
+      config.configuredAppointments,
+      config.officerAppointmentTypePatterns ?? []
     );
 
     if (changed) {

@@ -120,3 +120,67 @@ test("invalid settings.yaml fails fast with a clear validation error", async () 
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test("officerAppointmentTypes are parsed into regex patterns", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "attendance-config-officer-"));
+  const settingsPath = path.join(tempDir, "settings.yaml");
+
+  await writeFile(settingsPath, [
+    "schemaVersion: 1",
+    "unit:",
+    "  id: alpha",
+    "  name: Alpha Unit",
+    "hierarchy:",
+    "  - id: officers",
+    "    name: Officers",
+    "    type: department",
+    "    order: 0",
+    "officerAppointmentTypes:",
+    "  - OPS",
+    "  - AOPS",
+    "  - SME",
+    "appointments:",
+    "  - name: CO",
+    "    hierarchyNodeId: officers",
+    "    defaultAdmin: true",
+    "    order: 0",
+    "attendance:",
+    "  groups:",
+    "    - id: present",
+    "      label: Present",
+    "      options:",
+    "        - PRESENT"
+  ].join("\n"));
+
+  process.env.SETTINGS_FILE_PATH = settingsPath;
+  process.env.ATTENDANCE_BOT_DATA_DIR = tempDir;
+
+  try {
+    const module = await import(`../src/config.js?case=officer-${Date.now()}`);
+    const appliedConfig = await module.applyStoredConfigOverrides();
+
+    const patterns = appliedConfig.officerAppointmentTypePatterns;
+    assert.equal(patterns.length, 3, "three patterns expected");
+
+    const prefixes = patterns.map((p) => p.prefix);
+    assert.deepEqual(prefixes, ["OPS", "AOPS", "SME"]);
+
+    // OPS pattern matches "OPS", "OPS 1", "OPS 12" but not "AOPS" or "OPS 1A"
+    const opsPattern = patterns.find((p) => p.prefix === "OPS").pattern;
+    assert.ok(opsPattern.test("OPS"),     "OPS pattern matches bare OPS");
+    assert.ok(opsPattern.test("OPS 1"),   "OPS pattern matches OPS 1");
+    assert.ok(opsPattern.test("OPS 12"),  "OPS pattern matches OPS 12");
+    assert.ok(!opsPattern.test("AOPS"),   "OPS pattern does not match AOPS");
+    assert.ok(!opsPattern.test("OPS 1A"), "OPS pattern does not match OPS 1A");
+
+    // SME matches "SME" alone or with a number suffix
+    const smePattern = patterns.find((p) => p.prefix === "SME").pattern;
+    assert.ok(smePattern.test("SME"),   "SME pattern matches bare SME");
+    assert.ok(smePattern.test("SME 1"), "SME pattern matches SME 1");
+    assert.ok(!smePattern.test("SCSE"), "SME pattern does not match SCSE");
+  } finally {
+    delete process.env.SETTINGS_FILE_PATH;
+    delete process.env.ATTENDANCE_BOT_DATA_DIR;
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
