@@ -192,18 +192,31 @@ const TOP_BLOCK_ORDER = new Map([
 ]);
 
 const DEPARTMENT_SPECS = [
-  { label: "C2", order: 0, chiefPatterns: [/^CC2(.*)$/] },
-  { label: "WS", order: 1, chiefPatterns: [/^CWS(.*)$/] },
-  { label: "WCS", order: 2, chiefPatterns: [/^CWCS(.*)$/] },
-  { label: "UW", order: 3, chiefPatterns: [/^CUW(.*)$/] },
-  { label: "NAV", order: 4, chiefPatterns: [] },
-  { label: "COMMS", order: 5, chiefPatterns: [/^CCOMMS(.*)$/] },
-  { label: "ELECTRONIC SPECIALIST", order: 6, chiefPatterns: [/^CHIEF ELECTRONIC SPECIALIST(.*)$/] },
-  { label: "COMMS SPECIALIST", order: 7, chiefPatterns: [/^CHIEF COMMS SPECIALIST(.*)$/] },
-  { label: "MS", order: 8, chiefPatterns: [/^CMS(.*)$/] },
-  { label: "ECS", order: 9, chiefPatterns: [/^CECS(.*)$/] },
-  { label: "CHEF", order: 10, chiefPatterns: [/^CCHEF(.*)$/] }
+  { label: "C2", order: 0 },
+  { label: "WS", order: 1 },
+  { label: "WCS", order: 2 },
+  { label: "UW", order: 3 },
+  { label: "NAV", order: 4 },
+  { label: "COMMS", order: 5 },
+  { label: "ELECTRONIC SPECIALIST", order: 6 },
+  { label: "COMMS SPECIALIST", order: 7 },
+  { label: "MS", order: 8 },
+  { label: "ECS", order: 9 },
+  { label: "CHEF", order: 10 }
 ];
+
+/**
+ * Builds a RegExp that matches the "chief" form of a department label:
+ *   - "C<LABEL>"   (compact, no space)
+ *   - "C <LABEL>"  (with space)
+ *   - "CHIEF <LABEL>"
+ *
+ * e.g. buildChiefPattern("WS") matches "CWS", "C WS", "CHIEF WS".
+ */
+function buildChiefPattern(label) {
+  const escapedLabel = label.replace(/\s+/g, "\\s+");
+  return new RegExp(`^(?:CHIEF\\s+|C\\s*)${escapedLabel}(.*)$`);
+}
 export const DEPARTMENT_BUCKETS = [
   { key: "OFFICERS", label: "Officers" },
   { key: "C2", label: "C2" },
@@ -222,9 +235,9 @@ const DEPARTMENT_LABEL_BY_KEY = new Map(
   DEPARTMENT_BUCKETS.map((entry) => [entry.key, entry.label])
 );
 
-const DEPARTMENT_PARSE_SPECS = [...DEPARTMENT_SPECS].sort(
-  (left, right) => right.label.length - left.label.length
-);
+const DEPARTMENT_PARSE_SPECS = [...DEPARTMENT_SPECS]
+  .sort((left, right) => right.label.length - left.label.length)
+  .map((spec) => ({ ...spec, chiefPattern: buildChiefPattern(spec.label) }));
 
 function compareVariantSuffix(left, right) {
   if (!left && !right) {
@@ -314,57 +327,124 @@ function parseDepartmentAppointment(label, originalIndex) {
   const normalized = normalizeAppointmentForOrdering(label);
 
   for (const spec of DEPARTMENT_PARSE_SPECS) {
+    // 1. Chief pattern: "C<LABEL>", "C <LABEL>", "Chief <LABEL>" / "CHIEF <LABEL>"
+    const chiefMatch = normalized.match(spec.chiefPattern);
 
-    for (const pattern of spec.chiefPatterns) {
-      const chiefMatch = normalized.match(pattern);
-
-      if (chiefMatch) {
-        return {
-          bucketOrder: 100 + spec.order,
-          family: `${spec.label}:CHIEF`,
-          roleOrder: 0,
-          number: -1,
-          variantSuffix: String(chiefMatch[1] ?? "").trim(),
-          originalIndex
-        };
-      }
-    }
-
-    const prefixPattern = new RegExp(`^${spec.label.replace(/\s+/g, "\\s+")}(.*)$`);
-    const prefixMatch = normalized.match(prefixPattern);
-
-    if (!prefixMatch || (prefixMatch[1] && !/^[\s(-]/.test(prefixMatch[1]))) {
-      continue;
-    }
-
-    const remainder = String(prefixMatch[1] ?? "").trim();
-
-    for (const [pattern, roleOrder, familySuffix] of [
-      [/^SUP(?:\s+(\d+))?(.*)$/, 1, "SUP"],
-      [/^(\d+)(.*)$/, 2, "SEAT"],
-      [/^WPL(?:\s+(\d+))?(.*)$/, 3, "WPL"],
-      [/^OJT(?:\s+(\d+))?(.*)$/, 4, "OJT"]
-    ]) {
-      const match = remainder.match(pattern);
-
-      if (!match) {
-        continue;
-      }
-
-        return {
-          bucketOrder: 100 + spec.order,
-          family: `${spec.label}:${familySuffix}`,
-        roleOrder,
-        number: match[1] ? Number(match[1]) : -1,
-        variantSuffix: String(match[2] ?? "").trim(),
+    if (chiefMatch) {
+      return {
+        bucketOrder: 100 + spec.order,
+        family: `${spec.label}:CHIEF`,
+        roleOrder: 0,
+        number: -1,
+        variantSuffix: String(chiefMatch[1] ?? "").trim(),
         originalIndex
       };
     }
 
+    // 2. Extract the remainder after the department prefix.
+    //    Spaced form first ("WS Sup 1", "ECS 2"), then compact form for
+    //    single-word labels only ("MSSUP1", "WSPO1", "C2WPL1").
+    let remainder = null;
+    const escapedLabel = spec.label.replace(/\s+/g, "\\s+");
+    const spacedMatch = normalized.match(new RegExp(`^${escapedLabel}(?:\\s+(.*))?$`));
+
+    if (spacedMatch) {
+      // Matched exactly "LABEL" (group undefined) or "LABEL <rest>"
+      remainder = String(spacedMatch[1] ?? "").trim();
+    } else if (!spec.label.includes(" ")) {
+      // Compact form: immediately-adjacent role token (no separator space).
+      // e.g. "MSSUP1" → remainder "SUP1", "WSPO1" → "PO1", "C2WPL1" → "WPL1"
+      const compactMatch = normalized.match(
+        new RegExp(`^${escapedLabel}(SUP|S(?=\\d)|PO|WPL|OJT|\\d)(.*)$`)
+      );
+
+      if (compactMatch) {
+        remainder = (compactMatch[1] + compactMatch[2]).trim();
+      }
+    }
+
+    if (remainder === null) {
+      continue;
+    }
+
+    // 3. Parse role from remainder.
+    //    Role order: Chief(0) > Sup(1) > PO(2) > Seat/operator(3) > WPL(4) > OJT(5) > Other(6)
+
+    // SUP / S (supervisor abbreviation — "S" only when followed by digit/whitespace+digit)
+    const supMatch = remainder.match(/^(SUP|S(?=\s*\d))(?:\s*(\d+))?(.*)$/);
+
+    if (supMatch) {
+      return {
+        bucketOrder: 100 + spec.order,
+        family: `${spec.label}:SUP`,
+        roleOrder: 1,
+        number: supMatch[2] !== undefined ? Number(supMatch[2]) : -1,
+        variantSuffix: String(supMatch[3] ?? "").trim(),
+        originalIndex
+      };
+    }
+
+    // PO (e.g. "WS PO 1", "WSPO1")
+    const poMatch = remainder.match(/^PO(?:\s*(\d+))?(.*)$/);
+
+    if (poMatch) {
+      return {
+        bucketOrder: 100 + spec.order,
+        family: `${spec.label}:PO`,
+        roleOrder: 2,
+        number: poMatch[1] !== undefined ? Number(poMatch[1]) : -1,
+        variantSuffix: String(poMatch[2] ?? "").trim(),
+        originalIndex
+      };
+    }
+
+    // SEAT — bare number operator (e.g. "WS 1", "WS1")
+    const seatMatch = remainder.match(/^(\d+)(.*)$/);
+
+    if (seatMatch) {
+      return {
+        bucketOrder: 100 + spec.order,
+        family: `${spec.label}:SEAT`,
+        roleOrder: 3,
+        number: Number(seatMatch[1]),
+        variantSuffix: String(seatMatch[2] ?? "").trim(),
+        originalIndex
+      };
+    }
+
+    // WPL (e.g. "C2 WPL 1", "C2WPL1")
+    const wplMatch = remainder.match(/^WPL(?:\s*(\d+))?(.*)$/);
+
+    if (wplMatch) {
+      return {
+        bucketOrder: 100 + spec.order,
+        family: `${spec.label}:WPL`,
+        roleOrder: 4,
+        number: wplMatch[1] !== undefined ? Number(wplMatch[1]) : -1,
+        variantSuffix: String(wplMatch[2] ?? "").trim(),
+        originalIndex
+      };
+    }
+
+    // OJT (e.g. "WS OJT 1", "WSOJT1")
+    const ojtMatch = remainder.match(/^OJT(?:\s*(\d+))?(.*)$/);
+
+    if (ojtMatch) {
+      return {
+        bucketOrder: 100 + spec.order,
+        family: `${spec.label}:OJT`,
+        roleOrder: 5,
+        number: ojtMatch[1] !== undefined ? Number(ojtMatch[1]) : -1,
+        variantSuffix: String(ojtMatch[2] ?? "").trim(),
+        originalIndex
+      };
+    }
+
+    // OTHER — within-department, unrecognized role suffix
     return {
       bucketOrder: 100 + spec.order,
       family: `${spec.label}:OTHER`,
-      roleOrder: 5,
+      roleOrder: 6,
       number: -1,
       variantSuffix: remainder,
       originalIndex
@@ -501,6 +581,11 @@ function sortWithConfig(appointments, config) {
     }
   }
 
+  // The highest yaml index present — used as a fallback anchor base so that
+  // pattern-matched officer types with NO explicit yaml entry still sort after
+  // all explicitly-listed key officers.
+  const maxYamlIdx = yamlOrder.size > 0 ? Math.max(...yamlOrder.values()) : 0;
+
   /**
    * Returns a sort key tuple [tier, primary, secondary, tertiary] for a
    * single appointment name.
@@ -523,12 +608,13 @@ function sortWithConfig(appointments, config) {
     for (const { prefix, pattern } of patterns) {
       if (pattern.test(identity)) {
         const anchor = prefixMaxYaml.get(prefix);
-        // If no explicit appointment of this prefix is in yaml, use the
-        // hardcoded TOP_BLOCK_ORDER position as the anchor.
+        // If no explicit appointment of this prefix is in yaml, place this
+        // entry AFTER all key officers by anchoring past maxYamlIdx.
+        // Use TOP_BLOCK_ORDER within that zone to preserve relative family order.
         const anchorBase =
           anchor !== undefined
             ? anchor * 10000 + 5000  // between anchor and anchor+1 explicit slots
-            : (TOP_BLOCK_ORDER.get(prefix) ?? 99) * 10000 + 5000;
+            : (maxYamlIdx + 1) * 10000 + (TOP_BLOCK_ORDER.get(prefix) ?? 99) * 100;
         const numMatch = identity.match(/\s+(\d+)$/);
         const num = numMatch ? parseInt(numMatch[1], 10) : -1;
         return [0, anchorBase + Math.max(0, num + 1), 0, 0];

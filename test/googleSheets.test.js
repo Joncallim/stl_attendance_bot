@@ -2077,3 +2077,107 @@ test("sortWithConfig: stable when config is null — falls back to canonical ord
   assert.equal(sorted[0], "CO", "CO first in canonical order");
 });
 
+test("sortWithConfig: pattern-matched officers without yaml entries sort after all key officers", () => {
+  // yaml: CO(0) … ME(14). ASE/ANO/YO have no yaml entries.
+  // They must sort AFTER ME, not before it.
+  const config = makeConfig({
+    yamlOrder: [
+      ["CO", 0], ["XO", 1], ["COXN", 2],
+      ["OPS 1", 3], ["OPS 2", 4], ["OPS 3", 5], ["OPS 4", 6], ["OPS 5", 7],
+      ["NO", 8], ["AOPS 1", 9], ["AOPS 2", 10], ["AOPS 3", 11],
+      ["SME", 12], ["SCSE", 13], ["ME", 14]
+    ],
+    officerPatterns: ["OPS", "AOPS", "SME", "SCSE", "ME", "ASE", "ANO", "YO"]
+  });
+  const sorted = __testing.sortWithConfig(["ASE 1", "ME", "ANO", "YO 2"], config);
+  assert.equal(sorted[0], "ME", "ME (last explicit) sorts before pattern-only entries");
+  assert.ok(sorted.indexOf("ASE 1") > sorted.indexOf("ME"), "ASE 1 after ME");
+  assert.ok(sorted.indexOf("ANO") > sorted.indexOf("ME"), "ANO after ME");
+  assert.ok(sorted.indexOf("YO 2") > sorted.indexOf("ME"), "YO 2 after ME");
+  // Family ordering within "other officers": ASE(9) < ANO(10) < YO(11)
+  assert.ok(sorted.indexOf("ASE 1") < sorted.indexOf("ANO"), "ASE before ANO");
+  assert.ok(sorted.indexOf("ANO") < sorted.indexOf("YO 2"), "ANO before YO");
+});
+
+// --- department appointment parsing (compact forms, PO role, chief variants) ---
+
+test("department parsing: compact forms without spaces are recognised", () => {
+  const ordered = __testing.orderAppointmentsCanonically([
+    "WSOJT1",   // WS OJT 1
+    "WSPO1",    // WS PO 1
+    "C2WPL1",   // C2 WPL 1
+    "MSSUP1",   // MS Sup 1
+    "WS 2",     // WS Seat 2 (spaced)
+    "CWS",      // Chief WS
+    "C2 1"      // C2 Seat 1
+  ]);
+  // Dept order: C2(0) < WS(1) < MS(8).
+  // Within WS: CHIEF(0) < PO(2) < SEAT(3) < OJT(5).
+  // Within C2: SEAT(3) < WPL(4).
+  // Expected full order: C2 1, C2WPL1, CWS, WSPO1, WS 2, WSOJT1, MSSUP1
+  assert.deepEqual(ordered, ["C2 1", "C2WPL1", "CWS", "WSPO1", "WS 2", "WSOJT1", "MSSUP1"]);
+
+  // Also verify relative within each department:
+  const wsPoIdx  = ordered.indexOf("WSPO1");
+  const ws2Idx   = ordered.indexOf("WS 2");
+  const wsOjtIdx = ordered.indexOf("WSOJT1");
+  assert.ok(wsPoIdx < ws2Idx,   "WS PO (roleOrder 2) before WS Seat (roleOrder 3)");
+  assert.ok(ws2Idx < wsOjtIdx,  "WS Seat (roleOrder 3) before WS OJT (roleOrder 5)");
+
+  const c2WplIdx = ordered.indexOf("C2WPL1");
+  const c21Idx   = ordered.indexOf("C2 1");
+  assert.ok(c21Idx < c2WplIdx,  "C2 Seat (roleOrder 3) before C2 WPL (roleOrder 4)");
+
+  // MSSUP1 belongs to MS (dept order 8), so it sorts after C2 (order 0) and WS (order 1)
+  assert.ok(ordered.indexOf("MSSUP1") > ordered.indexOf("WS 2"), "MS Sup after WS entries");
+});
+
+test("department parsing: S abbreviation for supervisor is recognized", () => {
+  const ordered = __testing.orderAppointmentsCanonically([
+    "ECS S1",   // ECS Sup 1 (spaced with S)
+    "ECSS1",    // ECS Sup 1 (compact)
+    "ECS 1",    // ECS Seat 1
+    "CECS"      // Chief ECS
+  ]);
+  assert.equal(ordered[0], "CECS",  "CECS is chief");
+  assert.equal(ordered[1], "ECS S1",  "ECS S1 is SUP (roleOrder 1)");
+  assert.equal(ordered[2], "ECSS1",   "ECSS1 is also SUP (roleOrder 1), same number → stable");
+  assert.equal(ordered[3], "ECS 1",  "ECS Seat (roleOrder 3) after SUP");
+});
+
+test("department parsing: chief pattern recognises C-space-LABEL and CHIEF-space-LABEL", () => {
+  const meta = (appt) => __testing.parseAppointmentOrderingMetadata(appt, 0);
+
+  const cwsChief  = meta("C WS");
+  const chiefWS   = meta("Chief WS");
+  const cws       = meta("CWS");
+  assert.equal(cwsChief.family,  "WS:CHIEF", "C WS → WS:CHIEF");
+  assert.equal(chiefWS.family,   "WS:CHIEF", "Chief WS → WS:CHIEF");
+  assert.equal(cws.family,       "WS:CHIEF", "CWS → WS:CHIEF");
+  assert.equal(cwsChief.roleOrder, 0, "chief has roleOrder 0");
+
+  const cecsChief = meta("C ECS");
+  assert.equal(cecsChief.family, "ECS:CHIEF", "C ECS → ECS:CHIEF");
+
+  const chiefES   = meta("Chief Electronic Specialist");
+  assert.equal(chiefES.family,   "ELECTRONIC SPECIALIST:CHIEF",
+    "Chief Electronic Specialist → ELECTRONIC SPECIALIST:CHIEF");
+});
+
+test("department parsing: PO role slots between SUP and SEAT", () => {
+  const ordered = __testing.orderAppointmentsCanonically([
+    "WS PO 2",   // WS PO 2
+    "WS Sup 1",  // WS Sup
+    "WS 3",      // WS Seat
+    "WS PO 1",   // WS PO 1
+    "C WS"       // Chief
+  ]);
+  assert.deepEqual(ordered, [
+    "C WS",
+    "WS Sup 1",
+    "WS PO 1",
+    "WS PO 2",
+    "WS 3"
+  ]);
+});
+
