@@ -431,13 +431,13 @@ test("department workweek view lets admins switch and keeps department order fix
     activeCodes: [
       { appointment: "CO" },
       { appointment: "SCSE" },
-      { appointment: "Chief Comms Specialist" },
-      { appointment: "Comms Specialist 1" }
+      { appointment: "C Owl" },
+      { appointment: "Owl 1" }
     ],
     sheetSnapshots: {
       synchronizedAt: "2026-03-24T00:00:00.000Z",
       snapshots: new Map([["Mar 26", {
-        appointments: ["CO", "SCSE", "Chief Comms Specialist", "Comms Specialist 1"],
+        appointments: ["CO", "SCSE", "C Owl", "Owl 1"],
         statusesByDay: new Map([[24, ["PRESENT", "", "", ""]]])
       }]])
     }
@@ -446,13 +446,13 @@ test("department workweek view lets admins switch and keeps department order fix
     timezone: "Asia/Singapore",
     hierarchy: [
       { key: "OFFICERS", label: "Officers" },
-      { key: "COMMS_SPECIALIST", label: "Comms Specialist" }
+      { key: "OWL", label: "Owl" }
     ],
     appointmentMetadataByName: new Map([
       ["CO", { hierarchyNodeKey: "OFFICERS" }],
       ["SCSE", { hierarchyNodeKey: "OFFICERS" }],
-      ["CHIEF COMMS SPECIALIST", { hierarchyNodeKey: "COMMS_SPECIALIST" }],
-      ["COMMS SPECIALIST 1", { hierarchyNodeKey: "COMMS_SPECIALIST" }]
+      ["C OWL", { hierarchyNodeKey: "OWL" }],
+      ["OWL 1", { hierarchyNodeKey: "OWL" }]
     ])
   };
 
@@ -460,19 +460,19 @@ test("department workweek view lets admins switch and keeps department order fix
     cache,
     config,
     { appointment: "CO" },
-    { departmentKey: "COMMS_SPECIALIST", isAdminUser: true, weekOffset: 0 }
+    { departmentKey: "OWL", isAdminUser: true, weekOffset: 0 }
   );
 
   assert.equal(viewModel.ok, true);
-  assert.equal(viewModel.departmentLabel, "Comms Specialist");
+  assert.equal(viewModel.departmentLabel, "Owl");
   assert.equal(viewModel.canSwitchDepartments, true);
   assert.deepEqual(
     viewModel.allDepartmentOptions.map((entry) => entry.label),
-    ["Officers", "Comms Specialist"]
+    ["Officers", "Owl"]
   );
   assert.deepEqual(
     viewModel.members.map((member) => member.appointment),
-    ["Chief Comms Specialist", "Comms Specialist 1"]
+    ["C Owl", "Owl 1"]
   );
 });
 

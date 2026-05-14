@@ -189,10 +189,11 @@ async function loadSettingsDocument() {
   }
 
   const orderedHierarchy = buildHierarchyTraversal(nodesById);
-  const hierarchyOptions = orderedHierarchy.map((node) => ({
+  const hierarchyOptions = orderedHierarchy.map((node, index) => ({
     key: node.key,
     id: node.id,
     label: node.name,
+    order: typeof node.order === "number" ? node.order : index,
     type: node.type,
     parentId: node.parentId
   }));

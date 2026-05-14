@@ -33,12 +33,12 @@ hierarchy:
     name: Comms
     type: department
     order: 6
-  - id: electronic_specialist
-    name: Electronic Specialist
+  - id: rav
+    name: Rav
     type: department
     order: 7
-  - id: comms_specialist
-    name: Comms Specialist
+  - id: owl
+    name: Owl
     type: department
     order: 8
   - id: ms

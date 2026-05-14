@@ -503,30 +503,30 @@ test("canonical appointment ordering keeps top block, departments, and variants 
   ]);
 });
 
-test("comms specialist stays distinct from comms in canonical ordering", () => {
+test("owl stays distinct from comms in canonical ordering", () => {
   const ordered = __testing.orderAppointmentsCanonically([
-    "Comms Specialist 1",
+    "Owl 1",
     "Comms 2",
-    "Chief Comms Specialist",
+    "C Owl",
     "CComms",
     "Comms Sup",
-    "Comms Specialist Sup"
+    "Owl Sup"
   ]);
 
   assert.deepEqual(ordered, [
     "CComms",
     "Comms Sup",
     "Comms 2",
-    "Chief Comms Specialist",
-    "Comms Specialist Sup",
-    "Comms Specialist 1"
+    "C Owl",
+    "Owl Sup",
+    "Owl 1"
   ]);
 });
 
 test("department classifier maps officers and specialist departments correctly", () => {
   assert.equal(__testing.classifyAppointmentDepartment("SCSE (OUT)"), "Officers");
   assert.equal(__testing.classifyAppointmentDepartment("OPS 3"), "Officers");
-  assert.equal(__testing.classifyAppointmentDepartment("Chief Comms Specialist"), "Comms Specialist");
+  assert.equal(__testing.classifyAppointmentDepartment("C Owl"), "Owl");
   assert.equal(__testing.classifyAppointmentDepartment("Comms 2"), "Comms");
   assert.equal(__testing.classifyAppointmentDepartment("Unknown Role"), null);
 });
@@ -1912,10 +1912,10 @@ test("reconcileOnboardingWithConfig: reorders matched appointments to yaml order
 
 test("reconcileOnboardingWithConfig: renames appointment to canonical settings.yaml casing", () => {
   const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
-    ["electronic specialist", "WS 6"],
-    ["Electronic Specialist", "WS 6"]
+    ["rav", "WS 6"],
+    ["Rav", "WS 6"]
   );
-  assert.deepEqual(reconciled, ["Electronic Specialist", "WS 6"]);
+  assert.deepEqual(reconciled, ["Rav", "WS 6"]);
   assert.equal(changed, true);
 });
 
@@ -2159,9 +2159,9 @@ test("department parsing: chief pattern recognises C-space-LABEL and CHIEF-space
   const cecsChief = meta("C ECS");
   assert.equal(cecsChief.family, "ECS:CHIEF", "C ECS → ECS:CHIEF");
 
-  const chiefES   = meta("Chief Electronic Specialist");
-  assert.equal(chiefES.family,   "ELECTRONIC SPECIALIST:CHIEF",
-    "Chief Electronic Specialist → ELECTRONIC SPECIALIST:CHIEF");
+  const chiefRav = meta("Chief Rav");
+  assert.equal(chiefRav.family, "RAV:CHIEF",
+    "Chief Rav → RAV:CHIEF");
 });
 
 test("department parsing: PO role slots between SUP and SEAT", () => {
@@ -2221,5 +2221,34 @@ test("canonical ordering: officers cluster before all departments", () => {
   ]);
   // All officers first (CO, XO, OPS), then C2 (dept order 0), then ECS (dept order 9).
   assert.deepEqual(ordered, ["CO", "XO", "OPS 2", "C2 1", "CECS", "ECS 1"]);
+});
+
+test("sortWithConfig: departments cluster by dept first, then role within dept", () => {
+  // Reproduces the role-first bug: when config.hierarchy nodes lack an `order` field,
+  // all dept buckets collapse to 0 and entries sort by roleOrder across all depts.
+  // After the fix (hierarchy nodes carry `order`), each dept gets its own bucket.
+  const config = {
+    appointmentOrderIndex: new Map([
+      ["CO", 0],
+      ["XO", 1]
+    ]),
+    officerAppointmentTypePatterns: [],
+    hierarchy: [
+      { key: "OFFICERS", label: "Officers", order: 0 },
+      { key: "C2",       label: "C2",       order: 1 },
+      { key: "WS",       label: "WS",       order: 2 },
+      { key: "ECS",      label: "ECS",      order: 10 }
+    ]
+  };
+
+  // Unmatched dept entries: chiefs across C2, WS, ECS; seats across C2, WS, ECS.
+  // Dept-first order: all C2 together, then all WS, then all ECS.
+  // Role-first (buggy) order: all chiefs, then all seats (interleaved across depts).
+  const sorted = __testing.sortWithConfig(
+    ["CWS", "ECS 1", "CECS", "WS 1", "C2 1", "CC2"],
+    config
+  );
+  // Expect: C2 cluster (CC2, C2 1) → WS cluster (CWS, WS 1) → ECS cluster (CECS, ECS 1)
+  assert.deepEqual(sorted, ["CC2", "C2 1", "CWS", "WS 1", "CECS", "ECS 1"]);
 });
 

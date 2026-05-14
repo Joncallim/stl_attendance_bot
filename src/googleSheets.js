@@ -198,8 +198,8 @@ const DEPARTMENT_SPECS = [
   { label: "UW", order: 3 },
   { label: "NAV", order: 4 },
   { label: "COMMS", order: 5 },
-  { label: "ELECTRONIC SPECIALIST", order: 6 },
-  { label: "COMMS SPECIALIST", order: 7 },
+  { label: "RAV", order: 6 },
+  { label: "OWL", order: 7 },
   { label: "MS", order: 8 },
   { label: "ECS", order: 9 },
   { label: "CHEF", order: 10 }
@@ -225,8 +225,8 @@ export const DEPARTMENT_BUCKETS = [
   { key: "UW", label: "UW" },
   { key: "NAV", label: "Nav" },
   { key: "COMMS", label: "Comms" },
-  { key: "ELECTRONIC_SPECIALIST", label: "Electronic Specialist" },
-  { key: "COMMS_SPECIALIST", label: "Comms Specialist" },
+  { key: "RAV", label: "Rav" },
+  { key: "OWL", label: "Owl" },
   { key: "MS", label: "MS" },
   { key: "ECS", label: "ECS" },
   { key: "CHEF", label: "Chef" }
@@ -529,7 +529,9 @@ function deptBucketFromMeta(meta, deptOrderByLabel) {
   }
   // Family strings look like "WS:CHIEF", "ELECTRONIC SPECIALIST:SUP", etc.
   const [rawLabel] = String(meta.family ?? "").split(":");
-  const label = rawLabel.replace(/_/g, " ").trim();
+  // Normalise to uppercase so the lookup matches the keys written by sortWithConfig
+  // (which uses normalizeAppointmentForOrdering → uppercase).
+  const label = normalizeAppointmentForOrdering(rawLabel.replace(/_/g, " ").trim());
   if (deptOrderByLabel.has(label)) {
     return 100 + deptOrderByLabel.get(label);
   }
@@ -562,9 +564,9 @@ function sortWithConfig(appointments, config) {
   // Build dept label → order from config.hierarchy (labels are already
   // mixed-case; normalise via normalizeAppointmentForOrdering for lookup).
   const deptOrderByLabel = new Map();
-  for (const node of hierarchy) {
+  for (const [index, node] of hierarchy.entries()) {
     const label = normalizeAppointmentForOrdering(node.label ?? "");
-    deptOrderByLabel.set(label, typeof node.order === "number" ? node.order : 0);
+    deptOrderByLabel.set(label, typeof node.order === "number" ? node.order : index);
   }
 
   // For each officer type pattern, find the MAXIMUM yaml order index of any
