@@ -24,6 +24,7 @@ import {
   syncOnboardingRoster,
   summarizeStatuses,
   summarizeStatusesFromSnapshot,
+  transferAttendanceRows,
   writeAttendanceStatuses
 } from "./googleSheets.js";
 import {
@@ -5246,19 +5247,45 @@ export function createAttendanceBot(config) {
       }
 
       const result = await transferAppointmentBinding(from.appointment, to.appointment);
-      await sendOrUpdateAdminMessage(
-        ctx,
-        result.ok
-          ? `✅ Transferred <b>${result.fromAppointment}</b> → <b>${result.toAppointment}</b>.\n${result.fullName ? `User: ${result.fullName}` : ""}\n\nRun <b>Sync Roster</b> to update the attendance sheets.`
-          : `Unable to transfer: ${result.reason}.`,
-        Markup.inlineKeyboard([[
-          Markup.button.callback("🔄 Sync Roster", "admin:syncroster"),
-          Markup.button.callback("🔙 Back", "admin:menu:roster")
-        ], [
-          Markup.button.callback("❌ Close", "admin:close")
-        ]]),
-        { parse_mode: "HTML" }
-      );
+
+      if (result.ok) {
+        // Move attendance data in month sheets immediately so the user doesn't
+        // need to run a manual Sync Roster to carry over existing entries.
+        const attendanceResults = await transferAttendanceRows(
+          sheets,
+          config,
+          result.fromAppointment,
+          result.toAppointment
+        );
+        const sheetsMoved = attendanceResults.filter((r) => r.transferred).map((r) => r.title);
+        const attendanceNote = sheetsMoved.length > 0
+          ? `\nAttendance carried over from: ${sheetsMoved.join(", ")}.`
+          : "";
+
+        await sendOrUpdateAdminMessage(
+          ctx,
+          `✅ Transferred <b>${result.fromAppointment}</b> → <b>${result.toAppointment}</b>.\n${result.fullName ? `User: ${result.fullName}` : ""}${attendanceNote}\n\nRun <b>Sync Roster</b> to reorder the attendance sheet rows.`,
+          Markup.inlineKeyboard([[
+            Markup.button.callback("🔄 Sync Roster", "admin:syncroster"),
+            Markup.button.callback("🔙 Back", "admin:menu:roster")
+          ], [
+            Markup.button.callback("❌ Close", "admin:close")
+          ]]),
+          { parse_mode: "HTML" }
+        );
+      } else {
+        await sendOrUpdateAdminMessage(
+          ctx,
+          `Unable to transfer: ${result.reason}.`,
+          Markup.inlineKeyboard([[
+            Markup.button.callback("🔙 Back", "admin:menu:roster")
+          ], [
+            Markup.button.callback("❌ Close", "admin:close")
+          ]]),
+          { parse_mode: "HTML" }
+        );
+      }
+
       await refreshAdminCache(adminCache, config);
       return;
     }

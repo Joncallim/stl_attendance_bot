@@ -598,6 +598,23 @@ function sortWithConfig(appointments, config) {
   // all explicitly-listed key officers.
   const maxYamlIdx = yamlOrder.size > 0 ? Math.max(...yamlOrder.values()) : 0;
 
+  // Build officer-family → max yaml index map for officer variants.
+  // An officer variant is an appointment whose family matches a configured
+  // officer appointment but is not itself in yaml (e.g. "ME (In)" ~ "ME").
+  // The max yaml index of the family is used as the anchor so the variant
+  // sorts right after the last explicitly configured member of that family.
+  const officerFamilyMaxYaml = new Map(); // family string → max yaml index
+  for (const appt of (config.configuredAppointments ?? [])) {
+    const meta = parseAppointmentOrderingMetadata(appt, 0);
+    if (meta.bucketOrder < 100) { // officer block only
+      const idx = yamlOrder.get(normalizeAppointmentIdentity(appt));
+      if (idx !== undefined) {
+        const cur = officerFamilyMaxYaml.get(meta.family);
+        if (cur === undefined || idx > cur) officerFamilyMaxYaml.set(meta.family, idx);
+      }
+    }
+  }
+
   /**
    * Returns a sort key tuple [tier, primary, secondary, tertiary] for a
    * single appointment name.
@@ -633,8 +650,24 @@ function sortWithConfig(appointments, config) {
       }
     }
 
+    // 2b) Officer variant — same family as a configured officer, but not itself
+    //     in yaml (e.g. "ME (In)", "ME (Out)", "ME (68)").  Sort right after
+    //     the last explicit yaml entry of the same family.
+    const variantMeta = parseAppointmentOrderingMetadata(appt, 0);
+    if (variantMeta.bucketOrder < 100) {
+      const familyAnchor = officerFamilyMaxYaml.get(variantMeta.family);
+      if (familyAnchor !== undefined) {
+        // Use 7500 offset (between 5000 for pattern-matched and 10000 for next
+        // explicit slot) so variants land after pattern-matched but before the
+        // next explicitly configured officer type.
+        const numMatch = identity.match(/\s+(\d+)$/);
+        const num = numMatch ? parseInt(numMatch[1], 10) : -1;
+        return [0, familyAnchor * 10000 + 7500 + Math.max(0, num + 1), 0, 0];
+      }
+    }
+
     // 3) Unmatched — use canonical metadata with config-driven dept order.
-    const meta = parseAppointmentOrderingMetadata(appt, 0);
+    const meta = variantMeta;
     const deptBucket = deptBucketFromMeta(meta, deptOrderByLabel);
     return [1, deptBucket * 10000, meta.roleOrder * 100, Math.max(0, meta.number)];
   }
@@ -693,10 +726,22 @@ function reconcileOnboardingWithConfig(
     configuredAppointments.map((name) => [normalizeAppointmentIdentity(name), name])
   );
 
+  // Set of officer-block families covered by configured appointments.
+  // Used to classify variants like "ME (In)", "ME (68)" as belonging next to
+  // their primary officer appointment rather than falling to the unmatched bottom.
+  const configuredOfficerFamilies = new Set();
+  for (const appt of configuredAppointments) {
+    const meta = parseAppointmentOrderingMetadata(appt, 0);
+    if (meta.bucketOrder < 100) { // officer block (not dept chiefs/seats)
+      configuredOfficerFamilies.add(meta.family);
+    }
+  }
+
   // Partition ONBOARDING appointments into three buckets (de-duplicate by
   // normalised identity; first occurrence wins):
   //   matchedIdentities — explicitly in configuredAppointments
-  //   patternMatched    — match an officer type pattern but not explicitly listed
+  //   patternMatched    — match an officer type pattern OR are a variant of a
+  //                       configured officer appointment (e.g. "ME (In)" ~ "ME")
   //   unmatched         — neither; kept at the bottom
   const matchedIdentities = new Set();
   const patternMatched = [];
@@ -719,7 +764,14 @@ function reconcileOnboardingWithConfig(
     ) {
       patternMatched.push(appt);
     } else {
-      unmatched.push(appt);
+      // Check if this is a variant of a configured officer appointment
+      // (e.g. "ME (In)" has family "ME" which is a configured officer).
+      const meta = parseAppointmentOrderingMetadata(appt, 0);
+      if (meta.bucketOrder < 100 && configuredOfficerFamilies.has(meta.family)) {
+        patternMatched.push(appt);
+      } else {
+        unmatched.push(appt);
+      }
     }
   }
 
@@ -2051,9 +2103,15 @@ function buildManagedMonthlyRows({
   headerLength,
   mode
 }) {
-  const rowByAppointment = new Map(
-    existingRows.map((row) => [normalizeAppointmentIdentity(row[0]), row])
-  );
+  // Build lookup keyed by normalised identity; first occurrence wins so that
+  // duplicate rows (cleaned up below) preserve the earliest data.
+  const rowByAppointment = new Map();
+  for (const row of existingRows) {
+    const key = normalizeAppointmentIdentity(row[0]);
+    if (!rowByAppointment.has(key)) {
+      rowByAppointment.set(key, row);
+    }
+  }
   const nextAppointments = preferredAppointments.length > 0
     ? preferredAppointments
     : (
@@ -2196,9 +2254,12 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     logSheetsVerbose(`[${title}] In sheet but not ONBOARDING: ${notInOnboarding.length > 0 ? notInOnboarding.join(", ") : "(none)"}`);
   }
 
-  // Duplicate appointments are a hard block in any mode: the Map lookup in
+  // Duplicate appointments are a hard block in merge mode: the Map lookup in
   // buildManagedMonthlyRows would silently drop one duplicate's attendance data.
-  if ((liveSlice.duplicateAppointments?.length ?? 0) > 0) {
+  // In replace mode the first-occurrence Map preserves data for the kept row,
+  // and planManagedRowStructureChanges naturally deletes the extra rows via the
+  // trailing-surplus deletion loop — so we log and proceed.
+  if ((liveSlice.duplicateAppointments?.length ?? 0) > 0 && mode !== "replace") {
     return {
       title,
       appointments: preferredAppointments,
@@ -2208,6 +2269,13 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
         duplicateAppointments: liveSlice.duplicateAppointments
       }
     };
+  }
+
+  if ((liveSlice.duplicateAppointments?.length ?? 0) > 0) {
+    logSheetsWarn(
+      `[${title}] Structural sync: removing ${liveSlice.duplicateAppointments.length} duplicate row(s); first occurrence kept.`,
+      { duplicates: liveSlice.duplicateAppointments }
+    );
   }
 
   // In "replace" mode (structural sync), unexpected appointments are not a blocker —
@@ -3830,6 +3898,129 @@ export async function removeAppointmentFromSheets(sheets, config, appointment) {
 export async function writeAttendanceStatus(sheets, config, entry) {
   const result = await writeAttendanceStatuses(sheets, config, [{ ...entry }]);
   return result.results?.[0] ?? null;
+}
+
+/**
+ * When a user's appointment binding is transferred from one slot to another,
+ * this function moves that user's attendance data across all three active month
+ * sheets (prev, current, next): the "to" row receives the "from" row's date-
+ * column values, and the "from" row's date columns are cleared.
+ *
+ * Returns an array of per-sheet results:
+ *   { title, transferred: true }          — data was moved
+ *   { title, skipped: true, reason: "…" } — row not found or no date columns
+ */
+export async function transferAttendanceRows(sheets, config, fromAppointment, toAppointment) {
+  const dates = [
+    shiftMonth(new Date(), config.timezone, -1),
+    new Date(),
+    shiftMonth(new Date(), config.timezone, 1)
+  ];
+
+  const results = [];
+
+  for (const date of dates) {
+    if (!isManagedMonthlyDate(date, config.timezone)) {
+      continue;
+    }
+
+    const { title } = getMonthParts(date, config.timezone);
+    const defaultHeader = getDefaultHeaderRow(date, config.timezone);
+    const rowLimit = managedRowLimit(200);
+    const values = await readSheetValues(
+      sheets,
+      config.spreadsheetId,
+      title,
+      `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${rowLimit}`
+    );
+
+    if (!values || values.length === 0) {
+      results.push({ title, skipped: true, reason: "empty_sheet" });
+      continue;
+    }
+
+    const header = getHeaderRowFromValues(values, defaultHeader);
+    const dateColumnMap = buildDateColumnMap(header, date, config.timezone);
+
+    if (dateColumnMap.size === 0) {
+      results.push({ title, skipped: true, reason: "no_date_columns" });
+      continue;
+    }
+
+    // Collect all date column indices (0-based) in order.
+    const dateColIndices = [...dateColumnMap.values()].sort((a, b) => a - b);
+
+    // Find the 1-based row numbers for fromAppointment and toAppointment.
+    let fromRowNumber = null;
+    let toRowNumber = null;
+
+    for (let i = 1; i < values.length; i += 1) {
+      const raw = String(values[i]?.[0] ?? "").trim();
+      if (!raw) continue;
+      if (isStopMarker(raw, config.rosterStopMarkers)) break;
+
+      const normed = normalizeAppointmentIdentity(raw);
+      if (fromRowNumber === null && normed === normalizeAppointmentIdentity(fromAppointment)) {
+        fromRowNumber = i + 1; // sheet row number (1 = header)
+      }
+      if (toRowNumber === null && normed === normalizeAppointmentIdentity(toAppointment)) {
+        toRowNumber = i + 1;
+      }
+      if (fromRowNumber !== null && toRowNumber !== null) break;
+    }
+
+    if (fromRowNumber === null) {
+      results.push({ title, skipped: true, reason: "from_row_not_found" });
+      continue;
+    }
+    if (toRowNumber === null) {
+      results.push({ title, skipped: true, reason: "to_row_not_found" });
+      continue;
+    }
+
+    // Build contiguous groups of date columns for efficient range writes.
+    const groups = groupContiguousIndices(dateColIndices);
+    const fromRowValues = values[fromRowNumber - 1] ?? [];
+
+    const data = [];
+    for (const group of groups) {
+      const startCol = group[0] + 1; // 1-based
+      const endCol   = group[group.length - 1] + 1;
+      const startLabel = columnNumberToLabel(startCol);
+      const endLabel   = columnNumberToLabel(endCol);
+
+      // Copy from → to
+      data.push({
+        range: `'${title}'!${startLabel}${toRowNumber}:${endLabel}${toRowNumber}`,
+        values: [group.map((col) => String(fromRowValues[col] ?? "").trim())]
+      });
+
+      // Clear from row
+      data.push({
+        range: `'${title}'!${startLabel}${fromRowNumber}:${endLabel}${fromRowNumber}`,
+        values: [group.map(() => "")]
+      });
+    }
+
+    if (data.length > 0) {
+      await runGoogleSheetsRequest(
+        `spreadsheets.values.batchUpdate:${title}:transferAttendance`,
+        (signal) =>
+          sheets.spreadsheets.values.batchUpdate(
+            {
+              spreadsheetId: config.spreadsheetId,
+              requestBody: { valueInputOption: "RAW", data }
+            },
+            { signal }
+          )
+      );
+      logSheetsSuccess(`[${title}] Transferred attendance: ${fromAppointment} → ${toAppointment}.`);
+    }
+
+    results.push({ title, transferred: true });
+  }
+
+  return results;
 }
 
 export async function writeAttendanceStatuses(sheets, config, entries) {

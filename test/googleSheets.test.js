@@ -2252,3 +2252,63 @@ test("sortWithConfig: departments cluster by dept first, then role within dept",
   assert.deepEqual(sorted, ["CC2", "C2 1", "CWS", "WS 1", "CECS", "ECS 1"]);
 });
 
+test("sortWithConfig: officer variants sort immediately after their primary appointment", () => {
+  // "ME (In)", "ME (Out)", "ME (68)" are not in yaml and don't match officer patterns,
+  // but their family is "ME" which IS in yaml → they should sort right after ME (tier 0),
+  // not at the bottom with unmatched department entries.
+  const config = {
+    appointmentOrderIndex: new Map([
+      ["CO", 0], ["XO", 1], ["COXN", 2], ["ME", 3]
+    ]),
+    officerAppointmentTypePatterns: [],
+    hierarchy: [],
+    configuredAppointments: ["CO", "XO", "COXN", "ME"]
+  };
+
+  const sorted = __testing.sortWithConfig(
+    ["ME (Out)", "CO", "ME (In)", "ME", "ME (68)", "WS 1"],
+    config
+  );
+
+  // CO(yaml 0), XO(yaml 1 — not present), COXN(yaml 2 — not present),
+  // ME(yaml 3), then ME variants immediately after, then unmatched WS 1 at bottom
+  assert.equal(sorted[0], "CO", "CO first (yaml 0)");
+  assert.equal(sorted[1], "ME", "ME second (yaml 3)");
+  // All three ME variants should follow ME immediately before WS 1
+  const meIdx = sorted.indexOf("ME");
+  const ws1Idx = sorted.indexOf("WS 1");
+  assert.ok(sorted.indexOf("ME (In)") > meIdx, "ME (In) after ME");
+  assert.ok(sorted.indexOf("ME (Out)") > meIdx, "ME (Out) after ME");
+  assert.ok(sorted.indexOf("ME (68)") > meIdx, "ME (68) after ME");
+  assert.ok(sorted.indexOf("ME (In)") < ws1Idx, "ME (In) before WS 1");
+  assert.ok(sorted.indexOf("ME (Out)") < ws1Idx, "ME (Out) before WS 1");
+  assert.ok(sorted.indexOf("ME (68)") < ws1Idx, "ME (68) before WS 1");
+});
+
+test("reconcileOnboardingWithConfig: officer variants cluster with their primary, not at bottom", () => {
+  // "ME (In)" is not in configuredAppointments but has the same officer family as "ME".
+  // It should appear right after ME, not at the bottom of the reconciled list.
+  const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
+    ["CO", "ME (In)", "ME", "WS 1"],
+    ["CO", "ME"],
+    [],
+    {
+      appointmentOrderIndex: new Map([["CO", 0], ["ME", 1]]),
+      officerAppointmentTypePatterns: [],
+      hierarchy: [],
+      configuredAppointments: ["CO", "ME"]
+    }
+  );
+
+  assert.ok(reconciled.includes("ME (In)"), "ME (In) must be kept (never dropped)");
+  assert.ok(reconciled.includes("WS 1"), "WS 1 must be kept (never dropped)");
+
+  const meIdx    = reconciled.indexOf("ME");
+  const meInIdx  = reconciled.indexOf("ME (In)");
+  const ws1Idx   = reconciled.indexOf("WS 1");
+
+  assert.ok(meInIdx > meIdx, "ME (In) sorts after ME");
+  assert.ok(meInIdx < ws1Idx, "ME (In) sorts before unmatched WS 1");
+  assert.equal(changed, true);
+});
+
