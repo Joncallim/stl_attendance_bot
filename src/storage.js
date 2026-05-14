@@ -608,6 +608,102 @@ export async function deregisterAppointmentBinding(appointment) {
   });
 }
 
+/**
+ * Transfers a user's binding from one appointment slot to another.
+ *
+ * - `fromAppointment` must be active and bound to a user.
+ * - `toAppointment` must be active and currently unbound.
+ *
+ * After the transfer:
+ *   - The user's appointment field is updated to `toAppointment`.
+ *   - The `to` registry entry inherits all binding fields from `from`.
+ *   - The `from` registry entry is cleared and issued a fresh secret code.
+ *
+ * Returns `{ ok, fromAppointment, toAppointment, chatId, username, fullName }` on
+ * success or `{ ok: false, reason }` on failure.
+ */
+export async function transferAppointmentBinding(fromAppointment, toAppointment) {
+  return withStorageMutation(async () => {
+    const registry = await readAppointmentRegistry();
+    const fromEntry = findAppointmentEntry(registry, fromAppointment);
+    const toEntry = findAppointmentEntry(registry, toAppointment);
+
+    if (!fromEntry || !fromEntry.active) {
+      return { ok: false, reason: "from_not_found" };
+    }
+    if (!fromEntry.boundChatId) {
+      return { ok: false, reason: "from_not_bound" };
+    }
+    if (!toEntry || !toEntry.active) {
+      return { ok: false, reason: "to_not_found" };
+    }
+    if (toEntry.boundChatId) {
+      return { ok: false, reason: "to_already_bound" };
+    }
+
+    const existingCodes = new Set(
+      registry.appointments
+        .filter((e) => e.appointment !== fromEntry.appointment)
+        .map((e) => normalizeCode(e.secretCode))
+    );
+    const freshCode = generateSecretCode(existingCodes);
+
+    registry.appointments = registry.appointments.map((entry) => {
+      const norm = normalizeAppointmentName(entry.appointment);
+      if (norm === normalizeAppointmentName(fromEntry.appointment)) {
+        return {
+          ...entry,
+          secretCode: freshCode,
+          boundChatId: null,
+          boundUserId: null,
+          boundUsername: null,
+          boundFullName: null,
+          boundAt: null
+        };
+      }
+      if (norm === normalizeAppointmentName(toEntry.appointment)) {
+        return {
+          ...entry,
+          boundChatId: fromEntry.boundChatId,
+          boundUserId: fromEntry.boundUserId,
+          boundUsername: fromEntry.boundUsername,
+          boundFullName: fromEntry.boundFullName,
+          boundAt: fromEntry.boundAt
+        };
+      }
+      return entry;
+    });
+
+    registry.adminAppointments = pruneUnboundAdminAppointments(registry);
+    registry.updatedAt = new Date().toISOString();
+    await writeAppointmentRegistry(registry);
+
+    const users = await readUsers();
+    const nextUsers = users.map((user) =>
+      String(user.chatId) === String(fromEntry.boundChatId)
+        ? { ...user, appointment: toEntry.appointment, updatedAt: new Date().toISOString() }
+        : user
+    );
+    await writeUsers(nextUsers);
+
+    logStorageSuccess(`# Transferred binding.`, {
+      from: fromEntry.appointment,
+      to: toEntry.appointment,
+      chatId: fromEntry.boundChatId,
+      username: fromEntry.boundUsername
+    });
+
+    return {
+      ok: true,
+      fromAppointment: fromEntry.appointment,
+      toAppointment: toEntry.appointment,
+      chatId: fromEntry.boundChatId,
+      username: fromEntry.boundUsername,
+      fullName: fromEntry.boundFullName
+    };
+  });
+}
+
 export async function deregisterRequestorByChatId(chatId) {
   const users = await readUsers();
   const user = users.find((entry) => entry.chatId === String(chatId));

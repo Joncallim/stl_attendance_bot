@@ -14,6 +14,7 @@ import {
   listAdminAppointments,
   removeAppointmentFromRegistry,
   syncAppointmentRegistry,
+  transferAppointmentBinding,
   updateUserByChatId,
   upsertUser
 } from "../src/storage.js";
@@ -235,5 +236,121 @@ test("appointments can be added to and removed from the active registry", async 
     const bravoEntry = registry.appointments.find((entry) => entry.appointment === "BRAVO");
     assert.equal(bravoEntry.active, false);
     assert.equal(bravoEntry.boundChatId, null);
+  });
+});
+
+test("transferAppointmentBinding moves binding from one slot to another", async () => {
+  await withTempDataDir(async () => {
+    // Set up two appointments: ALPHA (will be bound) and BRAVO (unbound target).
+    await syncAppointmentRegistry(["ALPHA", "BRAVO"]);
+    const alphaInvite = await getOnboardingInvite("ALPHA");
+
+    await upsertUser({
+      chatId: "chat-transfer",
+      userId: "user-transfer",
+      username: "alpha",
+      fullName: "Transfer User",
+      updatedAt: new Date().toISOString()
+    });
+    await bindAppointmentCode(alphaInvite.secretCode, {
+      chatId: "chat-transfer",
+      userId: "user-transfer",
+      username: "alpha",
+      fullName: "Transfer User"
+    });
+    await updateUserByChatId("chat-transfer", {
+      appointment: "ALPHA",
+      onboardingCompletedAt: new Date().toISOString()
+    });
+
+    const result = await transferAppointmentBinding("ALPHA", "BRAVO");
+    assert.equal(result.ok, true);
+    assert.equal(result.fromAppointment, "ALPHA");
+    assert.equal(result.toAppointment, "BRAVO");
+    assert.equal(result.chatId, "chat-transfer");
+    assert.equal(result.username, "alpha");
+    assert.equal(result.fullName, "Transfer User");
+
+    const registry = await getAppointmentRegistry();
+
+    // ALPHA should now be unbound with a fresh secret code.
+    const alphaEntry = registry.appointments.find((e) => e.appointment === "ALPHA");
+    assert.equal(alphaEntry.boundChatId, null, "ALPHA binding cleared");
+    assert.ok(alphaEntry.secretCode, "ALPHA has a secret code");
+    assert.notEqual(alphaEntry.secretCode, alphaInvite.secretCode, "ALPHA has a fresh secret code");
+
+    // BRAVO should now be bound to the transferred user.
+    const bravoEntry = registry.appointments.find((e) => e.appointment === "BRAVO");
+    assert.equal(bravoEntry.boundChatId, "chat-transfer", "BRAVO is now bound");
+    assert.equal(bravoEntry.boundUsername, "alpha");
+    assert.equal(bravoEntry.boundFullName, "Transfer User");
+
+    // User record should reflect the new appointment.
+    const user = await getUserByChatId("chat-transfer");
+    assert.equal(user.appointment, "BRAVO", "user appointment updated to BRAVO");
+  });
+});
+
+test("transferAppointmentBinding rejects invalid combinations", async () => {
+  await withTempDataDir(async () => {
+    await syncAppointmentRegistry(["ALPHA", "BRAVO", "CHARLIE"]);
+    const alphaInvite = await getOnboardingInvite("ALPHA");
+    const bravoInvite = await getOnboardingInvite("BRAVO");
+
+    // Bind ALPHA and BRAVO to different users.
+    await upsertUser({
+      chatId: "chat-a",
+      userId: "user-a",
+      username: "alpha",
+      fullName: "Alpha User",
+      updatedAt: new Date().toISOString()
+    });
+    await upsertUser({
+      chatId: "chat-b",
+      userId: "user-b",
+      username: "bravo",
+      fullName: "Bravo User",
+      updatedAt: new Date().toISOString()
+    });
+    await bindAppointmentCode(alphaInvite.secretCode, {
+      chatId: "chat-a",
+      userId: "user-a",
+      username: "alpha",
+      fullName: "Alpha User"
+    });
+    await updateUserByChatId("chat-a", {
+      appointment: "ALPHA",
+      onboardingCompletedAt: new Date().toISOString()
+    });
+    await bindAppointmentCode(bravoInvite.secretCode, {
+      chatId: "chat-b",
+      userId: "user-b",
+      username: "bravo",
+      fullName: "Bravo User"
+    });
+    await updateUserByChatId("chat-b", {
+      appointment: "BRAVO",
+      onboardingCompletedAt: new Date().toISOString()
+    });
+
+    // Cannot transfer to an already-bound slot.
+    const toBound = await transferAppointmentBinding("ALPHA", "BRAVO");
+    assert.equal(toBound.ok, false);
+    assert.equal(toBound.reason, "to_already_bound");
+
+    // Cannot transfer from an unbound slot.
+    const fromUnbound = await transferAppointmentBinding("CHARLIE", "ALPHA");
+    assert.equal(fromUnbound.ok, false);
+    assert.equal(fromUnbound.reason, "from_not_bound");
+
+    // Cannot transfer from a non-existent appointment.
+    const fromMissing = await transferAppointmentBinding("DELTA", "CHARLIE");
+    assert.equal(fromMissing.ok, false);
+    assert.equal(fromMissing.reason, "from_not_found");
+
+    // Cannot transfer to a non-existent appointment.
+    const toMissing = await transferAppointmentBinding("ALPHA", "ECHO");
+    assert.equal(toMissing.ok, false);
+    assert.equal(toMissing.reason, "to_not_found");
   });
 });

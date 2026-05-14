@@ -466,6 +466,16 @@ function parseAppointmentOrderingMetadata(label, originalIndex) {
     };
 }
 
+/**
+ * Returns true when `appointment` is a department chief role — i.e. it parses
+ * as roleOrder 0 (chief) inside a department bucket (bucketOrder ≥ 100).
+ * Examples: CWS, C ECS, CECS, Chief Rav, Chief Comms.
+ */
+export function isChiefAppointment(appointment) {
+  const meta = parseAppointmentOrderingMetadata(appointment, 0);
+  return meta.roleOrder === 0 && meta.bucketOrder >= 100;
+}
+
 export function classifyAppointmentDepartment(appointment) {
   if (parseTopBlockAppointment(appointment, 0)) {
     return DEPARTMENT_LABEL_BY_KEY.get("OFFICERS");

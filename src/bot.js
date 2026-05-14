@@ -6,6 +6,7 @@ import {
   addAppointmentToSheets,
   buildQueuedAttendanceEventMetadata,
   classifyAppointmentDepartment,
+  isChiefAppointment,
   clearAllSheetProtections,
   createGoogleSheetsClient,
   runStartupSheetCleanup,
@@ -53,6 +54,7 @@ import {
   setAttendanceOptionUsage,
   setAttendanceOptions,
   syncAppointmentRegistry,
+  transferAppointmentBinding,
   updateUserByChatId,
   upsertUser
 } from "./storage.js";
@@ -581,6 +583,9 @@ function buildAdminRosterMenu() {
     [
       Markup.button.callback("➕ Add Appointment", "admin:appointments:add"),
       Markup.button.callback("➖ Remove Appointment", "admin:menu:appointments:remove:0")
+    ],
+    [
+      Markup.button.callback("🔀 Transfer User", "admin:menu:transfer:0")
     ],
     [
       Markup.button.callback("🔓 Clear All Protections", "admin:clearprotections")
@@ -1653,9 +1658,19 @@ function buildManageAdminsDescription(admins, activeCodes = [], defaultAdminAppo
     source: "custom",
     onboarded: true
   }));
+  const chiefRows = sortAppointmentsForAdmin(
+    admins
+      .filter((entry) => entry.source === "chief")
+      .map((entry) => ({ appointment: entry.appointment }))
+  ).map(({ appointment }) => ({
+    appointment,
+    source: "chief",
+    onboarded: true
+  }));
   const visibleRows = [
     ...defaultRows,
-    ...customRows.filter((entry) => !adminByAppointment.has(entry.appointment.toUpperCase()) || entry.source === "custom")
+    ...customRows.filter((entry) => !adminByAppointment.has(entry.appointment.toUpperCase()) || entry.source === "custom"),
+    ...chiefRows.filter((entry) => !adminByAppointment.has(entry.appointment.toUpperCase()))
   ];
 
   if (visibleRows.length === 0) {
@@ -1682,6 +1697,7 @@ function buildRosterDescription() {
     "🔄 Sync Roster — Sort ONBOARDING and sync monthly attendance sheets.",
     "➕ Add Appointment — Add a new appointment and generate a registration code.",
     "➖ Remove Appointment — Remove an appointment and clear their Telegram binding.",
+    "🔀 Transfer User — Move a registered user from one appointment slot to another.",
     "🔓 Clear All Protections — Remove all sheet protections from the spreadsheet."
   ].join("\n");
 }
@@ -1934,7 +1950,9 @@ function createAdminCache() {
     deregisterCandidates: [],
     removeAppointmentCandidates: [],
     addAdminCandidates: [],
-    removeAdminCandidates: []
+    removeAdminCandidates: [],
+    transferFromCandidates: [],
+    transferToCandidates: []
   };
 }
 
@@ -2254,6 +2272,13 @@ function getCommandArgument(text, commandName) {
   return text.replace(new RegExp(`^/${commandName}(@\\w+)?`, "i"), "").trim();
 }
 
+/**
+ * Returns true if the user behind `ctx` has admin access.
+ * Admin status is granted through three routes (any one is sufficient):
+ *   1. The appointment appears in settings.yaml with `defaultAdmin: true`.
+ *   2. The appointment was manually added via "Add Admin".
+ *   3. The appointment is a department chief (C/Chief prefix → roleOrder 0).
+ */
 async function isAdmin(ctx, config) {
   const user = await getUserByChatId(ctx.chat.id);
 
@@ -2261,11 +2286,17 @@ async function isAdmin(ctx, config) {
     return false;
   }
 
+  // Route 3 — department chiefs are always admins.
+  if (isChiefAppointment(user.appointment)) {
+    return true;
+  }
+
   const adminAppointments = await listAdminAppointments(config.defaultAdminAppointments);
   return adminAppointments.some(
     (entry) => entry.appointment.toUpperCase() === user.appointment.toUpperCase()
   );
 }
+
 
 async function requireAdmin(ctx, config) {
   if (await isAdmin(ctx, config)) {
@@ -2413,13 +2444,22 @@ async function refreshAdminCache(cache, config) {
     getAppointmentRegistry(),
     listAdminAppointments(config.defaultAdminAppointments)
   ]);
-  const adminSet = new Set(admins.map((entry) => entry.appointment.toUpperCase()));
   const activeCodes = registry.appointments.filter((entry) => entry.active);
   const pending = activeCodes.filter((entry) => !entry.boundChatId);
 
+  // Merge manually-granted and default admins with auto-chief admins so that
+  // department chiefs show in the admin list UI without needing manual grants.
+  const adminAppointmentSet = new Set(admins.map((e) => e.appointment.toUpperCase()));
+  const chiefAdmins = activeCodes
+    .filter((entry) => entry.boundChatId && isChiefAppointment(entry.appointment))
+    .filter((entry) => !adminAppointmentSet.has(entry.appointment.toUpperCase()))
+    .map((entry) => ({ appointment: entry.appointment, source: "chief" }));
+  const allAdmins = [...admins, ...chiefAdmins];
+  const adminSet = new Set(allAdmins.map((e) => e.appointment.toUpperCase()));
+
   cache.activeCodes = activeCodes;
   cache.pending = pending;
-  cache.admins = admins;
+  cache.admins = allAdmins;
   cache.inviteCandidates = pending.map((entry) => ({
     label: entry.appointment,
     appointment: entry.appointment
@@ -2431,17 +2471,33 @@ async function refreshAdminCache(cache, config) {
     label: entry.appointment,
     appointment: entry.appointment
   }));
+  // Chiefs are already admins — exclude them from the "add admin" list.
   cache.addAdminCandidates = activeCodes
     .filter((entry) => !adminSet.has(entry.appointment.toUpperCase()))
     .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
-  cache.removeAdminCandidates = admins
+  cache.removeAdminCandidates = allAdmins
     .filter((entry) => entry.source === "custom")
+    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
+
+  // Transfer candidates: from = bound slots, to = unbound slots.
+  cache.transferFromCandidates = activeCodes
+    .filter((entry) => entry.boundChatId)
+    .map((entry) => ({
+      label: entry.boundFullName
+        ? `${entry.appointment} — ${entry.boundFullName}`
+        : entry.appointment,
+      appointment: entry.appointment
+    }));
+  cache.transferToCandidates = activeCodes
+    .filter((entry) => !entry.boundChatId)
     .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
 
   cache.inviteCandidates = sortAppointmentsForAdmin(cache.inviteCandidates, config);
   cache.removeAppointmentCandidates = sortAppointmentsForAdmin(cache.removeAppointmentCandidates, config);
   cache.addAdminCandidates = sortAppointmentsForAdmin(cache.addAdminCandidates, config);
   cache.removeAdminCandidates = sortAppointmentsForAdmin(cache.removeAdminCandidates, config);
+  cache.transferFromCandidates = sortAppointmentsForAdmin(cache.transferFromCandidates, config);
+  cache.transferToCandidates = sortAppointmentsForAdmin(cache.transferToCandidates, config);
 }
 
 async function ensureSheetReadiness(sheets, config, cache, options = {}) {
@@ -2779,6 +2835,69 @@ async function renderRemoveAppointmentSubmenu(ctx, cache, page = 0) {
       "admin:menu:appointments:remove",
       "admin:menu:roster"
     )
+  );
+}
+
+async function renderTransferFromSubmenu(ctx, cache, page = 0) {
+  const candidates = cache.transferFromCandidates;
+
+  if (candidates.length === 0) {
+    await sendOrUpdateAdminMessage(
+      ctx,
+      "There are no registered users to transfer.",
+      Markup.inlineKeyboard([[
+        Markup.button.callback("🔙 Back", "admin:menu:roster"),
+        Markup.button.callback("❌ Close", "admin:close")
+      ]])
+    );
+    return;
+  }
+
+  await sendOrUpdateAdminMessage(
+    ctx,
+    "Step 1/2 — Select the person to transfer (current appointment).",
+    buildPagedSelectionMenu(
+      candidates,
+      page,
+      "admin:pick:transferfrom",
+      "admin:menu:transfer",
+      "admin:menu:roster"
+    )
+  );
+}
+
+async function renderTransferToSubmenu(ctx, cache, fromIdx, page = 0) {
+  const from = cache.transferFromCandidates[fromIdx];
+  const candidates = cache.transferToCandidates;
+
+  if (!from) {
+    await renderTransferFromSubmenu(ctx, cache, 0);
+    return;
+  }
+
+  if (candidates.length === 0) {
+    await sendOrUpdateAdminMessage(
+      ctx,
+      "There are no unbound appointment slots to transfer into.",
+      Markup.inlineKeyboard([[
+        Markup.button.callback("🔙 Back", "admin:menu:transfer:0"),
+        Markup.button.callback("❌ Close", "admin:close")
+      ]])
+    );
+    return;
+  }
+
+  await sendOrUpdateAdminMessage(
+    ctx,
+    `Step 2/2 — Moving <b>${from.appointment}</b>.\nSelect the destination appointment slot.`,
+    buildPagedSelectionMenu(
+      candidates,
+      page,
+      `admin:pick:transferto:${fromIdx}`,
+      `admin:menu:transferto:${fromIdx}`,
+      `admin:menu:transfer:0`
+    ),
+    { parse_mode: "HTML" }
   );
 }
 
@@ -4895,6 +5014,21 @@ export function createAttendanceBot(config) {
       return;
     }
 
+    if (action.startsWith("menu:transfer:")) {
+      triggerBackgroundSheetRefresh(adminCache, "admin:menu:transfer");
+      await renderTransferFromSubmenu(ctx, adminCache, Number(action.split(":")[2]));
+      return;
+    }
+
+    if (action.startsWith("menu:transferto:")) {
+      // Pagination within the "to" selection: format is menu:transferto:<fromIdx>:<page>
+      const parts = action.split(":");
+      const fromIdx = Number(parts[2]);
+      const page = Number(parts[3] ?? 0);
+      await renderTransferToSubmenu(ctx, adminCache, fromIdx, page);
+      return;
+    }
+
     if (action === "menu:admins") {
       await sendOrUpdateAdminMessage(
         ctx,
@@ -5081,6 +5215,49 @@ export function createAttendanceBot(config) {
             Markup.button.callback("❌ Close", "admin:close")
           ]
         ])
+      );
+      await refreshAdminCache(adminCache, config);
+      return;
+    }
+
+    if (action.startsWith("pick:transferfrom:")) {
+      // Admin selected the "from" user — now show the "to" slot list.
+      const fromIdx = Number(action.split(":")[2]);
+      const from = adminCache.transferFromCandidates[fromIdx];
+      if (!from) {
+        await renderTransferFromSubmenu(ctx, adminCache, 0);
+        return;
+      }
+      await renderTransferToSubmenu(ctx, adminCache, fromIdx, 0);
+      return;
+    }
+
+    if (action.startsWith("pick:transferto:")) {
+      // Format: pick:transferto:<fromIdx>:<toIdx>
+      const parts = action.split(":");
+      const fromIdx = Number(parts[2]);
+      const toIdx = Number(parts[3]);
+      const from = adminCache.transferFromCandidates[fromIdx];
+      const to = adminCache.transferToCandidates[toIdx];
+
+      if (!from || !to) {
+        await renderTransferFromSubmenu(ctx, adminCache, 0);
+        return;
+      }
+
+      const result = await transferAppointmentBinding(from.appointment, to.appointment);
+      await sendOrUpdateAdminMessage(
+        ctx,
+        result.ok
+          ? `✅ Transferred <b>${result.fromAppointment}</b> → <b>${result.toAppointment}</b>.\n${result.fullName ? `User: ${result.fullName}` : ""}\n\nRun <b>Sync Roster</b> to update the attendance sheets.`
+          : `Unable to transfer: ${result.reason}.`,
+        Markup.inlineKeyboard([[
+          Markup.button.callback("🔄 Sync Roster", "admin:syncroster"),
+          Markup.button.callback("🔙 Back", "admin:menu:roster")
+        ], [
+          Markup.button.callback("❌ Close", "admin:close")
+        ]]),
+        { parse_mode: "HTML" }
       );
       await refreshAdminCache(adminCache, config);
       return;
