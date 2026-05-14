@@ -167,6 +167,18 @@ export async function updateUserByChatId(chatId, patch) {
 export async function syncAppointmentRegistry(appointments) {
   return withStorageMutation(async () => {
     const registry = await readAppointmentRegistry();
+    const users = await readUsers();
+
+    // Build a lookup of chatIds that are confirmed active in the users list
+    // AND whose appointment field matches some registry entry.  Used below to
+    // detect "orphaned" registry bindings where the user record has been
+    // removed or their appointment field was cleared.
+    const activeUserByChatId = new Map(
+      users
+        .filter((u) => u.chatId && u.appointment)
+        .map((u) => [String(u.chatId), normalizeAppointmentName(u.appointment)])
+    );
+
     const uniqueAppointments = [...new Set(
       appointments.map((value) => value.trim()).filter(Boolean)
     )];
@@ -180,6 +192,39 @@ export async function syncAppointmentRegistry(appointments) {
       const existing = registry.appointments.find((entry) => entry.appointment === appointment);
 
       if (existing) {
+        // Detect orphaned binding: registry claims a user is bound but the
+        // users list has no matching active record for this appointment.
+        // This can happen after a partial data loss, manual file edit, or
+        // redeployment that reset the users store while the registry survived.
+        // → Clear the stale binding and issue a fresh code so the slot is
+        //   available again and the sheet no longer shows "IN-USE".
+        if (existing.boundChatId) {
+          const boundChatIdStr = String(existing.boundChatId);
+          const userAppointment = activeUserByChatId.get(boundChatIdStr);
+          const isOrphaned =
+            !userAppointment ||
+            userAppointment !== normalizeAppointmentName(existing.appointment);
+
+          if (isOrphaned) {
+            const secretCode = generateSecretCode(existingCodes);
+            existingCodes.add(secretCode);
+            logStorageSuccess(
+              `# Cleared orphaned binding and regenerated code. {"appointment":"${appointment}","staleBoundChatId":"${existing.boundChatId}"}`
+            );
+            return {
+              ...existing,
+              appointment,
+              secretCode,
+              boundChatId: null,
+              boundUserId: null,
+              boundUsername: null,
+              boundFullName: null,
+              boundAt: null,
+              active: true
+            };
+          }
+        }
+
         // If the entry has a blank secret code (and is not bound to a user),
         // generate a fresh code so the ONBOARDING sheet cell is never empty.
         if (!existing.secretCode && !existing.boundChatId) {

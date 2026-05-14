@@ -2181,3 +2181,45 @@ test("department parsing: PO role slots between SUP and SEAT", () => {
   ]);
 });
 
+test("canonical ordering: departments fully clustered, role order within each dept", () => {
+  // Validates the primary sort invariant: all entries for each department appear
+  // together (clustered), with internal role order Chief→Sup→PO→Seat→WPL→OJT→Other.
+  const ordered = __testing.orderAppointmentsCanonically([
+    "Chef 1",
+    "ECS OJT",
+    "ECS WPL 2",
+    "ECS WPL 1",
+    "ECS 2",
+    "ECS 1",
+    "ECS S2",
+    "ECS S1",
+    "CECS",
+    "C Chef",
+  ]);
+  assert.deepEqual(ordered, [
+    "CECS",
+    "ECS S1",
+    "ECS S2",
+    "ECS 1",
+    "ECS 2",
+    "ECS WPL 1",
+    "ECS WPL 2",
+    "ECS OJT",
+    "C Chef",
+    "Chef 1"
+  ]);
+});
+
+test("canonical ordering: officers cluster before all departments", () => {
+  const ordered = __testing.orderAppointmentsCanonically([
+    "ECS 1",
+    "XO",
+    "CECS",
+    "CO",
+    "OPS 2",
+    "C2 1"
+  ]);
+  // All officers first (CO, XO, OPS), then C2 (dept order 0), then ECS (dept order 9).
+  assert.deepEqual(ordered, ["CO", "XO", "OPS 2", "C2 1", "CECS", "ECS 1"]);
+});
+
