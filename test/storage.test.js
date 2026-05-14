@@ -165,6 +165,58 @@ test("syncAppointmentRegistry preserves valid bindings where user record matches
   });
 });
 
+test("syncAppointmentRegistry registry-sheet reconciliation rules", async () => {
+  await withTempDataDir(async () => {
+    // Seed: three appointments known to the registry.
+    await syncAppointmentRegistry(["ALPHA", "BRAVO", "CHARLIE"]);
+
+    // Bind ALPHA to a user (simulates a completed onboarding).
+    await upsertUser({
+      chatId: "chat-alpha",
+      userId: "user-alpha",
+      username: "alpha",
+      fullName: "Alpha User",
+      updatedAt: new Date().toISOString()
+    });
+    const alphaInvite = await getOnboardingInvite("ALPHA");
+    await bindAppointmentCode(alphaInvite.secretCode, {
+      chatId: "chat-alpha",
+      userId: "user-alpha",
+      username: "alpha",
+      fullName: "Alpha User"
+    });
+    await updateUserByChatId("chat-alpha", {
+      appointment: "ALPHA",
+      onboardingCompletedAt: new Date().toISOString()
+    });
+
+    // Now sync against a sheet that:
+    //   - is missing ALPHA (bound) and BRAVO (unbound)
+    //   - has a new appointment DELTA that is not yet in the registry
+    await syncAppointmentRegistry(["CHARLIE", "DELTA"]);
+
+    const registry = await getAppointmentRegistry();
+
+    // Rule 1 — bound appointment (ALPHA) not in sheet: kept in JSON (active:false)
+    //           so syncRosterState can restore it to the sheet.
+    const alphaEntry = registry.appointments.find((e) => e.appointment === "ALPHA");
+    assert.ok(alphaEntry, "ALPHA must be retained (bound, missing from sheet)");
+    assert.equal(alphaEntry.active, false, "ALPHA marked inactive");
+    assert.equal(alphaEntry.boundChatId, "chat-alpha", "ALPHA binding preserved");
+
+    // Rule 2 — unbound appointment (BRAVO) not in sheet: pruned from JSON entirely.
+    const bravoEntry = registry.appointments.find((e) => e.appointment === "BRAVO");
+    assert.equal(bravoEntry, undefined, "BRAVO must be pruned (unbound, missing from sheet)");
+
+    // Rule 3 — appointment in sheet but not in JSON (DELTA): inserted as new entry.
+    const deltaEntry = registry.appointments.find((e) => e.appointment === "DELTA");
+    assert.ok(deltaEntry, "DELTA must be created (in sheet, new to registry)");
+    assert.equal(deltaEntry.active, true);
+    assert.ok(deltaEntry.secretCode, "DELTA gets a fresh secret code");
+    assert.equal(deltaEntry.boundChatId, null);
+  });
+});
+
 test("appointments can be added to and removed from the active registry", async () => {
   await withTempDataDir(async () => {
     const addResult = await addAppointmentToRegistry("BRAVO");

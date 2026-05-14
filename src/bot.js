@@ -2361,10 +2361,12 @@ async function syncRosterState(sheets, config) {
   await applyStoredConfigOverrides();
 
   // Collect currently-bound appointments from the registry so that any that
-  // have been accidentally removed from the sheet are restored (Req 5).
+  // have been accidentally removed from the sheet are restored.
+  // Include inactive entries: a bound entry can become active:false if it
+  // was previously absent from the sheet; it still needs to be restored.
   const preRegistry = await getAppointmentRegistry();
   const boundAppointmentsToRestore = preRegistry.appointments
-    .filter((entry) => entry.active && entry.boundChatId)
+    .filter((entry) => entry.boundChatId)
     .map((entry) => entry.appointment);
 
   const roster = await syncOnboardingRoster(sheets, config, { boundAppointmentsToRestore });

@@ -255,8 +255,21 @@ export async function syncAppointmentRegistry(appointments) {
       };
     });
 
+    // Rule 1: bound entries not in the sheet are kept (active:false) so
+    // syncRosterState can restore them to the sheet on the next sync.
+    // Rule 2: unbound entries not in the sheet are pruned from the JSON entirely —
+    // they are stale slots that serve no purpose and only create noise.
+    const droppedUnbound = registry.appointments.filter(
+      (entry) => !currentSet.has(entry.appointment) && !entry.boundChatId
+    );
+    if (droppedUnbound.length > 0) {
+      logStorageSuccess(
+        `# Pruned ${droppedUnbound.length} unbound appointment(s) not in sheet: ${droppedUnbound.map((e) => e.appointment).join(", ")}`
+      );
+    }
+
     const inactiveAppointments = registry.appointments
-      .filter((entry) => !currentSet.has(entry.appointment))
+      .filter((entry) => !currentSet.has(entry.appointment) && entry.boundChatId)
       .map((entry) => ({
         ...entry,
         active: false
