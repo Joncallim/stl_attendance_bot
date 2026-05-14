@@ -437,31 +437,154 @@ function orderAppointmentsCanonically(appointments = []) {
 }
 
 /**
+ * Returns the department bucket sort-order for `meta` using `deptOrderByLabel`
+ * (a label → order map built from config.hierarchy) when the appointment
+ * belongs to a department bucket.  Falls back to meta.bucketOrder when the
+ * label is not found in the config map.
+ */
+function deptBucketFromMeta(meta, deptOrderByLabel) {
+  if (meta.bucketOrder < 100) {
+    // Officers-block entry (bucketOrder 0–99): keep as-is.
+    return meta.bucketOrder;
+  }
+  // Family strings look like "WS:CHIEF", "ELECTRONIC SPECIALIST:SUP", etc.
+  const [rawLabel] = String(meta.family ?? "").split(":");
+  const label = rawLabel.replace(/_/g, " ").trim();
+  if (deptOrderByLabel.has(label)) {
+    return 100 + deptOrderByLabel.get(label);
+  }
+  return meta.bucketOrder; // unknown dept — keep canonical fallback
+}
+
+/**
+ * Sorts `appointments` using config-driven ordering:
+ *
+ *   1. Appointments explicitly listed in settings.yaml (`appointmentOrderIndex`)
+ *      come first, in their yaml order.
+ *   2. Appointments that match an officerAppointmentTypePattern (dynamic
+ *      variants like "OPS 2") are interspersed with their type family.
+ *      They slot right after the last explicitly-listed appointment of the
+ *      same prefix, sorted by number within the family.
+ *   3. Everything else (unmatched) follows in department order derived from
+ *      config.hierarchy, then canonical role/number order within each dept.
+ *
+ * Falls back to `orderAppointmentsCanonically` when config is null/empty.
+ */
+function sortWithConfig(appointments, config) {
+  if (!config || appointments.length === 0) {
+    return orderAppointmentsCanonically(appointments);
+  }
+
+  const yamlOrder = config.appointmentOrderIndex ?? new Map();
+  const patterns = config.officerAppointmentTypePatterns ?? [];
+  const hierarchy = config.hierarchy ?? [];
+
+  // Build dept label → order from config.hierarchy (labels are already
+  // mixed-case; normalise via normalizeAppointmentForOrdering for lookup).
+  const deptOrderByLabel = new Map();
+  for (const node of hierarchy) {
+    const label = normalizeAppointmentForOrdering(node.label ?? "");
+    deptOrderByLabel.set(label, typeof node.order === "number" ? node.order : 0);
+  }
+
+  // For each officer type pattern, find the MAXIMUM yaml order index of any
+  // explicitly-listed appointment that belongs to the same prefix family.
+  // This is the "anchor" — pattern-matched entries of the same type sort
+  // immediately after the last explicit appointment of that type.
+  const prefixMaxYaml = new Map(); // prefix → max yaml index
+  for (const { prefix, pattern } of patterns) {
+    for (const [identity, idx] of yamlOrder.entries()) {
+      if (pattern.test(identity)) {
+        const cur = prefixMaxYaml.get(prefix);
+        if (cur === undefined || idx > cur) prefixMaxYaml.set(prefix, idx);
+      }
+    }
+  }
+
+  /**
+   * Returns a sort key tuple [tier, primary, secondary, tertiary] for a
+   * single appointment name.
+   *
+   * tier 0 — explicitly configured or pattern-matched (go first)
+   * tier 1 — unmatched (go at bottom)
+   */
+  function sortKey(appt) {
+    const identity = normalizeAppointmentIdentity(appt);
+
+    // 1) Explicitly in yaml — use yaml order * 10000 so pattern-matched
+    //    entries with the same anchor slot in between explicit ones without
+    //    collision.
+    const yamlIdx = yamlOrder.get(identity);
+    if (yamlIdx !== undefined) {
+      return [0, yamlIdx * 10000, 0, 0];
+    }
+
+    // 2) Matches an officer type pattern (dynamic, not explicitly listed).
+    for (const { prefix, pattern } of patterns) {
+      if (pattern.test(identity)) {
+        const anchor = prefixMaxYaml.get(prefix);
+        // If no explicit appointment of this prefix is in yaml, use the
+        // hardcoded TOP_BLOCK_ORDER position as the anchor.
+        const anchorBase =
+          anchor !== undefined
+            ? anchor * 10000 + 5000  // between anchor and anchor+1 explicit slots
+            : (TOP_BLOCK_ORDER.get(prefix) ?? 99) * 10000 + 5000;
+        const numMatch = identity.match(/\s+(\d+)$/);
+        const num = numMatch ? parseInt(numMatch[1], 10) : -1;
+        return [0, anchorBase + Math.max(0, num + 1), 0, 0];
+      }
+    }
+
+    // 3) Unmatched — use canonical metadata with config-driven dept order.
+    const meta = parseAppointmentOrderingMetadata(appt, 0);
+    const deptBucket = deptBucketFromMeta(meta, deptOrderByLabel);
+    return [1, deptBucket * 10000, meta.roleOrder * 100, Math.max(0, meta.number)];
+  }
+
+  return appointments
+    .map((appt, originalIndex) => ({ appt, originalIndex, key: sortKey(appt) }))
+    .sort((a, b) => {
+      for (let i = 0; i < a.key.length; i++) {
+        if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
+      }
+      // Stable: preserve original order as final tiebreaker.
+      return a.originalIndex - b.originalIndex;
+    })
+    .map(({ appt }) => appt);
+}
+
+/**
  * Reconciles the appointments currently in the ONBOARDING sheet against the
  * canonical list from settings.yaml.
  *
- * When configuredAppointments is non-empty, settings.yaml is authoritative:
- * - Appointments whose normalised identity (trim + toUpperCase) matches a
- *   configured appointment are renamed to the canonical settings.yaml name and
- *   placed in settings.yaml order.
- * - Appointments that match an officer type pattern (officerTypePatterns) are
- *   KEPT even if they are not explicitly listed in configuredAppointments.  When
- *   pattern-matched appointments are present the merged set is sorted canonically
- *   (officers block first, then departments) so that dynamic entries like "OPS 2"
- *   slot into the correct position.
- * - Appointments that neither match a configured name nor an officer type pattern
- *   are DROPPED — they have been removed from settings.yaml.
- * - If configuredAppointments is empty the original list is returned as-is.
+ * Policy (never silently delete):
+ * - Appointments matching a configuredAppointment name (case-insensitive) are
+ *   renamed to the canonical settings.yaml spelling and placed first, in
+ *   settings.yaml order.
+ * - Appointments matching an officerTypePattern (e.g. "OPS 2") are kept and
+ *   sorted into the correct position within their type family.
+ * - Appointments that match neither are placed at the bottom of the list sorted
+ *   canonically among themselves.  They are NEVER automatically removed —
+ *   removal must be performed by an admin action.
+ * - When configuredAppointments is empty the original list is returned as-is.
+ *
+ * Optional 4th argument `config` enriches the sort: when provided the merged
+ * list is ordered by settings.yaml appointmentOrderIndex (explicit entries),
+ * officer-type anchor positions (pattern-matched), and config hierarchy order
+ * (unmatched department entries).  When omitted the canonical heuristic sort
+ * (`orderAppointmentsCanonically`) is used as a fallback.
  *
  * @param {string[]} onboardingAppointments  Current ONBOARDING appointment names.
  * @param {string[]} configuredAppointments  Explicit appointments from settings.yaml.
- * @param {{ prefix: string, pattern: RegExp }[]} [officerTypePatterns]  Officer type patterns.
+ * @param {{ prefix: string, pattern: RegExp }[]} [officerTypePatterns]
+ * @param {object|null} [config]  Full runtime config (for config-aware sorting).
  * Returns { reconciled: string[], changed: boolean }.
  */
 function reconcileOnboardingWithConfig(
   onboardingAppointments,
   configuredAppointments,
-  officerTypePatterns = []
+  officerTypePatterns = [],
+  config = null
 ) {
   if (configuredAppointments.length === 0) {
     return { reconciled: onboardingAppointments, changed: false };
@@ -472,13 +595,14 @@ function reconcileOnboardingWithConfig(
     configuredAppointments.map((name) => [normalizeAppointmentIdentity(name), name])
   );
 
-  // Partition ONBOARDING appointments into three buckets:
-  //   matchedIdentities   — explicitly in configuredAppointments (use canonical name/order)
-  //   patternMatched      — match an officer type pattern but not explicitly listed (keep as-is)
-  //   (everything else)   — dropped
-  // De-duplicate by normalised identity throughout (first occurrence wins).
+  // Partition ONBOARDING appointments into three buckets (de-duplicate by
+  // normalised identity; first occurrence wins):
+  //   matchedIdentities — explicitly in configuredAppointments
+  //   patternMatched    — match an officer type pattern but not explicitly listed
+  //   unmatched         — neither; kept at the bottom
   const matchedIdentities = new Set();
   const patternMatched = [];
+  const unmatched = [];
   const seenIdentities = new Set();
 
   for (const appt of onboardingAppointments) {
@@ -496,22 +620,32 @@ function reconcileOnboardingWithConfig(
       officerTypePatterns.some((p) => p.pattern.test(identity))
     ) {
       patternMatched.push(appt);
+    } else {
+      unmatched.push(appt);
     }
-    // Unmatched, non-pattern appointments are intentionally dropped.
   }
 
-  // Build the reconciled list.
+  // Explicitly configured appointments that are present in ONBOARDING.
   const explicitReconciled = configuredAppointments.filter((name) =>
     matchedIdentities.has(normalizeAppointmentIdentity(name))
   );
 
-  // When pattern-matched appointments exist, merge with explicitly reconciled
-  // and re-sort canonically so dynamic entries (e.g. "OPS 2") land in the
-  // right position within the officer block.
-  const reconciled =
-    patternMatched.length > 0
-      ? orderAppointmentsCanonically([...explicitReconciled, ...patternMatched])
-      : explicitReconciled;
+  // Merge explicit + pattern-matched, then append unmatched at bottom.
+  const allValid = [...explicitReconciled, ...patternMatched];
+  const sortedValid =
+    config != null
+      ? sortWithConfig(allValid, config)
+      : patternMatched.length > 0
+        ? orderAppointmentsCanonically(allValid)
+        : allValid; // already in yaml order when no patterns present
+
+  // Unmatched stay at the bottom, sorted canonically (or config-aware if available).
+  const sortedUnmatched =
+    config != null
+      ? sortWithConfig(unmatched, config)
+      : orderAppointmentsCanonically(unmatched);
+
+  const reconciled = [...sortedValid, ...sortedUnmatched];
 
   const changed =
     reconciled.length !== onboardingAppointments.length ||
@@ -3302,6 +3436,41 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
     onboardingSlice = await refreshOnboardingSlice(sheets, config, { cache, force: true, persist: false });
   }
 
+  // Pre-Step 1b: Restore any bound appointments that were removed from the sheet
+  // but are still active in the registry.  These are passed in from the caller
+  // (bot.js syncRosterState) so we don't need a storage import here.
+  // Appointments are only re-added; duplicates (already in ONBOARDING) are skipped.
+  {
+    const boundToRestore = options.boundAppointmentsToRestore ?? [];
+    if (boundToRestore.length > 0) {
+      const currentIdentities = new Set(
+        onboardingSlice.appointments.map(normalizeAppointmentIdentity)
+      );
+      const missing = boundToRestore.filter(
+        (appt) => !currentIdentities.has(normalizeAppointmentIdentity(appt))
+      );
+      if (missing.length > 0) {
+        logSheetsSuccess(
+          `[ONBOARDING] Restoring ${missing.length} bound appointment(s) removed from sheet: ${missing.join(", ")}`
+        );
+        // Append missing entries; reconciliation will sort them into position.
+        const restoredList = [...onboardingSlice.appointments, ...missing];
+        await writeAppointmentColumn(
+          sheets,
+          config.spreadsheetId,
+          title,
+          restoredList,
+          { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
+        );
+        onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+          cache,
+          force: true,
+          persist: false
+        });
+      }
+    }
+  }
+
   // Step 1: Reconcile with settings.yaml configured appointments when available;
   // otherwise fall back to the canonical pattern-based sort.
   console.log(`[Sync] Step 1/4: Sorting ONBOARDING column A to canonical order…`);
@@ -3315,14 +3484,13 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
     const { reconciled, changed } = reconcileOnboardingWithConfig(
       rawOnboardingAppointments,
       config.configuredAppointments,
-      config.officerAppointmentTypePatterns ?? []
+      config.officerAppointmentTypePatterns ?? [],
+      config  // enables config-aware sort (yaml order + hierarchy dept order)
     );
 
     if (changed) {
-      const dropped = rawOnboardingAppointments.length - reconciled.length;
       logSheetsSuccess(
-        `[ONBOARDING] Reconciling with settings.yaml: ${reconciled.length} appointments` +
-        (dropped > 0 ? ` (${dropped} removed — no longer in settings.yaml).` : ".")
+        `[ONBOARDING] Reconciling with settings.yaml: ${reconciled.length} appointments.`
       );
       await writeAppointmentColumn(
         sheets,
@@ -4266,6 +4434,7 @@ export const __testing = {
   getBootstrapAppointments,
   isRetryableGoogleSheetsError,
   orderAppointmentsCanonically,
+  sortWithConfig,
   parseAppointmentOrderingMetadata,
   parseOnboardingManagedRows,
   runGoogleSheetsRequest,

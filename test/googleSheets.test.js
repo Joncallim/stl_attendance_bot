@@ -1919,13 +1919,15 @@ test("reconcileOnboardingWithConfig: renames appointment to canonical settings.y
   assert.equal(changed, true);
 });
 
-test("reconcileOnboardingWithConfig: unmatched appointments are dropped (settings.yaml is authoritative)", () => {
+test("reconcileOnboardingWithConfig: unmatched appointments go to the bottom (never dropped)", () => {
   const { reconciled, changed } = __testing.reconcileOnboardingWithConfig(
     ["CO", "WS 6", "Unknown Appt", "ECS 4"],
     ["CO", "ECS 4", "WS 6"]
   );
-  // "Unknown Appt" is not in settings.yaml so it must be removed from the result.
-  assert.deepEqual(reconciled, ["CO", "ECS 4", "WS 6"]);
+  // "Unknown Appt" is not in settings.yaml; it must be preserved at the bottom.
+  assert.ok(reconciled.includes("Unknown Appt"), "unmatched must be kept");
+  assert.deepEqual(reconciled.slice(0, 3), ["CO", "ECS 4", "WS 6"]);
+  assert.equal(reconciled[3], "Unknown Appt");
   assert.equal(changed, true);
 });
 
@@ -1981,15 +1983,17 @@ test("reconcileOnboardingWithConfig: officer type pattern keeps bare prefix (no 
   assert.equal(changed, true); // AOPS was added to the list
 });
 
-test("reconcileOnboardingWithConfig: non-officer unmatched appointment is still dropped with patterns active", () => {
+test("reconcileOnboardingWithConfig: non-officer unmatched appointment goes to bottom with patterns active", () => {
   const { reconciled } = __testing.reconcileOnboardingWithConfig(
     ["CO", "OPS 1", "ECS UNKNOWN", "OPS 2"],
     ["CO", "OPS 1"],
     makePatterns("OPS")
   );
-  // "ECS UNKNOWN" does not match OPS pattern → dropped
-  assert.ok(!reconciled.includes("ECS UNKNOWN"), "ECS UNKNOWN must be dropped");
+  // "ECS UNKNOWN" does not match OPS pattern → kept but placed at bottom
+  assert.ok(reconciled.includes("ECS UNKNOWN"), "ECS UNKNOWN must be kept (never dropped)");
   assert.ok(reconciled.includes("OPS 2"), "OPS 2 must be kept via pattern");
+  // ECS UNKNOWN must come after pattern-matched OPS 2
+  assert.ok(reconciled.indexOf("ECS UNKNOWN") > reconciled.indexOf("OPS 2"), "ECS UNKNOWN after pattern-matched");
 });
 
 test("reconcileOnboardingWithConfig: duplicate pattern-matched entry is de-duplicated", () => {
@@ -2011,13 +2015,65 @@ test("reconcileOnboardingWithConfig: officer type pattern is case-insensitive", 
   assert.ok(reconciled.includes("ops 2"), "lowercase ops 2 must be kept");
 });
 
-test("reconcileOnboardingWithConfig: no patterns — unchanged drop behaviour", () => {
-  // Without patterns the function must still drop non-explicit appointments.
+test("reconcileOnboardingWithConfig: no patterns — unmatched kept at bottom", () => {
+  // Without patterns, non-explicit appointments must be preserved at the bottom.
   const { reconciled } = __testing.reconcileOnboardingWithConfig(
     ["CO", "OPS 2"],
     ["CO"],
     [] // no patterns
   );
-  assert.deepEqual(reconciled, ["CO"]);
+  assert.ok(reconciled.includes("CO"), "CO must be kept (explicit)");
+  assert.ok(reconciled.includes("OPS 2"), "OPS 2 must be kept at bottom (never dropped)");
+  assert.equal(reconciled[0], "CO");
+});
+
+// --- sortWithConfig ---
+
+function makeConfig({ yamlOrder = [], officerPatterns = [], hierarchy = [] } = {}) {
+  const appointmentOrderIndex = new Map(
+    yamlOrder.map(([name, idx]) => [name.toUpperCase(), idx])
+  );
+  const officerAppointmentTypePatterns = officerPatterns.map((prefix) => ({
+    prefix: prefix.toUpperCase(),
+    pattern: new RegExp(`^${prefix.toUpperCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s+\\d+)?$`)
+  }));
+  return { appointmentOrderIndex, officerAppointmentTypePatterns, hierarchy };
+}
+
+test("sortWithConfig: explicitly configured appointments follow yaml order", () => {
+  const config = makeConfig({ yamlOrder: [["CO", 0], ["AOPS", 1], ["OPS 1", 2]] });
+  const sorted = __testing.sortWithConfig(["OPS 1", "CO", "AOPS"], config);
+  assert.deepEqual(sorted, ["CO", "AOPS", "OPS 1"]);
+});
+
+test("sortWithConfig: pattern-matched variants slot after last explicit of their type", () => {
+  // yaml: CO(0), OPS 1(1) — OPS 2 is pattern-matched
+  const config = makeConfig({
+    yamlOrder: [["CO", 0], ["OPS 1", 1]],
+    officerPatterns: ["OPS"]
+  });
+  const sorted = __testing.sortWithConfig(["OPS 2", "CO", "OPS 1"], config);
+  assert.deepEqual(sorted, ["CO", "OPS 1", "OPS 2"]);
+});
+
+test("sortWithConfig: unmatched appointments go after configured+pattern entries", () => {
+  const config = makeConfig({
+    yamlOrder: [["CO", 0]],
+    officerPatterns: ["OPS"],
+    hierarchy: [{ label: "Officers", order: 0 }, { label: "WS", order: 1 }]
+  });
+  const sorted = __testing.sortWithConfig(["WS 1", "CO", "OPS 2", "UNKNOWN"], config);
+  assert.equal(sorted[0], "CO", "CO first (yaml explicit)");
+  assert.equal(sorted[1], "OPS 2", "OPS 2 second (pattern-matched)");
+  // WS 1 and UNKNOWN are unmatched; they follow the configured entries
+  assert.ok(sorted.indexOf("WS 1") > sorted.indexOf("OPS 2"), "WS 1 after OPS 2");
+  assert.ok(sorted.indexOf("UNKNOWN") >= 0, "UNKNOWN is kept");
+});
+
+test("sortWithConfig: stable when config is null — falls back to canonical order", () => {
+  // sortWithConfig(appointments, null) must not throw and must return a sorted array.
+  const sorted = __testing.sortWithConfig(["ECS 1", "CO", "XO"], null);
+  assert.ok(Array.isArray(sorted) && sorted.length === 3, "returns array of same length");
+  assert.equal(sorted[0], "CO", "CO first in canonical order");
 });
 

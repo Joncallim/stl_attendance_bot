@@ -58,6 +58,7 @@ import {
 } from "./storage.js";
 import { createSyncManager } from "./syncManager.js";
 import { runSerialized } from "./fileStore.js";
+import { applyStoredConfigOverrides } from "./config.js";
 import {
   applyWeeklyAttendanceSelection,
   createWeeklyFlowState,
@@ -2355,7 +2356,18 @@ async function queueAttendanceSelection(cache, config, appointment, status, date
 }
 
 async function syncRosterState(sheets, config) {
-  const roster = await syncOnboardingRoster(sheets, config);
+  // Re-read settings.yaml before every sync so admin edits (new appointments,
+  // reordered hierarchy, updated officer types) are picked up without restart.
+  await applyStoredConfigOverrides();
+
+  // Collect currently-bound appointments from the registry so that any that
+  // have been accidentally removed from the sheet are restored (Req 5).
+  const preRegistry = await getAppointmentRegistry();
+  const boundAppointmentsToRestore = preRegistry.appointments
+    .filter((entry) => entry.active && entry.boundChatId)
+    .map((entry) => entry.appointment);
+
+  const roster = await syncOnboardingRoster(sheets, config, { boundAppointmentsToRestore });
 
   if (roster.driftDetected) {
     return roster;

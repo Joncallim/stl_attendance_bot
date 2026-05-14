@@ -180,6 +180,14 @@ export async function syncAppointmentRegistry(appointments) {
       const existing = registry.appointments.find((entry) => entry.appointment === appointment);
 
       if (existing) {
+        // If the entry has a blank secret code (and is not bound to a user),
+        // generate a fresh code so the ONBOARDING sheet cell is never empty.
+        if (!existing.secretCode && !existing.boundChatId) {
+          const secretCode = generateSecretCode(existingCodes);
+          existingCodes.add(secretCode);
+          logStorageSuccess(`# Generated secret code for existing appointment with blank code. {"appointment":"${appointment}"}`);
+          return { ...existing, appointment, secretCode, active: true };
+        }
         return {
           ...existing,
           appointment,

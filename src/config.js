@@ -400,7 +400,7 @@ const runtimeConfig = {
   onboardingAttendanceOptions: []
 };
 
-function applyUnitSettings(config, unitSettings) {
+export function applyUnitSettings(config, unitSettings) {
   config.unit = unitSettings.unit;
   config.hierarchy = unitSettings.hierarchy;
   config.hierarchyNodeByKey = unitSettings.hierarchyNodeByKey;
