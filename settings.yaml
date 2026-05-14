@@ -62,12 +62,12 @@ hierarchy:
 officerAppointmentTypes:
   - OPS
   - AOPS
-  - ASE
-  - ANO
-  - YO
   - SME
   - SCSE
   - ME
+  - ASE
+  - ANO
+  - YO
 
 appointments:
   - name: CO
@@ -82,23 +82,54 @@ appointments:
     hierarchyNodeId: officers
     defaultAdmin: true
     order: 2
-  - name: SCSE
-    hierarchyNodeId: officers
-    defaultAdmin: true
-    order: 3
   - name: OPS 1
     hierarchyNodeId: officers
     defaultAdmin: true
+    order: 3
+  - name: OPS 2
+    hierarchyNodeId: officers
+    defaultAdmin: false
     order: 4
-  - name: USER1
+  - name: OPS 3
     hierarchyNodeId: officers
+    defaultAdmin: false
     order: 5
-  - name: USER2
+  - name: OPS 4
     hierarchyNodeId: officers
+    defaultAdmin: false
     order: 6
-  - name: USER3
+  - name: OPS 5
     hierarchyNodeId: officers
+    defaultAdmin: false
     order: 7
+  - name: NO
+    hierarchyNodeId: officers
+    defaultAdmin: false
+    order: 8
+  - name: AOPS 1
+    hierarchyNodeId: officers
+    defaultAdmin: false
+    order: 9
+  - name: AOPS 2
+    hierarchyNodeId: officers
+    defaultAdmin: false
+    order: 10
+  - name: AOPS 3
+    hierarchyNodeId: officers
+    defaultAdmin: false
+    order: 11
+  - name: SME
+    hierarchyNodeId: officers
+    defaultAdmin: false
+    order: 12
+  - name: SCSE
+    hierarchyNodeId: officers
+    defaultAdmin: true
+    order: 13
+  - name: ME
+    hierarchyNodeId: officers
+    defaultAdmin: false
+    order: 14
 
 attendance:
   groups:
