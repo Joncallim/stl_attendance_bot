@@ -595,6 +595,9 @@ function buildAdminRosterMenu() {
       Markup.button.callback("📄 Change Spreadsheet", "admin:changespreadsheet")
     ],
     [
+      Markup.button.callback("🔧 Self-Heal Logs", "admin:selfheallogs:0")
+    ],
+    [
       Markup.button.callback("🔙 Back", "admin:main"),
       Markup.button.callback("❌ Close", "admin:close")
     ]
@@ -3188,6 +3191,16 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
     return;
   }
 
+  if (action.startsWith("selfheallogs:")) {
+    const page = Number(action.split(":")[1]) || 0;
+    await sendOrUpdateAdminMessage(
+      ctx,
+      buildSelfHealLogsText(page, config.timezone),
+      buildSelfHealLogsMenu(page)
+    );
+    return;
+  }
+
   if (action === "flushqueue") {
     // Fire-and-forget: flush can take tens of seconds; Telegraf 90 s limit would kill it.
     handleFlushAttendanceAdminAction(ctx, config, {
@@ -3498,6 +3511,27 @@ function getRelevantHealingMonthTitles(timezone) {
 }
 
 /**
+ * Returns a Set of the two sheet titles where self-healing may write structural
+ * changes (add or remove appointment rows): current month and next month only.
+ * Last month is always read-only during healing — an appointment may legitimately
+ * be absent from last month if it was created after that month ended.
+ */
+function getHealableMonthTitles(timezone) {
+  const now = new Date();
+  const numericMonth = Number(
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone, month: "numeric" }).format(now)
+  ) - 1;
+  const numericYear = Number(
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone, year: "numeric" }).format(now)
+  );
+
+  return new Set([
+    getSheetMonthTitle(new Date(Date.UTC(numericYear, numericMonth, 1)), timezone),
+    getSheetMonthTitle(new Date(Date.UTC(numericYear, numericMonth + 1, 1)), timezone)
+  ]);
+}
+
+/**
  * Returns true if the given appointment has at least one non-blank attendance
  * value in the snapshot (i.e. the row was actually used).
  */
@@ -3562,36 +3596,112 @@ function detectSnapshotDivergences(snapshotBundle, activeRegistryAppointments) {
 }
 
 /**
- * Returns the Telegram chat IDs of all currently-active admins
- * (default + custom + chief) that have completed onboarding.
+ * In-memory ring-buffer of self-healing cycle results, newest first.
+ * Each entry: { runAt, divergences, addResults, syncFailed }
+ * Capped at SELF_HEAL_LOG_MAX entries so memory usage stays bounded.
  */
-async function getAdminChatIds(adminCache) {
-  const registry = await getAppointmentRegistry();
-  const adminAppointments = new Set(
-    (adminCache.admins ?? []).map((e) => e.appointment.toUpperCase())
+const selfHealLog = [];
+const SELF_HEAL_LOG_MAX = 30;
+
+const SELF_HEAL_LOGS_PER_PAGE = 5;
+
+/**
+ * Renders one page of the self-healing log as plain text (HTML parse mode).
+ */
+function buildSelfHealLogsText(page, timezone) {
+  if (selfHealLog.length === 0) {
+    return [
+      "<b>🔧 Self-Heal Logs</b>",
+      "",
+      "No self-healing cycles have run yet.",
+      "",
+      "The bot checks for sheet divergences every 5 minutes and logs any repairs here."
+    ].join("\n");
+  }
+
+  const totalPages = Math.ceil(selfHealLog.length / SELF_HEAL_LOGS_PER_PAGE);
+  const safePage = Math.max(0, Math.min(page, totalPages - 1));
+  const entries = selfHealLog.slice(
+    safePage * SELF_HEAL_LOGS_PER_PAGE,
+    (safePage + 1) * SELF_HEAL_LOGS_PER_PAGE
   );
-  return registry.appointments
-    .filter((entry) => entry.boundChatId && adminAppointments.has(entry.appointment.toUpperCase()))
-    .map((entry) => entry.boundChatId);
+
+  const lines = [
+    `<b>🔧 Self-Heal Logs</b>  (page ${safePage + 1}/${totalPages})`,
+    ""
+  ];
+
+  for (const entry of entries) {
+    const runDate = new Date(entry.runAt);
+    const dateLabel = new Intl.DateTimeFormat("en-GB", {
+      timeZone: timezone,
+      day: "2-digit",
+      month: "short",
+      year: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    }).format(runDate).replace(",", "");
+
+    lines.push(`<b>🕐 ${dateLabel}</b>`);
+
+    if (entry.syncFailed) {
+      lines.push("  ❌ Structural sync failed after healing.");
+    }
+
+    for (const div of entry.divergences) {
+      lines.push(`  <b>${div.sheetTitle}</b>`);
+
+      for (const apt of div.missingFromSheet) {
+        lines.push(`    • Restored: ${apt}`);
+      }
+
+      for (const apt of div.unexpectedWithData) {
+        const res = (entry.addResults ?? []).find((r) => r.appointment === apt);
+        const tag = res?.ok ? "added to roster" : `add failed (${res?.reason ?? "?"})`;
+        lines.push(`    • Unknown+data: ${apt} → ${tag}`);
+      }
+
+      const noData = div.unexpectedInSheet.filter((a) => !div.unexpectedWithData.includes(a));
+
+      for (const apt of noData) {
+        lines.push(`    • Removed (no data): ${apt}`);
+      }
+    }
+
+    lines.push("");
+  }
+
+  return lines.join("\n");
 }
 
 /**
- * Sends a plain-text (HTML parse mode) message directly to every admin chat.
- * Failures per chat are swallowed so one bad chatId doesn't block the others.
+ * Returns the inline keyboard for the self-heal logs view (pagination + back).
  */
-async function notifyAdminsDirectly(bot, adminCache, message) {
-  const chatIds = await getAdminChatIds(adminCache);
+function buildSelfHealLogsMenu(page) {
+  const totalPages = Math.ceil(selfHealLog.length / SELF_HEAL_LOGS_PER_PAGE);
+  const navRow = [];
 
-  for (const chatId of chatIds) {
-    try {
-      await bot.telegram.sendMessage(chatId, message, { parse_mode: "HTML" });
-    } catch (error) {
-      logBotError("[SelfHeal] Failed to notify admin.", {
-        chatId,
-        error: error.message
-      });
-    }
+  if (page > 0) {
+    navRow.push(Markup.button.callback("◀ Newer", `admin:selfheallogs:${page - 1}`));
   }
+
+  if (page < totalPages - 1) {
+    navRow.push(Markup.button.callback("Older ▶", `admin:selfheallogs:${page + 1}`));
+  }
+
+  const rows = [];
+
+  if (navRow.length > 0) {
+    rows.push(navRow);
+  }
+
+  rows.push([
+    Markup.button.callback("🔙 Back", "admin:menu:roster"),
+    Markup.button.callback("❌ Close", "admin:close")
+  ]);
+
+  return Markup.inlineKeyboard(rows);
 }
 
 /**
@@ -3601,7 +3711,7 @@ async function notifyAdminsDirectly(bot, adminCache, message) {
  * Throttled by SELF_HEAL_COOLDOWN_MS so it cannot fire more than once per hour.
  * Skips when a roster sync is already in progress.
  */
-async function runSelfHealingCycle(bot, sheets, config, adminCache) {
+async function runSelfHealingCycle(sheets, config, adminCache) {
   const now = Date.now();
 
   if (now - lastSelfHealAt < SELF_HEAL_COOLDOWN_MS) {
@@ -3691,56 +3801,13 @@ async function runSelfHealingCycle(bot, sheets, config, adminCache) {
     rosterSyncInProgress = false;
   }
 
-  // Step 3: Build and send admin notification.
-  const lines = [
-    "<b>🔧 Self-Healing Alert</b>",
-    "",
-    "The bot detected appointments in the attendance sheets that did not match the roster. The sheets have been automatically repaired.",
-    ""
-  ];
+  // Step 3: Store results in the in-memory log (viewable from Admin → Roster → Self-Heal Logs).
+  selfHealLog.unshift({ runAt: new Date().toISOString(), divergences, addResults, syncFailed });
 
-  for (const div of divergences) {
-    lines.push(`<b>📋 ${div.sheetTitle}</b>`);
-
-    for (const apt of div.missingFromSheet) {
-      lines.push(`• Restored: <b>${apt}</b> (was missing — re-inserted)`);
-    }
-
-    for (const apt of div.unexpectedWithData) {
-      const res = addResults.find((r) => r.appointment === apt);
-      const status = res?.ok
-        ? "added to roster so its data is preserved"
-        : `could not be added (${res?.reason ?? "unknown error"})`;
-      lines.push(`• Unknown appointment with data: <b>${apt}</b> — ${status}`);
-    }
-
-    const noDataUnexpected = div.unexpectedInSheet.filter(
-      (a) => !div.unexpectedWithData.includes(a)
-    );
-
-    for (const apt of noDataUnexpected) {
-      lines.push(`• Removed: <b>${apt}</b> (unknown appointment, no attendance data)`);
-    }
-
-    lines.push("");
+  if (selfHealLog.length > SELF_HEAL_LOG_MAX) {
+    selfHealLog.length = SELF_HEAL_LOG_MAX;
   }
 
-  const hasAddedAppointments = addResults.some((r) => r.ok);
-
-  if (hasAddedAppointments) {
-    lines.push(
-      "⚠️ <i>If an added appointment was intended to be a rename or transfer of an existing one, use <b>Transfer User</b> in the Admin Menu to re-bind the Telegram account. Manual cell edits cannot express intent — the bot always treats an unknown appointment as new.</i>"
-    );
-    lines.push("");
-  }
-
-  if (syncFailed) {
-    lines.push("❌ The structural sync after healing failed. Please run <b>Sync Roster</b> from the Admin Menu to complete the repair.");
-  } else {
-    lines.push("✅ All affected sheets have been repaired. No further action is required.");
-  }
-
-  await notifyAdminsDirectly(bot, adminCache, lines.join("\n"));
   logBot("[SelfHeal] Cycle complete.", {
     divergentSheets: divergences.length,
     appointmentsAdded: addResults.filter((r) => r.ok).length,
@@ -4146,7 +4213,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
     // month sheets.  Throttled by SELF_HEAL_COOLDOWN_MS (1 hour) so healing
     // never triggers more than once per cooldown window regardless of how
     // many 5-minute cycles elapse while the divergence persists.
-    runSelfHealingCycle(bot, sheets, config, adminCache).catch((error) => {
+    runSelfHealingCycle(sheets, config, adminCache).catch((error) => {
       logBotError("[SelfHeal] Unhandled error in self-healing cycle.", {
         error: error.message
       });
@@ -6105,5 +6172,8 @@ export const __testing = {
   detectSnapshotDivergences,
   snapshotAppointmentHasData,
   runSelfHealingCycle,
-  resetSelfHealGuard() { lastSelfHealAt = 0; }
+  resetSelfHealGuard() { lastSelfHealAt = 0; },
+  selfHealLog,
+  buildSelfHealLogsText,
+  buildSelfHealLogsMenu
 };
