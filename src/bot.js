@@ -3846,7 +3846,7 @@ async function runSelfHealingCycle(sheets, config, adminCache) {
   }
 
   logBot("[SelfHeal] Cycle complete.", {
-    divergentSheets: divergences.length,
+    divergentSheets: allDivergences.length,
     appointmentsAdded: addResults.filter((r) => r.ok).length,
     syncFailed
   });
