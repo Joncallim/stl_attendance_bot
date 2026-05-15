@@ -3650,22 +3650,34 @@ function buildSelfHealLogsText(page, timezone) {
     }
 
     for (const div of entry.divergences) {
-      lines.push(`  <b>${div.sheetTitle}</b>`);
+      const readOnly = div.healed === false;
+      const sheetTag = readOnly ? " (observe only — last month)" : "";
+      lines.push(`  <b>${div.sheetTitle}</b>${sheetTag}`);
 
       for (const apt of div.missingFromSheet) {
-        lines.push(`    • Restored: ${apt}`);
+        lines.push(readOnly
+          ? `    • Missing: ${apt} (not restored — last month is read-only)`
+          : `    • Restored: ${apt}`
+        );
       }
 
       for (const apt of div.unexpectedWithData) {
-        const res = (entry.addResults ?? []).find((r) => r.appointment === apt);
-        const tag = res?.ok ? "added to roster" : `add failed (${res?.reason ?? "?"})`;
-        lines.push(`    • Unknown+data: ${apt} → ${tag}`);
+        if (readOnly) {
+          lines.push(`    • Unknown+data: ${apt} (not added — last month is read-only)`);
+        } else {
+          const res = (entry.addResults ?? []).find((r) => r.appointment === apt);
+          const tag = res?.ok ? "added to roster" : `add failed (${res?.reason ?? "?"})`;
+          lines.push(`    • Unknown+data: ${apt} → ${tag}`);
+        }
       }
 
       const noData = div.unexpectedInSheet.filter((a) => !div.unexpectedWithData.includes(a));
 
       for (const apt of noData) {
-        lines.push(`    • Removed (no data): ${apt}`);
+        lines.push(readOnly
+          ? `    • Unknown (no data): ${apt} (left as-is — last month is read-only)`
+          : `    • Removed (no data): ${apt}`
+        );
       }
     }
 
@@ -3737,8 +3749,12 @@ async function runSelfHealingCycle(sheets, config, adminCache) {
     return;
   }
 
-  // Restrict healing to last, current, and next month only — ignore historical sheets.
+  // Detect divergences across last, current, and next month — but only write to
+  // current and next month.  Last month is observe-only: an appointment may
+  // legitimately be absent from last month if it was created after that month ended.
   const relevantTitles = getRelevantHealingMonthTitles(config.timezone);
+  const healableTitles = getHealableMonthTitles(config.timezone);
+
   const filteredSnapshots = new Map(
     [...snapshotBundle.snapshots].filter(([title]) => relevantTitles.has(title))
   );
@@ -3748,23 +3764,30 @@ async function runSelfHealingCycle(sheets, config, adminCache) {
   }
 
   const filteredBundle = { ...snapshotBundle, snapshots: filteredSnapshots };
-  const divergences = detectSnapshotDivergences(filteredBundle, activeAppointments);
+  const allDivergences = detectSnapshotDivergences(filteredBundle, activeAppointments);
 
-  if (divergences.length === 0) {
+  if (allDivergences.length === 0) {
     return;
   }
+
+  // Partition into sheets we can repair vs sheets we only observe.
+  const divergencesToHeal = allDivergences.filter((d) => healableTitles.has(d.sheetTitle));
+  const divergencesToObserve = allDivergences.filter((d) => !healableTitles.has(d.sheetTitle));
 
   // Commit the timestamp immediately — even if healing partially fails we don't
   // want the next 5-minute cycle to re-trigger before the cooldown expires.
   lastSelfHealAt = now;
   logBot("[SelfHeal] Divergences detected — beginning healing cycle.", {
-    sheets: divergences.map((d) => d.sheetTitle)
+    healSheets: divergencesToHeal.map((d) => d.sheetTitle),
+    observeSheets: divergencesToObserve.map((d) => d.sheetTitle)
   });
 
-  // Step 1: Add every unexpected-with-data appointment to the roster so its
-  // existing attendance rows are preserved rather than discarded by the sync.
+  // Step 1: Add unexpected-with-data appointments from healable months to the
+  // roster BEFORE the structural sync so their rows are preserved rather than
+  // discarded.  We do NOT add from observe-only months — appointments absent
+  // from last month may simply not have existed yet that month.
   const toAdd = [
-    ...new Set(divergences.flatMap((d) => d.unexpectedWithData))
+    ...new Set(divergencesToHeal.flatMap((d) => d.unexpectedWithData))
   ];
   const addResults = [];
 
@@ -3779,30 +3802,44 @@ async function runSelfHealingCycle(sheets, config, adminCache) {
     }
   }
 
-  // Step 2: Full structural sync — inserts missing appointments, removes
-  // unknown ones, restores correct ordering, and re-syncs ONBOARDING codes.
+  // Step 2: Structural sync — only runs when there are healable divergences.
+  // syncOnboardingRoster already uses layoutOnly:true for last month internally,
+  // so row structure is never modified there even if sync runs.
   let syncFailed = false;
 
-  rosterSyncInProgress = true;
+  if (divergencesToHeal.length > 0) {
+    rosterSyncInProgress = true;
 
-  try {
-    await syncRosterState(sheets, config);
-    await refreshAdminCache(adminCache, config);
-    await preloadSheetSnapshots(sheets, config, adminCache, {
-      force: true,
-      structural: false,
-      normalizeAliases: true
-    });
-    logBot("[SelfHeal] Structural sync complete.");
-  } catch (error) {
-    syncFailed = true;
-    logBotError("[SelfHeal] Structural sync failed.", { error: error.message });
-  } finally {
-    rosterSyncInProgress = false;
+    try {
+      await syncRosterState(sheets, config);
+      await refreshAdminCache(adminCache, config);
+      await preloadSheetSnapshots(sheets, config, adminCache, {
+        force: true,
+        structural: false,
+        normalizeAliases: true
+      });
+      logBot("[SelfHeal] Structural sync complete.");
+    } catch (error) {
+      syncFailed = true;
+      logBotError("[SelfHeal] Structural sync failed.", { error: error.message });
+    } finally {
+      rosterSyncInProgress = false;
+    }
   }
 
   // Step 3: Store results in the in-memory log (viewable from Admin → Roster → Self-Heal Logs).
-  selfHealLog.unshift({ runAt: new Date().toISOString(), divergences, addResults, syncFailed });
+  // Tag each divergence so the log viewer can show whether it was repaired or just observed.
+  const taggedDivergences = [
+    ...divergencesToHeal.map((d) => ({ ...d, healed: true })),
+    ...divergencesToObserve.map((d) => ({ ...d, healed: false }))
+  ];
+
+  selfHealLog.unshift({
+    runAt: new Date().toISOString(),
+    divergences: taggedDivergences,
+    addResults,
+    syncFailed
+  });
 
   if (selfHealLog.length > SELF_HEAL_LOG_MAX) {
     selfHealLog.length = SELF_HEAL_LOG_MAX;
