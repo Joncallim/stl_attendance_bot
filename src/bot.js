@@ -1,3 +1,5 @@
+import { readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import cron from "node-cron";
 import { Markup, Telegraf, session } from "telegraf";
 import { ipv4HttpsAgent } from "./network.js";
@@ -589,7 +591,8 @@ function buildAdminRosterMenu() {
       Markup.button.callback("🔀 Transfer User", "admin:menu:transfer:0")
     ],
     [
-      Markup.button.callback("🔓 Clear All Protections", "admin:clearprotections")
+      Markup.button.callback("🔓 Clear All Protections", "admin:clearprotections"),
+      Markup.button.callback("📄 Change Spreadsheet", "admin:changespreadsheet")
     ],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
@@ -2124,23 +2127,82 @@ async function submitGitHubIssue(title, body) {
     return { ok: false, reason: "no_token" };
   }
 
-  const response = await fetch("https://api.github.com/repos/Joncallim/stl_attendance_bot/issues", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/json",
-      "Accept": "application/vnd.github+json",
-      "X-GitHub-Api-Version": "2022-11-28"
-    },
-    body: JSON.stringify({ title, body, labels: ["user-report"] })
-  });
+  let response;
+
+  try {
+    response = await fetch("https://api.github.com/repos/Joncallim/stl_attendance_bot/issues", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+      },
+      body: JSON.stringify({ title, body })
+    });
+  } catch (error) {
+    logBotError("[GitHub] fetch failed.", { error: error.message });
+    return { ok: false, reason: `network_error:${error.message}` };
+  }
 
   if (!response.ok) {
+    const responseText = await response.text().catch(() => "");
+    logBotError("[GitHub] API error.", { status: response.status, body: responseText });
     return { ok: false, reason: `github_api_error:${response.status}` };
   }
 
   const data = await response.json();
   return { ok: true, issueNumber: data.number, issueUrl: data.html_url };
+}
+
+/**
+ * Updates GOOGLE_SHEETS_SPREADSHEET_ID in the .env file on disk and in
+ * the live config object.  The file path is read from ENV_FILE_PATH, falling
+ * back to ".env" in the process working directory.
+ *
+ * Returns { ok: true } on success, or { ok: false, reason } on failure.
+ */
+async function updateEnvSpreadsheetId(newSpreadsheetId, config) {
+  const envPath = process.env.ENV_FILE_PATH ?? path.resolve(process.cwd(), ".env");
+
+  let content;
+
+  try {
+    content = await readFile(envPath, "utf-8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      logBotError("[SpreadsheetChange] .env file not found.", { path: envPath });
+      return { ok: false, reason: "env_file_not_found", path: envPath };
+    }
+    logBotError("[SpreadsheetChange] Failed to read .env file.", { error: error.message });
+    return { ok: false, reason: error.message };
+  }
+
+  const lineRegex = /^GOOGLE_SHEETS_SPREADSHEET_ID=.*/m;
+  const newLine = `GOOGLE_SHEETS_SPREADSHEET_ID=${newSpreadsheetId}`;
+
+  let updated;
+
+  if (lineRegex.test(content)) {
+    updated = content.replace(lineRegex, newLine);
+  } else {
+    // Key is absent — append it.
+    updated = content.trimEnd() + `\n${newLine}\n`;
+  }
+
+  try {
+    await writeFile(envPath, updated, "utf-8");
+  } catch (error) {
+    logBotError("[SpreadsheetChange] Failed to write .env file.", { error: error.message });
+    return { ok: false, reason: error.message };
+  }
+
+  // Apply to the live config so subsequent API calls use the new spreadsheet immediately.
+  config.spreadsheetId = newSpreadsheetId;
+  process.env.GOOGLE_SHEETS_SPREADSHEET_ID = newSpreadsheetId;
+
+  logBot("[SpreadsheetChange] Spreadsheet ID updated.", { newSpreadsheetId });
+  return { ok: true };
 }
 
 async function resetConversationState(ctx) {
@@ -2149,6 +2211,7 @@ async function resetConversationState(ctx) {
   ctx.session.awaitingAttendanceOptionAdd = false;
   ctx.session.awaitingAppointmentAdd = false;
   ctx.session.awaitingIssueReport = false;
+  ctx.session.awaitingSpreadsheetIdChange = false;
   await clearWeeklyAttendanceState(ctx);
   await updateUserByChatId(ctx.chat.id, {
     awaitingAttendance: false,
@@ -3097,6 +3160,34 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
     return;
   }
 
+  if (action === "changespreadsheet") {
+    ctx.session.awaitingSpreadsheetIdChange = true;
+    await sendOrUpdateAdminMessage(
+      ctx,
+      [
+        "📄 Change Target Spreadsheet",
+        "",
+        `Current spreadsheet ID: <code>${escapeHtml(config.spreadsheetId)}</code>`,
+        "",
+        "Send the new Google Sheets spreadsheet ID. You can find it in the sheet URL between <code>/d/</code> and <code>/edit</code>.",
+        "",
+        "⚠️ This will immediately switch the bot to the new spreadsheet and update your <code>.env</code> file on disk. Make sure the service account has access to the new sheet before proceeding."
+      ].join("\n"),
+      Markup.inlineKeyboard([[
+        Markup.button.callback("🔙 Back", "admin:menu:roster"),
+        Markup.button.callback("❌ Cancel", "admin:changespreadsheet:cancel")
+      ]]),
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  if (action === "changespreadsheet:cancel") {
+    ctx.session.awaitingSpreadsheetIdChange = false;
+    await sendOrUpdateAdminMessage(ctx, buildRosterDescription(), buildAdminRosterMenu());
+    return;
+  }
+
   if (action === "flushqueue") {
     // Fire-and-forget: flush can take tens of seconds; Telegraf 90 s limit would kill it.
     handleFlushAttendanceAdminAction(ctx, config, {
@@ -3377,6 +3468,36 @@ let lastSelfHealAt = 0;
 const SELF_HEAL_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
 
 /**
+ * Returns the sheet title (e.g. "Apr 26") for the given date in the bot's
+ * configured timezone, using the same format as googleSheets.js / getMonthParts.
+ */
+function getSheetMonthTitle(date, timezone) {
+  const month = new Intl.DateTimeFormat("en-US", { timeZone: timezone, month: "short" }).format(date);
+  const year = new Intl.DateTimeFormat("en-US", { timeZone: timezone, year: "2-digit" }).format(date);
+  return `${month} ${year}`;
+}
+
+/**
+ * Returns a Set of the three sheet titles that self-healing should inspect:
+ * last month, this month, and next month.
+ */
+function getRelevantHealingMonthTitles(timezone) {
+  const now = new Date();
+  const numericMonth = Number(
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone, month: "numeric" }).format(now)
+  ) - 1; // 0-indexed
+  const numericYear = Number(
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone, year: "numeric" }).format(now)
+  );
+
+  return new Set([
+    getSheetMonthTitle(new Date(Date.UTC(numericYear, numericMonth - 1, 1)), timezone),
+    getSheetMonthTitle(new Date(Date.UTC(numericYear, numericMonth, 1)), timezone),
+    getSheetMonthTitle(new Date(Date.UTC(numericYear, numericMonth + 1, 1)), timezone)
+  ]);
+}
+
+/**
  * Returns true if the given appointment has at least one non-blank attendance
  * value in the snapshot (i.e. the row was actually used).
  */
@@ -3506,7 +3627,18 @@ async function runSelfHealingCycle(bot, sheets, config, adminCache) {
     return;
   }
 
-  const divergences = detectSnapshotDivergences(snapshotBundle, activeAppointments);
+  // Restrict healing to last, current, and next month only — ignore historical sheets.
+  const relevantTitles = getRelevantHealingMonthTitles(config.timezone);
+  const filteredSnapshots = new Map(
+    [...snapshotBundle.snapshots].filter(([title]) => relevantTitles.has(title))
+  );
+
+  if (filteredSnapshots.size === 0) {
+    return;
+  }
+
+  const filteredBundle = { ...snapshotBundle, snapshots: filteredSnapshots };
+  const divergences = detectSnapshotDivergences(filteredBundle, activeAppointments);
 
   if (divergences.length === 0) {
     return;
@@ -4486,6 +4618,7 @@ export function createAttendanceBot(config) {
     const awaitingAttendanceOptionAdd = ctx.session.awaitingAttendanceOptionAdd === true;
     const awaitingAppointmentAdd = ctx.session.awaitingAppointmentAdd === true;
     const awaitingIssueReport = ctx.session.awaitingIssueReport === true;
+    const awaitingSpreadsheetIdChange = ctx.session.awaitingSpreadsheetIdChange === true;
 
     if (awaitingIssueReport) {
       ctx.session.awaitingIssueReport = false;
@@ -4514,14 +4647,20 @@ export function createAttendanceBot(config) {
         description
       ].join("\n");
 
-      const result = await submitGitHubIssue(issueTitle, issueBody);
+      let result;
+
+      try {
+        result = await submitGitHubIssue(issueTitle, issueBody);
+      } catch (error) {
+        logBotError("[GitHub] Unhandled error in submitGitHubIssue.", { error: error.message });
+        result = { ok: false, reason: `unexpected_error:${error.message}` };
+      }
 
       if (!result.ok) {
         const reason = result.reason === "no_token"
           ? "GitHub reporting is not configured on this bot. Please contact the administrator."
           : `Failed to submit the issue (${result.reason}). Please try again later.`;
-        await sendOrUpdateAdminMessage(
-          ctx,
+        await ctx.reply(
           `❌ ${reason}`,
           Markup.inlineKeyboard([[
             Markup.button.callback("🔙 Back", "home:main"),
@@ -4531,8 +4670,7 @@ export function createAttendanceBot(config) {
         return;
       }
 
-      await sendOrUpdateAdminMessage(
-        ctx,
+      await ctx.reply(
         [
           `✅ Issue #${result.issueNumber} submitted successfully.`,
           "",
@@ -4542,6 +4680,67 @@ export function createAttendanceBot(config) {
           Markup.button.callback("🔙 Back", "home:main"),
           Markup.button.callback("❌ Close", "home:close")
         ]])
+      );
+      return;
+    }
+
+    if (awaitingSpreadsheetIdChange) {
+      if (!(await requireAdmin(ctx, config))) {
+        ctx.session.awaitingSpreadsheetIdChange = false;
+        return;
+      }
+
+      ctx.session.awaitingSpreadsheetIdChange = false;
+      const newId = message.trim();
+      const adminBackMenu = Markup.inlineKeyboard([[
+        Markup.button.callback("🔙 Back", "admin:menu:roster"),
+        Markup.button.callback("❌ Close", "admin:close")
+      ]]);
+
+      if (!newId) {
+        await ctx.reply("Spreadsheet ID cannot be empty. Please try again.", adminBackMenu);
+        return;
+      }
+
+      // Basic sanity check: Google Sheets IDs are 40-character base58 strings.
+      if (!/^[A-Za-z0-9_-]{20,}$/.test(newId)) {
+        await ctx.reply(
+          "That doesn't look like a valid Google Sheets spreadsheet ID. Please copy it from the sheet URL and try again.\n\nThe ID is the long alphanumeric string between /d/ and /edit in the URL.",
+          adminBackMenu
+        );
+        return;
+      }
+
+      const previousId = config.spreadsheetId;
+      const updateResult = await updateEnvSpreadsheetId(newId, config);
+
+      if (!updateResult.ok) {
+        const detail = updateResult.reason === "env_file_not_found"
+          ? `The .env file was not found at the expected path (${updateResult.path}). Please update the spreadsheet ID manually in your .env file.`
+          : `Could not update the .env file: ${updateResult.reason}`;
+        await ctx.reply(`❌ ${detail}`, adminBackMenu);
+        return;
+      }
+
+      // Clear caches so the next operation reads from the new spreadsheet.
+      adminCache.sheetSnapshots = null;
+      adminCache.summaryMemoVersion = null;
+
+      // Trigger a background snapshot reload from the new spreadsheet.
+      preloadSheetSnapshots(sheets, config, adminCache, { force: true, structural: true }).catch(
+        (error) => logBotError("[SpreadsheetChange] Background reload failed.", { error: error.message })
+      );
+
+      await ctx.reply(
+        [
+          "✅ Spreadsheet ID updated successfully.",
+          "",
+          `Previous: <code>${escapeHtml(previousId)}</code>`,
+          `New:      <code>${escapeHtml(newId)}</code>`,
+          "",
+          "The bot is now loading data from the new spreadsheet. Run <b>Sync Roster</b> from the Admin Menu to ensure the roster is aligned."
+        ].join("\n"),
+        { parse_mode: "HTML", ...adminBackMenu }
       );
       return;
     }
