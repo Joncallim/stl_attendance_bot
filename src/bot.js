@@ -613,6 +613,7 @@ function buildHomeMenu(isAdminUser, timezone) {
     Markup.button.callback("⚠️ Deregister", "home:deregister"),
     Markup.button.callback("📊 Summary", "home:summary"),
     Markup.button.callback("❓ Help", "home:help"),
+    Markup.button.callback("🐛 Report Issue", "home:reportissue"),
     Markup.button.callback("❌ Close", "home:close")
   );
 
@@ -1668,10 +1669,14 @@ function buildManageAdminsDescription(admins, activeCodes = [], defaultAdminAppo
     source: "chief",
     onboarded: true
   }));
+  const alreadyShownAppointments = new Set([
+    ...defaultRows.map((e) => e.appointment.toUpperCase()),
+    ...customRows.map((e) => e.appointment.toUpperCase())
+  ]);
   const visibleRows = [
     ...defaultRows,
-    ...customRows.filter((entry) => !adminByAppointment.has(entry.appointment.toUpperCase()) || entry.source === "custom"),
-    ...chiefRows.filter((entry) => !adminByAppointment.has(entry.appointment.toUpperCase()))
+    ...customRows,
+    ...chiefRows.filter((entry) => !alreadyShownAppointments.has(entry.appointment.toUpperCase()))
   ];
 
   if (visibleRows.length === 0) {
@@ -2052,11 +2057,11 @@ async function clearWeeklyAttendanceState(ctx) {
 }
 
 async function finalizeWeeklyAttendanceFlow(ctx, config, appointment, cache) {
-  const results = Array.isArray(ctx.session.weeklyAttendanceResults)
-    ? ctx.session.weeklyAttendanceResults
-    : [];
   const entries = Array.isArray(ctx.session.weeklyAttendanceEntries)
     ? ctx.session.weeklyAttendanceEntries
+    : [];
+  const dates = Array.isArray(ctx.session.weeklyAttendanceDates)
+    ? ctx.session.weeklyAttendanceDates
     : [];
 
   if (entries.length > 0) {
@@ -2087,6 +2092,15 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, appointment, cache) {
     }
   }
 
+  const results = dates.map((dateValue) => {
+    const date = new Date(dateValue);
+    const label = formatWeekDateLabel(date, config.timezone);
+    const staged = getStagedAttendanceStatus(entries, dateValue, (v) => toIsoDateString(v, config.timezone));
+    const cached = getCachedAttendanceStatus(cache, config, appointment, date);
+    const status = staged || cached || "—";
+    return `${label}: ${status}`;
+  });
+
   await clearWeeklyAttendanceState(ctx);
   const weeklyHeader = entries.length > 0
     ? "Weekly attendance updated and queued for Google Sheets sync:"
@@ -2103,11 +2117,38 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, appointment, cache) {
   );
 }
 
+async function submitGitHubIssue(title, body) {
+  const token = process.env.GITHUB_TOKEN;
+
+  if (!token) {
+    return { ok: false, reason: "no_token" };
+  }
+
+  const response = await fetch("https://api.github.com/repos/Joncallim/stl_attendance_bot/issues", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "Accept": "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28"
+    },
+    body: JSON.stringify({ title, body, labels: ["user-report"] })
+  });
+
+  if (!response.ok) {
+    return { ok: false, reason: `github_api_error:${response.status}` };
+  }
+
+  const data = await response.json();
+  return { ok: true, issueNumber: data.number, issueUrl: data.html_url };
+}
+
 async function resetConversationState(ctx) {
   ctx.session.awaitingAttendance = false;
   ctx.session.awaitingSecretCode = false;
   ctx.session.awaitingAttendanceOptionAdd = false;
   ctx.session.awaitingAppointmentAdd = false;
+  ctx.session.awaitingIssueReport = false;
   await clearWeeklyAttendanceState(ctx);
   await updateUserByChatId(ctx.chat.id, {
     awaitingAttendance: false,
@@ -2160,6 +2201,61 @@ async function askAttendance(ctx, config, user = null, cache = null) {
   );
 }
 
+function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config, user) {
+  const appointment = user?.appointment;
+  const dayLines = weeklyDates.map((dateValue) => {
+    const date = new Date(dateValue);
+    const label = formatAttendanceDateLabel(date, config.timezone);
+    const staged = getStagedAttendanceStatus(weeklyEntries, dateValue, (v) => toIsoDateString(v, config.timezone));
+    const cached = appointment ? getCachedAttendanceStatus(cache, config, appointment, date) : "";
+    const status = staged || cached || "—";
+    return `${label}: ${status}`;
+  });
+
+  const message = [
+    "Weekly attendance update",
+    "Public holidays are prefilled as PH.",
+    "",
+    ...dayLines,
+    "",
+    "Tap a day below to update it, then press Submit when done."
+  ].join("\n");
+
+  const dayButtons = weeklyDates.map((dateValue, index) => {
+    const date = new Date(dateValue);
+    const shortLabel = new Intl.DateTimeFormat("en-GB", {
+      timeZone: config.timezone,
+      weekday: "short",
+      day: "numeric"
+    }).format(date);
+    const staged = getStagedAttendanceStatus(weeklyEntries, dateValue, (v) => toIsoDateString(v, config.timezone));
+    const cached = appointment ? getCachedAttendanceStatus(cache, config, appointment, date) : "";
+    const status = staged || cached || "—";
+    return Markup.button.callback(`${shortLabel}: ${status}`, `home:week:day:${index}`);
+  });
+
+  const rows = [];
+
+  for (let i = 0; i < dayButtons.length; i += 2) {
+    rows.push(dayButtons.slice(i, i + 2));
+  }
+
+  rows.push([Markup.button.callback("✅ Submit", "home:week:submit")]);
+  rows.push([
+    Markup.button.callback("🔙 Back", "home:main"),
+    Markup.button.callback("❌ Close", "home:close")
+  ]);
+
+  return { message, keyboard: Markup.inlineKeyboard(rows) };
+}
+
+async function showWeeklyAttendanceOverview(ctx, config, user, cache) {
+  const weeklyDates = ctx.session.weeklyAttendanceDates ?? [];
+  const weeklyEntries = ctx.session.weeklyAttendanceEntries ?? [];
+  const { message, keyboard } = buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config, user);
+  await sendOrUpdateAdminMessage(ctx, message, keyboard);
+}
+
 async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
   const dateValue = ctx.session.weeklyAttendanceDates?.[ctx.session.weeklyAttendanceIndex];
 
@@ -2182,7 +2278,7 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
     : `Select attendance for ${label}.`;
   const message = [
     "Weekly attendance update",
-    "Public holidays are prefilled as PH. Use Skip Day to keep the current entry unchanged.",
+    "Public holidays are prefilled as PH. Use Skip to keep the current entry unchanged.",
     "",
     detailLine
   ].join("\n");
@@ -2194,7 +2290,7 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
       page,
       "home:pick:week",
       "home:week:page",
-      "home:main",
+      "home:week:overview",
       [[Markup.button.callback(WEEK_SKIP_LABEL, "home:pick:week:skip")]]
     )
   );
@@ -2250,7 +2346,7 @@ async function startWeeklyAttendanceFlow(ctx, config, sheets, user, cache, weekO
 
   await autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache);
 
-  await promptWeeklyAttendanceDay(ctx, config, user, cache);
+  await showWeeklyAttendanceOverview(ctx, config, user, cache);
 }
 
 async function registerUser(ctx) {
@@ -3032,7 +3128,14 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
     const users = (await listUsers()).filter((user) => user.appointment);
 
     if (users.length === 0) {
-      await sendOrUpdateAdminMessage(ctx, "No bound users found yet.");
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "No bound users found yet.",
+        Markup.inlineKeyboard([[
+          Markup.button.callback("🔙 Back", "admin:main"),
+          Markup.button.callback("❌ Close", "admin:close")
+        ]])
+      );
       return;
     }
 
@@ -3047,7 +3150,14 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       }
     }
 
-    await sendOrUpdateAdminMessage(ctx, `Attendance prompt sent to ${sent} bound user(s).`);
+    await sendOrUpdateAdminMessage(
+      ctx,
+      `Attendance prompt sent to ${sent} bound user(s).`,
+      Markup.inlineKeyboard([[
+        Markup.button.callback("🔙 Back", "admin:main"),
+        Markup.button.callback("❌ Close", "admin:close")
+      ]])
+    );
     return;
   }
 
@@ -3261,10 +3371,16 @@ async function withUiOperationTimeout(label, operation, timeoutMs = 8000) {
 let rosterSyncInProgress = false;
 
 async function handleSyncRosterAdminAction(ctx, config, deps) {
+  const adminBackMenu = Markup.inlineKeyboard([[
+    Markup.button.callback("🔙 Back", "admin:main"),
+    Markup.button.callback("❌ Close", "admin:close")
+  ]]);
+
   if (rosterSyncInProgress) {
     await deps.sendOrUpdateAdminMessage(
       ctx,
-      "A roster sync is already in progress. Please wait for the current sync to complete."
+      "A roster sync is already in progress. Please wait for the current sync to complete.",
+      adminBackMenu
     );
     return;
   }
@@ -3287,6 +3403,16 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
     // ensureNextMonthSheetExists is intentionally NOT called here — it would
     // trigger a second full syncOnboardingRoster run (all 4 steps again).
     const roster = await deps.syncRosterState(deps.sheets, config);
+
+    if (roster.driftDetected) {
+      logBot("[Admin] Roster sync: drift detected in ONBOARDING sheet — halted.");
+      await deps.sendOrUpdateAdminMessage(
+        ctx,
+        "⚠️ Roster sync halted: the ONBOARDING sheet has structural issues (blank rows, duplicate appointments, or an inline STOP marker). Please fix the ONBOARDING sheet and run Sync Roster again.",
+        adminBackMenu
+      );
+      return;
+    }
 
     await deps.refreshAdminCache(deps.cache, config);
 
@@ -3313,15 +3439,24 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
       nextMonth: roster.nextMonthTitle
     });
 
-    await deps.sendOrUpdateAdminMessage(
-      ctx,
-      `Roster synced from ${config.onboardingSheetTitle}. Last month: ${roster.prevMonthTitle}. Current month: ${roster.currentMonthTitle}. Next month: ${roster.nextMonthTitle}.${resetResult.resetCount > 0 ? ` (${resetResult.resetCount} previously stuck attendance ${resetResult.resetCount === 1 ? "entry" : "entries"} re-queued for retry.)` : ""}`
-    );
+    const summaryLines = [
+      `✅ Roster synced from ${config.onboardingSheetTitle}.`,
+      `Last month: ${roster.prevMonthTitle}`,
+      `Current month: ${roster.currentMonthTitle}`,
+      `Next month: ${roster.nextMonthTitle}`
+    ];
+
+    if (resetResult.resetCount > 0) {
+      summaryLines.push(`\n⚠️ ${resetResult.resetCount} previously stuck attendance ${resetResult.resetCount === 1 ? "entry" : "entries"} re-queued for retry.`);
+    }
+
+    await deps.sendOrUpdateAdminMessage(ctx, summaryLines.join("\n"), adminBackMenu);
   } catch (error) {
     logBotError("[Admin] Roster sync failed.", { error: error.message });
     await deps.sendOrUpdateAdminMessage(
       ctx,
-      `Roster sync failed: ${error.message}`
+      `❌ Roster sync failed: ${error.message}`,
+      adminBackMenu
     );
     throw error;
   } finally {
@@ -3330,6 +3465,10 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
 }
 
 async function handleClearProtectionsAdminAction(ctx, config, deps) {
+  const adminBackMenu = Markup.inlineKeyboard([[
+    Markup.button.callback("🔙 Back", "admin:main"),
+    Markup.button.callback("❌ Close", "admin:close")
+  ]]);
   logBot("[Admin] Clear all protections started.");
   await deps.sendOrUpdateAdminMessage(
     ctx,
@@ -3343,19 +3482,25 @@ async function handleClearProtectionsAdminAction(ctx, config, deps) {
       ctx,
       removedCount === 0
         ? "✅ No protections found — the spreadsheet is already unprotected."
-        : `✅ Removed ${removedCount} protection${removedCount === 1 ? "" : "s"} from the spreadsheet.`
+        : `✅ Removed ${removedCount} protection${removedCount === 1 ? "" : "s"} from the spreadsheet.`,
+      adminBackMenu
     );
   } catch (error) {
     logBotError("[Admin] Clear all protections failed.", { error: error.message });
     await deps.sendOrUpdateAdminMessage(
       ctx,
-      `❌ Failed to clear protections: ${error.message}`
+      `❌ Failed to clear protections: ${error.message}`,
+      adminBackMenu
     );
     throw error;
   }
 }
 
 async function handleFlushAttendanceAdminAction(ctx, config, deps) {
+  const adminBackMenu = Markup.inlineKeyboard([[
+    Markup.button.callback("🔙 Back", "admin:main"),
+    Markup.button.callback("❌ Close", "admin:close")
+  ]]);
   const status = await deps.getAttendanceQueueStatus();
 
   if (status.queueDepth === 0) {
@@ -3364,7 +3509,8 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
       : "";
     await deps.sendOrUpdateAdminMessage(
       ctx,
-      `✅ No pending attendance entries to push.${conflictNote}`
+      `✅ No pending attendance entries to push.${conflictNote}`,
+      adminBackMenu
     );
     return;
   }
@@ -3414,12 +3560,13 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
       parts.push("✅ Queue flushed — no new data to write.");
     }
 
-    await deps.sendOrUpdateAdminMessage(ctx, parts.join("\n"));
+    await deps.sendOrUpdateAdminMessage(ctx, parts.join("\n"), adminBackMenu);
   } catch (error) {
     logBotError("[Admin] Attendance push failed.", { error: error.message });
     await deps.sendOrUpdateAdminMessage(
       ctx,
-      `❌ Push failed: ${error.message}\n\nThe queue will retry automatically in the background.`
+      `❌ Push failed: ${error.message}\n\nThe queue will retry automatically in the background.`,
+      adminBackMenu
     );
   }
 }
@@ -4082,6 +4229,66 @@ export function createAttendanceBot(config) {
       ctx.session.awaitingWeeklyAttendance || storedUser?.awaitingWeeklyAttendance === true;
     const awaitingAttendanceOptionAdd = ctx.session.awaitingAttendanceOptionAdd === true;
     const awaitingAppointmentAdd = ctx.session.awaitingAppointmentAdd === true;
+    const awaitingIssueReport = ctx.session.awaitingIssueReport === true;
+
+    if (awaitingIssueReport) {
+      ctx.session.awaitingIssueReport = false;
+      const description = message.trim();
+
+      if (!description) {
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "Issue description cannot be empty. Please try again.",
+          Markup.inlineKeyboard([[
+            Markup.button.callback("🔙 Back", "home:main"),
+            Markup.button.callback("❌ Close", "home:close")
+          ]])
+        );
+        return;
+      }
+
+      const username = ctx.from?.username ? `@${ctx.from.username}` : ctx.from?.first_name ?? "Unknown";
+      const titleText = description.length > 60 ? `${description.slice(0, 57)}…` : description;
+      const issueTitle = `[User Report] ${titleText}`;
+      const issueBody = [
+        `**Reported by:** ${username} (Telegram chat ID: ${ctx.chat.id})`,
+        `**Date:** ${new Date().toISOString()}`,
+        "",
+        "**Description:**",
+        description
+      ].join("\n");
+
+      const result = await submitGitHubIssue(issueTitle, issueBody);
+
+      if (!result.ok) {
+        const reason = result.reason === "no_token"
+          ? "GitHub reporting is not configured on this bot. Please contact the administrator."
+          : `Failed to submit the issue (${result.reason}). Please try again later.`;
+        await sendOrUpdateAdminMessage(
+          ctx,
+          `❌ ${reason}`,
+          Markup.inlineKeyboard([[
+            Markup.button.callback("🔙 Back", "home:main"),
+            Markup.button.callback("❌ Close", "home:close")
+          ]])
+        );
+        return;
+      }
+
+      await sendOrUpdateAdminMessage(
+        ctx,
+        [
+          `✅ Issue #${result.issueNumber} submitted successfully.`,
+          "",
+          "Thank you for your report! The development team will review it shortly."
+        ].join("\n"),
+        Markup.inlineKeyboard([[
+          Markup.button.callback("🔙 Back", "home:main"),
+          Markup.button.callback("❌ Close", "home:close")
+        ]])
+      );
+      return;
+    }
 
     if (awaitingAppointmentAdd) {
       if (!(await requireAdmin(ctx, config))) {
@@ -4576,6 +4783,31 @@ export function createAttendanceBot(config) {
       return;
     }
 
+    if (action === "reportissue") {
+      ctx.session.awaitingIssueReport = true;
+      await sendOrUpdateAdminMessage(
+        ctx,
+        [
+          "Report an Issue",
+          "",
+          "Describe the issue or bug you've encountered. Your message will be submitted as a GitHub issue on the stl_attendance_bot repository.",
+          "",
+          "Please be as specific as possible (what you did, what you expected, what happened instead)."
+        ].join("\n"),
+        Markup.inlineKeyboard([[
+          Markup.button.callback("🔙 Back", "home:main"),
+          Markup.button.callback("❌ Cancel", "home:reportissue:cancel")
+        ]])
+      );
+      return;
+    }
+
+    if (action === "reportissue:cancel") {
+      ctx.session.awaitingIssueReport = false;
+      await renderHomeMenu(ctx, config, { cache: adminCache });
+      return;
+    }
+
     if (action.startsWith("attendance:page:")) {
       triggerBackgroundSheetRefresh(adminCache, "home:attendance:page");
       const user = await ensureUserBound(ctx, config);
@@ -4690,6 +4922,48 @@ export function createAttendanceBot(config) {
       return;
     }
 
+    if (action === "week:overview") {
+      triggerBackgroundSheetRefresh(adminCache, "home:week:overview");
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      await ctx.answerCbQuery();
+      await showWeeklyAttendanceOverview(ctx, config, user, adminCache);
+      return;
+    }
+
+    if (action.startsWith("week:day:")) {
+      triggerBackgroundSheetRefresh(adminCache, "home:week:day");
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      const dayIndex = Number(action.split(":")[2]);
+      ctx.session.weeklyAttendanceIndex = dayIndex;
+      await updateUserByChatId(ctx.chat.id, { weeklyAttendanceIndex: dayIndex });
+      await ctx.answerCbQuery();
+      await promptWeeklyAttendanceDay(ctx, config, user, adminCache);
+      return;
+    }
+
+    if (action === "week:submit") {
+      triggerBackgroundSheetRefresh(adminCache, "home:week:submit");
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      await ctx.answerCbQuery("Submitting…");
+      await finalizeWeeklyAttendanceFlow(ctx, config, user.appointment, adminCache);
+      return;
+    }
+
     if (action === "pick:week:skip" || action.startsWith("pick:week:")) {
       triggerBackgroundSheetRefresh(adminCache, "home:pick:week");
       const user = await ensureUserBound(ctx, config);
@@ -4706,11 +4980,6 @@ export function createAttendanceBot(config) {
       const weeklyIndex = Number.isInteger(ctx.session.weeklyAttendanceIndex)
         ? ctx.session.weeklyAttendanceIndex
         : Number(storedUser?.weeklyAttendanceIndex ?? 0);
-      const weeklyResults = Array.isArray(ctx.session.weeklyAttendanceResults)
-        ? ctx.session.weeklyAttendanceResults
-        : Array.isArray(storedUser?.weeklyAttendanceResults)
-          ? storedUser.weeklyAttendanceResults
-          : [];
       const weeklyEntries = Array.isArray(ctx.session.weeklyAttendanceEntries)
         ? ctx.session.weeklyAttendanceEntries
         : Array.isArray(storedUser?.weeklyAttendanceEntries)
@@ -4744,7 +5013,6 @@ export function createAttendanceBot(config) {
         ) ||
         getCachedAttendanceStatus(adminCache, config, user.appointment, date);
       let nextEntries = weeklyEntries;
-      let pickedPayload = null;
 
       if (action !== "pick:week:skip") {
         const picked = config.attendanceOptions[Number(action.split(":")[2])];
@@ -4761,10 +5029,6 @@ export function createAttendanceBot(config) {
           picked,
           (value) => toIsoDateString(value, config.timezone)
         );
-        pickedPayload = {
-          status: picked,
-          entries: nextEntries
-        };
         await ctx.answerCbQuery(`Saved: ${picked}`);
       } else if (currentStatus) {
         await ctx.answerCbQuery("Kept current status");
@@ -4772,41 +5036,14 @@ export function createAttendanceBot(config) {
         await ctx.answerCbQuery("Skipped");
       }
 
-      const nextState = applyWeeklyAttendanceSelection(
-        {
-          awaitingWeeklyAttendance: true,
-          weeklyAttendanceDates: weeklyDates,
-          weeklyAttendanceIndex: weeklyIndex,
-          weeklyAttendanceResults: weeklyResults,
-          weeklyAttendanceEntries: weeklyEntries
-        },
-        {
-          action: action === "pick:week:skip" ? "skip" : "pick",
-          dateValue,
-          currentStatus,
-          pickedStatus: pickedPayload,
-          formatWeekDateLabel: (value) => formatWeekDateLabel(value, config.timezone)
-        }
-      );
-
-      ctx.session.weeklyAttendanceResults = nextState.weeklyAttendanceResults;
-      ctx.session.weeklyAttendanceIndex = nextState.weeklyAttendanceIndex;
-      ctx.session.weeklyAttendanceEntries = nextState.weeklyAttendanceEntries;
+      ctx.session.weeklyAttendanceEntries = nextEntries;
 
       await updateUserByChatId(ctx.chat.id, {
-        awaitingWeeklyAttendance: nextState.awaitingWeeklyAttendance,
-        weeklyAttendanceResults: nextState.weeklyAttendanceResults,
-        weeklyAttendanceIndex: nextState.weeklyAttendanceIndex,
-        weeklyAttendanceEntries: nextState.weeklyAttendanceEntries,
+        weeklyAttendanceEntries: nextEntries,
         lastSubmittedAt: new Date().toISOString()
       });
 
-      if (!nextState.awaitingWeeklyAttendance) {
-        await finalizeWeeklyAttendanceFlow(ctx, config, user.appointment, adminCache);
-        return;
-      }
-
-      await promptWeeklyAttendanceDay(ctx, config, user, adminCache);
+      await showWeeklyAttendanceOverview(ctx, config, user, adminCache);
       return;
     }
 

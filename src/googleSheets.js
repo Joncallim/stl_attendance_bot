@@ -235,6 +235,23 @@ const DEPARTMENT_LABEL_BY_KEY = new Map(
   DEPARTMENT_BUCKETS.map((entry) => [entry.key, entry.label])
 );
 
+// Subtle pastel background tints for each department's Column A cell.
+// Values are {red, green, blue} in the 0–1 range used by Google Sheets API.
+const DEPARTMENT_COLUMN_A_COLORS = new Map([
+  ["Officers", { red: 0.878, green: 0.906, blue: 0.980 }], // soft blue-grey
+  ["C2",       { red: 0.980, green: 0.976, blue: 0.871 }], // soft yellow
+  ["WS",       { red: 0.882, green: 0.965, blue: 0.882 }], // soft green
+  ["WCS",      { red: 0.863, green: 0.965, blue: 0.965 }], // soft teal
+  ["UW",       { red: 0.949, green: 0.882, blue: 0.980 }], // soft purple
+  ["Nav",      { red: 1.000, green: 0.945, blue: 0.863 }], // soft orange
+  ["Comms",    { red: 0.976, green: 0.882, blue: 0.929 }], // soft rose
+  ["Rav",      { red: 0.906, green: 0.965, blue: 0.863 }], // soft lime
+  ["Owl",      { red: 0.929, green: 0.906, blue: 0.980 }], // soft lavender
+  ["MS",       { red: 0.863, green: 0.929, blue: 0.976 }], // soft sky blue
+  ["ECS",      { red: 0.980, green: 0.914, blue: 0.882 }], // soft salmon
+  ["Chef",     { red: 0.996, green: 0.965, blue: 0.863 }]  // soft gold
+]);
+
 const DEPARTMENT_PARSE_SPECS = [...DEPARTMENT_SPECS]
   .sort((left, right) => right.label.length - left.label.length)
   .map((spec) => ({ ...spec, chiefPattern: buildChiefPattern(spec.label) }));
@@ -2386,6 +2403,45 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
         }
       }
     }
+  }
+
+  // Apply per-department background tint to column A for every data row.
+  const columnAColorRequests = [];
+
+  for (let i = 0; i < nextAppointments.length; i++) {
+    const deptLabel = classifyAppointmentDepartment(nextAppointments[i]);
+    const color = deptLabel ? DEPARTMENT_COLUMN_A_COLORS.get(deptLabel) : null;
+
+    if (color) {
+      columnAColorRequests.push({
+        repeatCell: {
+          range: {
+            sheetId: sheet.properties.sheetId,
+            startRowIndex: i + 1, // +1 skips the header row
+            endRowIndex: i + 2,
+            startColumnIndex: 0,
+            endColumnIndex: 1
+          },
+          cell: {
+            userEnteredFormat: { backgroundColor: color }
+          },
+          fields: "userEnteredFormat.backgroundColor"
+        }
+      });
+    }
+  }
+
+  if (columnAColorRequests.length > 0) {
+    await runGoogleSheetsRequest(
+      `spreadsheets.batchUpdate:${sheet.properties.sheetId}:columnADeptColors`,
+      (signal) => sheets.spreadsheets.batchUpdate({
+        spreadsheetId: config.spreadsheetId,
+        requestBody: { requests: columnAColorRequests }
+      }, { signal })
+    );
+    logSheetsSuccess(`[${title}] Column A department colors applied.`, {
+      coloredRows: columnAColorRequests.length
+    });
   }
 
   logSheetsSuccess("Monthly attendance sheet synchronized.", {
