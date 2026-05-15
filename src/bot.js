@@ -3370,6 +3370,252 @@ async function withUiOperationTimeout(label, operation, timeoutMs = 8000) {
 // still-running ones, making subsequent attempts progressively slower.
 let rosterSyncInProgress = false;
 
+// ─── Self-healing ─────────────────────────────────────────────────────────────
+
+// Minimum gap between autonomous healing runs (prevents cascading repairs).
+let lastSelfHealAt = 0;
+const SELF_HEAL_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Returns true if the given appointment has at least one non-blank attendance
+ * value in the snapshot (i.e. the row was actually used).
+ */
+function snapshotAppointmentHasData(snapshot, appointmentName) {
+  const index = (snapshot.appointments ?? []).indexOf(appointmentName);
+
+  if (index === -1) {
+    return false;
+  }
+
+  for (const values of (snapshot.statusesByDay ?? new Map()).values()) {
+    if (String(values[index] ?? "").trim()) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Compares each month-sheet snapshot against the active registry appointments
+ * and returns per-sheet divergence objects.
+ *
+ * Returns an array of:
+ *   { sheetTitle, missingFromSheet, unexpectedInSheet, unexpectedWithData }
+ */
+function detectSnapshotDivergences(snapshotBundle, activeRegistryAppointments) {
+  if (!snapshotBundle?.snapshots?.size) {
+    return [];
+  }
+
+  const registryNormalized = new Set(
+    activeRegistryAppointments.map((a) => a.toUpperCase().trim())
+  );
+  const divergences = [];
+
+  for (const [title, snapshot] of snapshotBundle.snapshots) {
+    const sheetAppointments = snapshot.appointments ?? [];
+    const sheetNormalized = new Set(sheetAppointments.map((a) => a.toUpperCase().trim()));
+
+    const missingFromSheet = activeRegistryAppointments.filter(
+      (a) => !sheetNormalized.has(a.toUpperCase().trim())
+    );
+    const unexpectedInSheet = sheetAppointments.filter(
+      (a) => !registryNormalized.has(a.toUpperCase().trim())
+    );
+    const unexpectedWithData = unexpectedInSheet.filter(
+      (apt) => snapshotAppointmentHasData(snapshot, apt)
+    );
+
+    if (missingFromSheet.length > 0 || unexpectedInSheet.length > 0) {
+      divergences.push({
+        sheetTitle: title,
+        missingFromSheet,
+        unexpectedInSheet,
+        unexpectedWithData
+      });
+    }
+  }
+
+  return divergences;
+}
+
+/**
+ * Returns the Telegram chat IDs of all currently-active admins
+ * (default + custom + chief) that have completed onboarding.
+ */
+async function getAdminChatIds(adminCache) {
+  const registry = await getAppointmentRegistry();
+  const adminAppointments = new Set(
+    (adminCache.admins ?? []).map((e) => e.appointment.toUpperCase())
+  );
+  return registry.appointments
+    .filter((entry) => entry.boundChatId && adminAppointments.has(entry.appointment.toUpperCase()))
+    .map((entry) => entry.boundChatId);
+}
+
+/**
+ * Sends a plain-text (HTML parse mode) message directly to every admin chat.
+ * Failures per chat are swallowed so one bad chatId doesn't block the others.
+ */
+async function notifyAdminsDirectly(bot, adminCache, message) {
+  const chatIds = await getAdminChatIds(adminCache);
+
+  for (const chatId of chatIds) {
+    try {
+      await bot.telegram.sendMessage(chatId, message, { parse_mode: "HTML" });
+    } catch (error) {
+      logBotError("[SelfHeal] Failed to notify admin.", {
+        chatId,
+        error: error.message
+      });
+    }
+  }
+}
+
+/**
+ * Detects appointment divergences between the cached month-sheet snapshots and
+ * the active registry, then heals the sheets and notifies all admins.
+ *
+ * Throttled by SELF_HEAL_COOLDOWN_MS so it cannot fire more than once per hour.
+ * Skips when a roster sync is already in progress.
+ */
+async function runSelfHealingCycle(bot, sheets, config, adminCache) {
+  const now = Date.now();
+
+  if (now - lastSelfHealAt < SELF_HEAL_COOLDOWN_MS) {
+    return;
+  }
+
+  if (rosterSyncInProgress) {
+    return;
+  }
+
+  const snapshotBundle = adminCache.sheetSnapshots;
+
+  if (!snapshotBundle?.snapshots?.size) {
+    return;
+  }
+
+  const registry = await getAppointmentRegistry();
+  const activeAppointments = registry.appointments
+    .filter((entry) => entry.active)
+    .map((entry) => entry.appointment);
+
+  if (activeAppointments.length === 0) {
+    return;
+  }
+
+  const divergences = detectSnapshotDivergences(snapshotBundle, activeAppointments);
+
+  if (divergences.length === 0) {
+    return;
+  }
+
+  // Commit the timestamp immediately — even if healing partially fails we don't
+  // want the next 5-minute cycle to re-trigger before the cooldown expires.
+  lastSelfHealAt = now;
+  logBot("[SelfHeal] Divergences detected — beginning healing cycle.", {
+    sheets: divergences.map((d) => d.sheetTitle)
+  });
+
+  // Step 1: Add every unexpected-with-data appointment to the roster so its
+  // existing attendance rows are preserved rather than discarded by the sync.
+  const toAdd = [
+    ...new Set(divergences.flatMap((d) => d.unexpectedWithData))
+  ];
+  const addResults = [];
+
+  for (const apt of toAdd) {
+    try {
+      const result = await addManagedAppointment(sheets, config, adminCache, apt);
+      addResults.push({ appointment: apt, ok: result.ok, reason: result.reason });
+      logBot(`[SelfHeal] addManagedAppointment: ${apt}`, { ok: result.ok });
+    } catch (error) {
+      addResults.push({ appointment: apt, ok: false, reason: error.message });
+      logBotError(`[SelfHeal] Failed to add appointment: ${apt}`, { error: error.message });
+    }
+  }
+
+  // Step 2: Full structural sync — inserts missing appointments, removes
+  // unknown ones, restores correct ordering, and re-syncs ONBOARDING codes.
+  let syncFailed = false;
+
+  rosterSyncInProgress = true;
+
+  try {
+    await syncRosterState(sheets, config);
+    await refreshAdminCache(adminCache, config);
+    await preloadSheetSnapshots(sheets, config, adminCache, {
+      force: true,
+      structural: false,
+      normalizeAliases: true
+    });
+    logBot("[SelfHeal] Structural sync complete.");
+  } catch (error) {
+    syncFailed = true;
+    logBotError("[SelfHeal] Structural sync failed.", { error: error.message });
+  } finally {
+    rosterSyncInProgress = false;
+  }
+
+  // Step 3: Build and send admin notification.
+  const lines = [
+    "<b>🔧 Self-Healing Alert</b>",
+    "",
+    "The bot detected appointments in the attendance sheets that did not match the roster. The sheets have been automatically repaired.",
+    ""
+  ];
+
+  for (const div of divergences) {
+    lines.push(`<b>📋 ${div.sheetTitle}</b>`);
+
+    for (const apt of div.missingFromSheet) {
+      lines.push(`• Restored: <b>${apt}</b> (was missing — re-inserted)`);
+    }
+
+    for (const apt of div.unexpectedWithData) {
+      const res = addResults.find((r) => r.appointment === apt);
+      const status = res?.ok
+        ? "added to roster so its data is preserved"
+        : `could not be added (${res?.reason ?? "unknown error"})`;
+      lines.push(`• Unknown appointment with data: <b>${apt}</b> — ${status}`);
+    }
+
+    const noDataUnexpected = div.unexpectedInSheet.filter(
+      (a) => !div.unexpectedWithData.includes(a)
+    );
+
+    for (const apt of noDataUnexpected) {
+      lines.push(`• Removed: <b>${apt}</b> (unknown appointment, no attendance data)`);
+    }
+
+    lines.push("");
+  }
+
+  const hasAddedAppointments = addResults.some((r) => r.ok);
+
+  if (hasAddedAppointments) {
+    lines.push(
+      "⚠️ <i>If an added appointment was intended to be a rename or transfer of an existing one, use <b>Transfer User</b> in the Admin Menu to re-bind the Telegram account. Manual cell edits cannot express intent — the bot always treats an unknown appointment as new.</i>"
+    );
+    lines.push("");
+  }
+
+  if (syncFailed) {
+    lines.push("❌ The structural sync after healing failed. Please run <b>Sync Roster</b> from the Admin Menu to complete the repair.");
+  } else {
+    lines.push("✅ All affected sheets have been repaired. No further action is required.");
+  }
+
+  await notifyAdminsDirectly(bot, adminCache, lines.join("\n"));
+  logBot("[SelfHeal] Cycle complete.", {
+    divergentSheets: divergences.length,
+    appointmentsAdded: addResults.filter((r) => r.ok).length,
+    syncFailed
+  });
+}
+
 async function handleSyncRosterAdminAction(ctx, config, deps) {
   const adminBackMenu = Markup.inlineKeyboard([[
     Markup.button.callback("🔙 Back", "admin:main"),
@@ -3763,6 +4009,16 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
     } catch (error) {
       logBotError("Five-minute sheet reconciliation failed.", { error: error.message });
     }
+
+    // Self-healing: detect and repair manual edits to appointment names in
+    // month sheets.  Throttled by SELF_HEAL_COOLDOWN_MS (1 hour) so healing
+    // never triggers more than once per cooldown window regardless of how
+    // many 5-minute cycles elapse while the divergence persists.
+    runSelfHealingCycle(bot, sheets, config, adminCache).catch((error) => {
+      logBotError("[SelfHeal] Unhandled error in self-healing cycle.", {
+        error: error.message
+      });
+    });
   }, 5 * 60 * 1000);
 
   // 2 AM SGT (18:00 UTC): full structural maintenance (sheet creation, row sync, layout, protections).
@@ -5646,5 +5902,9 @@ export const __testing = {
   renderInviteSubmenu,
   renderAttendanceOptionsMenu,
   registerBackgroundSchedules,
-  resetRosterSyncGuard() { rosterSyncInProgress = false; }
+  resetRosterSyncGuard() { rosterSyncInProgress = false; },
+  detectSnapshotDivergences,
+  snapshotAppointmentHasData,
+  runSelfHealingCycle,
+  resetSelfHealGuard() { lastSelfHealAt = 0; }
 };
