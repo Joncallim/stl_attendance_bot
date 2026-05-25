@@ -3243,14 +3243,14 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       return;
     }
 
-    let sent = 0;
+    const results = await Promise.allSettled(
+      users.map((user) => sendPromptToChat(bot, config, user.chatId, cache))
+    );
+    const sent = results.filter((r) => r.status === "fulfilled").length;
 
-    for (const user of users) {
-      try {
-        await sendPromptToChat(bot, config, user.chatId, cache);
-        sent += 1;
-      } catch (error) {
-        logBotError("Failed to send prompt.", { chatId: user.chatId, error: error.message });
+    for (let i = 0; i < results.length; i++) {
+      if (results[i].status === "rejected") {
+        logBotError("Failed to send prompt.", { chatId: users[i].chatId, error: results[i].reason?.message });
       }
     }
 
@@ -4286,13 +4286,15 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
           return hasUnfilledAttendance(adminCache, config, user.appointment, now);
         });
 
-        for (const user of users) {
-          try {
-            await sendPromptToChatFn(bot, config, user.chatId, adminCache);
-          } catch (error) {
-            logBotError(`[Reminder] Failed to send ${reminderTime} prompt.`, { chatId: user.chatId, error: error.message });
-          }
-        }
+        await Promise.allSettled(
+          users.map(async (user) => {
+            try {
+              await sendPromptToChatFn(bot, config, user.chatId, adminCache);
+            } catch (error) {
+              logBotError(`[Reminder] Failed to send ${reminderTime} prompt.`, { chatId: user.chatId, error: error.message });
+            }
+          })
+        );
       },
       { timezone: config.timezone }
     );

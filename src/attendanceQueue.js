@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { getDataFile } from "./dataDir.js";
-import { appendJsonLine, readJsonLines, runSerialized, writeJsonLines } from "./fileStore.js";
+import { appendJsonLine, appendJsonLines, readJsonLines, runSerialized, writeJsonLines } from "./fileStore.js";
 
 const QUEUE_MUTEX_KEY = "attendance-queue";
 const ATTENDANCE_QUEUE_FILE = () => getDataFile("attendance-queue.ndjson");
@@ -196,15 +196,11 @@ export async function enqueueAttendanceEvents(config, events) {
       baseCacheTimestamp: event.baseCacheTimestamp ?? null
     }));
 
+    const enqueueRecords = nextEvents.map((event) => ({ kind: "attendance_enqueued", event }));
+    await appendJsonLines(ATTENDANCE_QUEUE_FILE(), enqueueRecords);
+
     for (const event of nextEvents) {
-      await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
-        kind: "attendance_enqueued",
-        event
-      });
-      state.records.push({
-        kind: "attendance_enqueued",
-        event
-      });
+      state.records.push({ kind: "attendance_enqueued", event });
       state.events.set(event.id, {
         ...event,
         queueStatus: "pending",
@@ -280,6 +276,9 @@ export async function flushAttendanceQueue(writeEntries) {
 
       const flushedAt = new Date().toISOString();
 
+      // Collect all bookkeeping records, then write them in one batch append.
+      const bookkeepingRecords = [];
+
       for (const event of finalEvents) {
         if (!writtenEventIds.has(event.id)) {
           continue;
@@ -288,16 +287,9 @@ export async function flushAttendanceQueue(writeEntries) {
         const groupedEvents = eventGroups.get(`${event.appointment}:${event.date}`) ?? [event];
 
         for (const groupedEvent of groupedEvents) {
-          await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
-            kind: "attendance_flushed",
-            eventId: groupedEvent.id,
-            flushedAt
-          });
-          state.records.push({
-            kind: "attendance_flushed",
-            eventId: groupedEvent.id,
-            flushedAt
-          });
+          const record = { kind: "attendance_flushed", eventId: groupedEvent.id, flushedAt };
+          bookkeepingRecords.push(record);
+          state.records.push(record);
           const current = state.events.get(groupedEvent.id);
 
           if (current) {
@@ -318,18 +310,14 @@ export async function flushAttendanceQueue(writeEntries) {
           : [];
 
         for (const groupedEvent of groupedEvents) {
-          await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
+          const record = {
             kind: "attendance_skipped",
             eventId: groupedEvent.id,
             skippedAt: flushedAt,
             reason: skippedEvent.reason ?? "noop"
-          });
-          state.records.push({
-            kind: "attendance_skipped",
-            eventId: groupedEvent.id,
-            skippedAt: flushedAt,
-            reason: skippedEvent.reason ?? "noop"
-          });
+          };
+          bookkeepingRecords.push(record);
+          state.records.push(record);
           const current = state.events.get(groupedEvent.id);
 
           if (current) {
@@ -350,20 +338,15 @@ export async function flushAttendanceQueue(writeEntries) {
           : [];
 
         for (const groupedEvent of groupedEvents) {
-          await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
+          const record = {
             kind: "attendance_conflicted",
             eventId: groupedEvent.id,
             conflictedAt: flushedAt,
             reason: conflictedEvent.reason ?? "sheet_layout_changed",
             error: conflictedEvent.error ?? null
-          });
-          state.records.push({
-            kind: "attendance_conflicted",
-            eventId: groupedEvent.id,
-            conflictedAt: flushedAt,
-            reason: conflictedEvent.reason ?? "sheet_layout_changed",
-            error: conflictedEvent.error ?? null
-          });
+          };
+          bookkeepingRecords.push(record);
+          state.records.push(record);
           const current = state.events.get(groupedEvent.id);
 
           if (current) {
@@ -374,6 +357,8 @@ export async function flushAttendanceQueue(writeEntries) {
           }
         }
       }
+
+      await appendJsonLines(ATTENDANCE_QUEUE_FILE(), bookkeepingRecords);
 
       const writtenCount = outcome?.writtenEventIds?.length ?? finalEvents.length;
       const skippedCount = outcome?.skippedEvents?.length ?? 0;
@@ -399,23 +384,20 @@ export async function flushAttendanceQueue(writeEntries) {
         `[Queue] Flush failed (will retry in ~${retryDelayS}s): ${error.message}`
       );
 
+      const failedRecords = pendingEvents.map((event) => ({
+        kind: "attendance_flush_failed",
+        eventId: event.id,
+        failedAt,
+        error: error.message,
+        retryCount: Number(event.retryCount ?? 0) + 1,
+        nextRetryAt
+      }));
+
+      await appendJsonLines(ATTENDANCE_QUEUE_FILE(), failedRecords);
+
       for (const event of pendingEvents) {
-        await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
-          kind: "attendance_flush_failed",
-          eventId: event.id,
-          failedAt,
-          error: error.message,
-          retryCount: Number(event.retryCount ?? 0) + 1,
-          nextRetryAt
-        });
-        state.records.push({
-          kind: "attendance_flush_failed",
-          eventId: event.id,
-          failedAt,
-          error: error.message,
-          retryCount: Number(event.retryCount ?? 0) + 1,
-          nextRetryAt
-        });
+        const record = failedRecords.find((r) => r.eventId === event.id);
+        state.records.push(record);
         const current = state.events.get(event.id);
 
         if (current) {
