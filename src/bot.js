@@ -1156,6 +1156,22 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+// Returns a Map<UPPER_NAME, arrayIndex> for the snapshot's appointments array.
+// Built lazily on first call and stored as a non-enumerable property so it is
+// invisible to JSON serialization and object spread. Rebuilt automatically
+// whenever adminCache replaces the snapshot object with a fresh one.
+function getSnapshotAppointmentIndex(snapshot) {
+  if (!snapshot._appointmentIndex) {
+    Object.defineProperty(snapshot, "_appointmentIndex", {
+      value: new Map(snapshot.appointments.map((apt, i) => [apt.toUpperCase(), i])),
+      enumerable: false,
+      configurable: true,
+      writable: true
+    });
+  }
+  return snapshot._appointmentIndex;
+}
+
 function getCachedAttendanceStatus(cache, config, appointment, date) {
   const month = new Intl.DateTimeFormat("en-US", {
     timeZone: config.timezone,
@@ -1172,11 +1188,9 @@ function getCachedAttendanceStatus(cache, config, appointment, date) {
     return "";
   }
 
-  const appointmentIndex = snapshot.appointments.findIndex(
-    (value) => value.toUpperCase() === appointment.toUpperCase()
-  );
+  const appointmentIndex = getSnapshotAppointmentIndex(snapshot).get(appointment.toUpperCase());
 
-  if (appointmentIndex === -1) {
+  if (appointmentIndex === undefined) {
     return "";
   }
 
@@ -2608,53 +2622,64 @@ async function refreshAdminCache(cache, config) {
     getAppointmentRegistry(),
     listAdminAppointments(config.defaultAdminAppointments)
   ]);
-  const activeCodes = registry.appointments.filter((entry) => entry.active);
-  const pending = activeCodes.filter((entry) => !entry.boundChatId);
-
   // Merge manually-granted and default admins with auto-chief admins so that
   // department chiefs show in the admin list UI without needing manual grants.
   const adminAppointmentSet = new Set(admins.map((e) => e.appointment.toUpperCase()));
-  const chiefAdmins = activeCodes
-    .filter((entry) => entry.boundChatId && isChiefAppointment(entry.appointment))
-    .filter((entry) => !adminAppointmentSet.has(entry.appointment.toUpperCase()))
-    .map((entry) => ({ appointment: entry.appointment, source: "chief" }));
+
+  // Single pass over all appointments — avoids 7 separate filter/map chains.
+  const activeCodes = [];
+  const pending = [];
+  const chiefAdmins = [];
+  const inviteCandidates = [];
+  const deregisterCandidates = [];
+  const removeAppointmentCandidates = [];
+  const transferFromCandidates = [];
+  const transferToCandidates = [];
+
+  for (const entry of registry.appointments) {
+    if (!entry.active) continue;
+    activeCodes.push(entry);
+    const label = { label: entry.appointment, appointment: entry.appointment };
+    removeAppointmentCandidates.push(label);
+    if (entry.boundChatId) {
+      deregisterCandidates.push(label);
+      transferFromCandidates.push({
+        label: entry.boundFullName
+          ? `${entry.appointment} — ${entry.boundFullName}`
+          : entry.appointment,
+        appointment: entry.appointment
+      });
+      if (isChiefAppointment(entry.appointment) && !adminAppointmentSet.has(entry.appointment.toUpperCase())) {
+        chiefAdmins.push({ appointment: entry.appointment, source: "chief" });
+      }
+    } else {
+      pending.push(entry);
+      inviteCandidates.push(label);
+      transferToCandidates.push(label);
+    }
+  }
+
   const allAdmins = [...admins, ...chiefAdmins];
   const adminSet = new Set(allAdmins.map((e) => e.appointment.toUpperCase()));
+
+  // Chiefs are already admins — exclude them from the "add admin" list.
+  const addAdminCandidates = activeCodes
+    .filter((entry) => !adminSet.has(entry.appointment.toUpperCase()))
+    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
+  const removeAdminCandidates = allAdmins
+    .filter((entry) => entry.source === "custom")
+    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
 
   cache.activeCodes = activeCodes;
   cache.pending = pending;
   cache.admins = allAdmins;
-  cache.inviteCandidates = pending.map((entry) => ({
-    label: entry.appointment,
-    appointment: entry.appointment
-  }));
-  cache.deregisterCandidates = activeCodes
-    .filter((entry) => entry.boundChatId)
-    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
-  cache.removeAppointmentCandidates = activeCodes.map((entry) => ({
-    label: entry.appointment,
-    appointment: entry.appointment
-  }));
-  // Chiefs are already admins — exclude them from the "add admin" list.
-  cache.addAdminCandidates = activeCodes
-    .filter((entry) => !adminSet.has(entry.appointment.toUpperCase()))
-    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
-  cache.removeAdminCandidates = allAdmins
-    .filter((entry) => entry.source === "custom")
-    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
-
-  // Transfer candidates: from = bound slots, to = unbound slots.
-  cache.transferFromCandidates = activeCodes
-    .filter((entry) => entry.boundChatId)
-    .map((entry) => ({
-      label: entry.boundFullName
-        ? `${entry.appointment} — ${entry.boundFullName}`
-        : entry.appointment,
-      appointment: entry.appointment
-    }));
-  cache.transferToCandidates = activeCodes
-    .filter((entry) => !entry.boundChatId)
-    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
+  cache.inviteCandidates = inviteCandidates;
+  cache.deregisterCandidates = deregisterCandidates;
+  cache.removeAppointmentCandidates = removeAppointmentCandidates;
+  cache.addAdminCandidates = addAdminCandidates;
+  cache.removeAdminCandidates = removeAdminCandidates;
+  cache.transferFromCandidates = transferFromCandidates;
+  cache.transferToCandidates = transferToCandidates;
 
   cache.inviteCandidates = sortAppointmentsForAdmin(cache.inviteCandidates, config);
   cache.removeAppointmentCandidates = sortAppointmentsForAdmin(cache.removeAppointmentCandidates, config);
