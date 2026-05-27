@@ -59,12 +59,24 @@ function clearUserBindingFields(user) {
   };
 }
 
+let usersCache = null;
+let usersCacheAt = 0;
+const USERS_CACHE_TTL_MS = 30_000;
+
 async function readUsers() {
-  return readJsonFile(getUsersFile(), []);
+  if (usersCache !== null && Date.now() - usersCacheAt < USERS_CACHE_TTL_MS) {
+    return usersCache;
+  }
+  const users = await readJsonFile(getUsersFile(), []);
+  usersCache = users;
+  usersCacheAt = Date.now();
+  return users;
 }
 
 async function writeUsers(users) {
   await writeJsonFile(getUsersFile(), users);
+  usersCache = users;
+  usersCacheAt = Date.now();
 }
 
 async function readAppointmentRegistry() {
@@ -161,6 +173,28 @@ export async function updateUserByChatId(chatId, patch) {
     users[index] = { ...users[index], ...patch };
     await writeUsers(users);
     return users[index];
+  });
+}
+
+// Applies multiple patches in a single read-modify-write cycle. Use this
+// instead of calling updateUserByChatId in a loop when many users need updating
+// at once (e.g. after a batch reminder send).
+export async function batchUpdateUsersByChatId(patches) {
+  if (!patches || patches.length === 0) return [];
+  return withStorageMutation(async () => {
+    const users = await readUsers();
+    const results = [];
+    for (const { chatId, patch } of patches) {
+      const index = users.findIndex((entry) => entry.chatId === String(chatId));
+      if (index === -1) {
+        results.push(null);
+        continue;
+      }
+      users[index] = { ...users[index], ...patch };
+      results.push(users[index]);
+    }
+    await writeUsers(users);
+    return results;
   });
 }
 

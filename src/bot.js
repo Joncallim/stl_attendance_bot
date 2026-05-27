@@ -42,6 +42,7 @@ import { getSingaporePublicHolidaySet } from "./holidays.js";
 import {
   addAdminAppointment,
   addAppointmentToRegistry,
+  batchUpdateUsersByChatId,
   bindAppointmentCode,
   deregisterAppointmentBinding,
   deregisterRequestorByChatId,
@@ -3243,16 +3244,24 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       return;
     }
 
-    const results = await Promise.allSettled(
-      users.map((user) => sendPromptToChat(bot, config, user.chatId, cache))
+    const promptResults = await Promise.allSettled(
+      users.map((user) => buildAndSendAttendancePrompt(bot, config, user, cache))
     );
-    const sent = results.filter((r) => r.status === "fulfilled").length;
+    const sent = promptResults.filter((r) => r.status === "fulfilled").length;
 
-    for (let i = 0; i < results.length; i++) {
-      if (results[i].status === "rejected") {
-        logBotError("Failed to send prompt.", { chatId: users[i].chatId, error: results[i].reason?.message });
+    const promptedAt = new Date().toISOString();
+    const patches = [];
+
+    for (let i = 0; i < promptResults.length; i++) {
+      if (promptResults[i].status === "fulfilled") {
+        const { chatId, awaitingAttendance } = promptResults[i].value;
+        patches.push({ chatId, patch: { awaitingAttendance, promptedAt } });
+      } else {
+        logBotError("Failed to send prompt.", { chatId: users[i].chatId, error: promptResults[i].reason?.message });
       }
     }
+
+    await batchUpdateUsersByChatId(patches);
 
     await sendOrUpdateAdminMessage(
       ctx,
@@ -3344,24 +3353,21 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
   }
 }
 
-async function sendPromptToChat(bot, config, chatId, cache = null) {
-  const user = await getUserByChatId(chatId);
+// Sends the attendance prompt message to a pre-fetched user object and returns
+// the state patch to apply. Caller is responsible for writing the patch to disk
+// so that bulk sends can batch all writes into a single storage operation.
+async function buildAndSendAttendancePrompt(bot, config, user, cache) {
   const today = new Date();
   const dateLabel = formatAttendanceDateLabel(today, config.timezone);
   const currentStatus = user?.appointment && cache
     ? getCachedAttendanceStatus(cache, config, user.appointment, today)
     : "";
-  const message = buildTodayAttendancePromptMessage(
-    config,
-    today,
-    user?.appointment ?? null,
-    cache
-  );
+  const message = buildTodayAttendancePromptMessage(config, today, user?.appointment ?? null, cache);
   const promptMessage = currentStatus
     ? `Your attendance for ${dateLabel} is currently ${currentStatus}. Update it if needed.`
     : `You have not updated your attendance for ${dateLabel}. ${message}`;
   await bot.telegram.sendMessage(
-    chatId,
+    user.chatId,
     promptMessage,
     buildInlineAttendanceMenu(
       config.attendanceOptions,
@@ -3371,10 +3377,16 @@ async function sendPromptToChat(bot, config, chatId, cache = null) {
       "home:main"
     )
   );
+  return { chatId: user.chatId, awaitingAttendance: !currentStatus };
+}
+
+async function sendPromptToChat(bot, config, chatId, cache = null) {
+  const user = await getUserByChatId(chatId);
+  const { awaitingAttendance } = await buildAndSendAttendancePrompt(bot, config, user, cache);
   // Only set awaitingAttendance if no status is on file; users who already filed
   // should not be put into a text-prompt state just from receiving the reminder.
   await updateUserByChatId(chatId, {
-    awaitingAttendance: !currentStatus,
+    awaitingAttendance,
     promptedAt: new Date().toISOString()
   });
 }
@@ -4105,6 +4117,8 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   const isReminderWorkingDayFn = deps.isReminderWorkingDayFn ?? isReminderWorkingDay;
   const listUsersFn = deps.listUsersFn ?? listUsers;
   const sendPromptToChatFn = deps.sendPromptToChatFn ?? sendPromptToChat;
+  const buildAndSendAttendancePromptFn = deps.buildAndSendAttendancePromptFn ?? buildAndSendAttendancePrompt;
+  const batchUpdateUsersByChatIdFn = deps.batchUpdateUsersByChatIdFn ?? batchUpdateUsersByChatId;
   const runDailySheetMaintenanceFn = deps.runDailySheetMaintenanceFn ?? runDailySheetMaintenance;
   const runStartupSheetCleanupFn = deps.runStartupSheetCleanupFn ?? runStartupSheetCleanup;
 
@@ -4286,15 +4300,23 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
           return hasUnfilledAttendance(adminCache, config, user.appointment, now);
         });
 
-        await Promise.allSettled(
-          users.map(async (user) => {
-            try {
-              await sendPromptToChatFn(bot, config, user.chatId, adminCache);
-            } catch (error) {
-              logBotError(`[Reminder] Failed to send ${reminderTime} prompt.`, { chatId: user.chatId, error: error.message });
-            }
-          })
+        const promptResults = await Promise.allSettled(
+          users.map((user) => buildAndSendAttendancePromptFn(bot, config, user, adminCache))
         );
+
+        const promptedAt = new Date().toISOString();
+        const patches = [];
+
+        for (let i = 0; i < promptResults.length; i++) {
+          if (promptResults[i].status === "fulfilled") {
+            const { chatId, awaitingAttendance } = promptResults[i].value;
+            patches.push({ chatId, patch: { awaitingAttendance, promptedAt } });
+          } else {
+            logBotError(`[Reminder] Failed to send ${reminderTime} prompt.`, { chatId: users[i].chatId, error: promptResults[i].reason?.message });
+          }
+        }
+
+        await batchUpdateUsersByChatIdFn(patches);
       },
       { timezone: config.timezone }
     );

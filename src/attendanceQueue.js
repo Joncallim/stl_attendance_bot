@@ -372,7 +372,7 @@ export async function flushAttendanceQueue(writeEntries) {
       return { flushedEvents: finalEvents, pendingEvents: [], outcome };
     } catch (error) {
       const failedAt = new Date().toISOString();
-      const maxRetryCount = Math.max(...pendingEvents.map((event) => Number(event.retryCount ?? 0)), 0);
+      const maxRetryCount = pendingEvents.reduce((max, event) => Math.max(max, Number(event.retryCount ?? 0)), 0);
       const nextRetryCount = maxRetryCount + 1;
       const nextRetryAt = new Date(
         Date.now() + Math.min(15 * 60 * 1000, 1000 * (2 ** Math.min(nextRetryCount, 5))) + Math.floor(Math.random() * 250)
@@ -449,12 +449,12 @@ export async function resetConflictedQueueEntries() {
 
     const resetAt = new Date().toISOString();
 
+    await appendJsonLines(
+      ATTENDANCE_QUEUE_FILE(),
+      conflicted.map((event) => ({ kind: "attendance_conflict_reset", eventId: event.id, resetAt }))
+    );
+
     for (const event of conflicted) {
-      await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
-        kind: "attendance_conflict_reset",
-        eventId: event.id,
-        resetAt
-      });
       event.queueStatus = "pending";
       event.conflictReason = null;
       event.lastError = null;
