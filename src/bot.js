@@ -42,6 +42,7 @@ import { getSingaporePublicHolidaySet } from "./holidays.js";
 import {
   addAdminAppointment,
   addAppointmentToRegistry,
+  batchUpdateUsersByChatId,
   bindAppointmentCode,
   deregisterAppointmentBinding,
   deregisterRequestorByChatId,
@@ -1155,6 +1156,22 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+// Returns a Map<UPPER_NAME, arrayIndex> for the snapshot's appointments array.
+// Built lazily on first call and stored as a non-enumerable property so it is
+// invisible to JSON serialization and object spread. Rebuilt automatically
+// whenever adminCache replaces the snapshot object with a fresh one.
+function getSnapshotAppointmentIndex(snapshot) {
+  if (!snapshot._appointmentIndex) {
+    Object.defineProperty(snapshot, "_appointmentIndex", {
+      value: new Map(snapshot.appointments.map((apt, i) => [apt.toUpperCase(), i])),
+      enumerable: false,
+      configurable: true,
+      writable: true
+    });
+  }
+  return snapshot._appointmentIndex;
+}
+
 function getCachedAttendanceStatus(cache, config, appointment, date) {
   const month = new Intl.DateTimeFormat("en-US", {
     timeZone: config.timezone,
@@ -1171,11 +1188,9 @@ function getCachedAttendanceStatus(cache, config, appointment, date) {
     return "";
   }
 
-  const appointmentIndex = snapshot.appointments.findIndex(
-    (value) => value.toUpperCase() === appointment.toUpperCase()
-  );
+  const appointmentIndex = getSnapshotAppointmentIndex(snapshot).get(appointment.toUpperCase());
 
-  if (appointmentIndex === -1) {
+  if (appointmentIndex === undefined) {
     return "";
   }
 
@@ -2607,53 +2622,64 @@ async function refreshAdminCache(cache, config) {
     getAppointmentRegistry(),
     listAdminAppointments(config.defaultAdminAppointments)
   ]);
-  const activeCodes = registry.appointments.filter((entry) => entry.active);
-  const pending = activeCodes.filter((entry) => !entry.boundChatId);
-
   // Merge manually-granted and default admins with auto-chief admins so that
   // department chiefs show in the admin list UI without needing manual grants.
   const adminAppointmentSet = new Set(admins.map((e) => e.appointment.toUpperCase()));
-  const chiefAdmins = activeCodes
-    .filter((entry) => entry.boundChatId && isChiefAppointment(entry.appointment))
-    .filter((entry) => !adminAppointmentSet.has(entry.appointment.toUpperCase()))
-    .map((entry) => ({ appointment: entry.appointment, source: "chief" }));
+
+  // Single pass over all appointments — avoids 7 separate filter/map chains.
+  const activeCodes = [];
+  const pending = [];
+  const chiefAdmins = [];
+  const inviteCandidates = [];
+  const deregisterCandidates = [];
+  const removeAppointmentCandidates = [];
+  const transferFromCandidates = [];
+  const transferToCandidates = [];
+
+  for (const entry of registry.appointments) {
+    if (!entry.active) continue;
+    activeCodes.push(entry);
+    const label = { label: entry.appointment, appointment: entry.appointment };
+    removeAppointmentCandidates.push(label);
+    if (entry.boundChatId) {
+      deregisterCandidates.push(label);
+      transferFromCandidates.push({
+        label: entry.boundFullName
+          ? `${entry.appointment} — ${entry.boundFullName}`
+          : entry.appointment,
+        appointment: entry.appointment
+      });
+      if (isChiefAppointment(entry.appointment) && !adminAppointmentSet.has(entry.appointment.toUpperCase())) {
+        chiefAdmins.push({ appointment: entry.appointment, source: "chief" });
+      }
+    } else {
+      pending.push(entry);
+      inviteCandidates.push(label);
+      transferToCandidates.push(label);
+    }
+  }
+
   const allAdmins = [...admins, ...chiefAdmins];
   const adminSet = new Set(allAdmins.map((e) => e.appointment.toUpperCase()));
+
+  // Chiefs are already admins — exclude them from the "add admin" list.
+  const addAdminCandidates = activeCodes
+    .filter((entry) => !adminSet.has(entry.appointment.toUpperCase()))
+    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
+  const removeAdminCandidates = allAdmins
+    .filter((entry) => entry.source === "custom")
+    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
 
   cache.activeCodes = activeCodes;
   cache.pending = pending;
   cache.admins = allAdmins;
-  cache.inviteCandidates = pending.map((entry) => ({
-    label: entry.appointment,
-    appointment: entry.appointment
-  }));
-  cache.deregisterCandidates = activeCodes
-    .filter((entry) => entry.boundChatId)
-    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
-  cache.removeAppointmentCandidates = activeCodes.map((entry) => ({
-    label: entry.appointment,
-    appointment: entry.appointment
-  }));
-  // Chiefs are already admins — exclude them from the "add admin" list.
-  cache.addAdminCandidates = activeCodes
-    .filter((entry) => !adminSet.has(entry.appointment.toUpperCase()))
-    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
-  cache.removeAdminCandidates = allAdmins
-    .filter((entry) => entry.source === "custom")
-    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
-
-  // Transfer candidates: from = bound slots, to = unbound slots.
-  cache.transferFromCandidates = activeCodes
-    .filter((entry) => entry.boundChatId)
-    .map((entry) => ({
-      label: entry.boundFullName
-        ? `${entry.appointment} — ${entry.boundFullName}`
-        : entry.appointment,
-      appointment: entry.appointment
-    }));
-  cache.transferToCandidates = activeCodes
-    .filter((entry) => !entry.boundChatId)
-    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
+  cache.inviteCandidates = inviteCandidates;
+  cache.deregisterCandidates = deregisterCandidates;
+  cache.removeAppointmentCandidates = removeAppointmentCandidates;
+  cache.addAdminCandidates = addAdminCandidates;
+  cache.removeAdminCandidates = removeAdminCandidates;
+  cache.transferFromCandidates = transferFromCandidates;
+  cache.transferToCandidates = transferToCandidates;
 
   cache.inviteCandidates = sortAppointmentsForAdmin(cache.inviteCandidates, config);
   cache.removeAppointmentCandidates = sortAppointmentsForAdmin(cache.removeAppointmentCandidates, config);
@@ -3243,16 +3269,24 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       return;
     }
 
-    let sent = 0;
+    const promptResults = await Promise.allSettled(
+      users.map((user) => buildAndSendAttendancePrompt(bot, config, user, cache))
+    );
+    const sent = promptResults.filter((r) => r.status === "fulfilled").length;
 
-    for (const user of users) {
-      try {
-        await sendPromptToChat(bot, config, user.chatId, cache);
-        sent += 1;
-      } catch (error) {
-        logBotError("Failed to send prompt.", { chatId: user.chatId, error: error.message });
+    const promptedAt = new Date().toISOString();
+    const patches = [];
+
+    for (let i = 0; i < promptResults.length; i++) {
+      if (promptResults[i].status === "fulfilled") {
+        const { chatId, awaitingAttendance } = promptResults[i].value;
+        patches.push({ chatId, patch: { awaitingAttendance, promptedAt } });
+      } else {
+        logBotError("Failed to send prompt.", { chatId: users[i].chatId, error: promptResults[i].reason?.message });
       }
     }
+
+    await batchUpdateUsersByChatId(patches);
 
     await sendOrUpdateAdminMessage(
       ctx,
@@ -3344,24 +3378,21 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
   }
 }
 
-async function sendPromptToChat(bot, config, chatId, cache = null) {
-  const user = await getUserByChatId(chatId);
+// Sends the attendance prompt message to a pre-fetched user object and returns
+// the state patch to apply. Caller is responsible for writing the patch to disk
+// so that bulk sends can batch all writes into a single storage operation.
+async function buildAndSendAttendancePrompt(bot, config, user, cache) {
   const today = new Date();
   const dateLabel = formatAttendanceDateLabel(today, config.timezone);
   const currentStatus = user?.appointment && cache
     ? getCachedAttendanceStatus(cache, config, user.appointment, today)
     : "";
-  const message = buildTodayAttendancePromptMessage(
-    config,
-    today,
-    user?.appointment ?? null,
-    cache
-  );
+  const message = buildTodayAttendancePromptMessage(config, today, user?.appointment ?? null, cache);
   const promptMessage = currentStatus
     ? `Your attendance for ${dateLabel} is currently ${currentStatus}. Update it if needed.`
     : `You have not updated your attendance for ${dateLabel}. ${message}`;
   await bot.telegram.sendMessage(
-    chatId,
+    user.chatId,
     promptMessage,
     buildInlineAttendanceMenu(
       config.attendanceOptions,
@@ -3371,10 +3402,16 @@ async function sendPromptToChat(bot, config, chatId, cache = null) {
       "home:main"
     )
   );
+  return { chatId: user.chatId, awaitingAttendance: !currentStatus };
+}
+
+async function sendPromptToChat(bot, config, chatId, cache = null) {
+  const user = await getUserByChatId(chatId);
+  const { awaitingAttendance } = await buildAndSendAttendancePrompt(bot, config, user, cache);
   // Only set awaitingAttendance if no status is on file; users who already filed
   // should not be put into a text-prompt state just from receiving the reminder.
   await updateUserByChatId(chatId, {
-    awaitingAttendance: !currentStatus,
+    awaitingAttendance,
     promptedAt: new Date().toISOString()
   });
 }
@@ -4105,6 +4142,8 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   const isReminderWorkingDayFn = deps.isReminderWorkingDayFn ?? isReminderWorkingDay;
   const listUsersFn = deps.listUsersFn ?? listUsers;
   const sendPromptToChatFn = deps.sendPromptToChatFn ?? sendPromptToChat;
+  const buildAndSendAttendancePromptFn = deps.buildAndSendAttendancePromptFn ?? buildAndSendAttendancePrompt;
+  const batchUpdateUsersByChatIdFn = deps.batchUpdateUsersByChatIdFn ?? batchUpdateUsersByChatId;
   const runDailySheetMaintenanceFn = deps.runDailySheetMaintenanceFn ?? runDailySheetMaintenance;
   const runStartupSheetCleanupFn = deps.runStartupSheetCleanupFn ?? runStartupSheetCleanup;
 
@@ -4286,13 +4325,23 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
           return hasUnfilledAttendance(adminCache, config, user.appointment, now);
         });
 
-        for (const user of users) {
-          try {
-            await sendPromptToChatFn(bot, config, user.chatId, adminCache);
-          } catch (error) {
-            logBotError(`[Reminder] Failed to send ${reminderTime} prompt.`, { chatId: user.chatId, error: error.message });
+        const promptResults = await Promise.allSettled(
+          users.map((user) => buildAndSendAttendancePromptFn(bot, config, user, adminCache))
+        );
+
+        const promptedAt = new Date().toISOString();
+        const patches = [];
+
+        for (let i = 0; i < promptResults.length; i++) {
+          if (promptResults[i].status === "fulfilled") {
+            const { chatId, awaitingAttendance } = promptResults[i].value;
+            patches.push({ chatId, patch: { awaitingAttendance, promptedAt } });
+          } else {
+            logBotError(`[Reminder] Failed to send ${reminderTime} prompt.`, { chatId: users[i].chatId, error: promptResults[i].reason?.message });
           }
         }
+
+        await batchUpdateUsersByChatIdFn(patches);
       },
       { timezone: config.timezone }
     );

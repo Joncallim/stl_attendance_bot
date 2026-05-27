@@ -407,6 +407,130 @@ With Docker Compose, that file will persist inside the mounted `./data` director
 - The `0800` reminder goes only to users still blank for that day.
 - Admin home shows `Last Synchronisation` from the 5-minute reconciliation pass.
 
+## Data Flow
+
+This section describes the complete lifecycle of a user action from Telegram to Google Sheets and back.
+
+### User submits attendance (daily flow)
+
+```
+User taps attendance button in Telegram
+  │
+  ▼
+Telegraf callback handler (bot.js)
+  │  reads user from users cache (storage.js — 30 s TTL)
+  │  reads current attendance status from adminCache.sheetSnapshots (in-memory)
+  │
+  ▼
+enqueueAttendanceEvent (attendanceQueue.js)
+  │  serialized by QUEUE_MUTEX_KEY
+  │  appends one NDJSON line to data/attendance-queue.ndjson
+  │  updates in-memory cachedQueueState
+  │
+  ▼
+Bot responds immediately (cache read — no Sheets API call)
+  │
+  ▼ (background, up to 60 s later)
+syncManager.runCycle → flushAttendanceQueue (attendanceQueue.js)
+  │  serialized by QUEUE_MUTEX_KEY
+  │  coalesces events: last-write-wins per (appointment, date)
+  │  calls reconcilePendingAttendanceWithSheets
+  │
+  ▼
+reconcilePendingAttendanceWithSheets (googleSheets.js)
+  │  reads local sheet-cache.json
+  │  fetches live month slice(s) via Sheets API (force: true)
+  │  resolves row and column for each entry against the live layout
+  │  builds a batch of { range, value } pairs
+  │
+  ▼
+sheets.spreadsheets.values.batchUpdate (single API call for all entries)
+  │  governed by acquireSheetsSemaphore: one request in-flight at a time
+  │  1 000 ms inter-request delay (3 000 ms under congestion)
+  │  15 s timeout per request with up to 5 retries (exponential backoff)
+  │
+  ▼
+Queue bookkeeping written in one batch appendJsonLines call
+  │  all flushed / skipped / conflicted records written atomically
+  │
+  ▼
+Local sheet-cache.json updated with the reconciled snapshot
+  │
+  ▼
+adminCache.sheetSnapshots updated (in-memory) on the next preload cycle
+```
+
+### 0700 morning reminder (up to 100 concurrent users)
+
+```
+node-cron fires at 0700 SGT
+  │
+  ▼
+isReminderWorkingDay check (Singapore public holidays + weekday filter)
+  │
+  ▼
+syncManager.runCycle({ force: true, reason: "reminder" })
+  │  flushes any queued attendance before reading live state
+  │  refreshes month snapshots via Sheets API (TTL-gated)
+  │
+  ▼
+listUsers() → users cache (storage.js — 30 s TTL, single disk read)
+  │  filters to bound users (appointment !== null)
+  │  first reminder: all bound users
+  │  second reminder: only users with blank attendance for today
+  │
+  ▼
+Promise.allSettled over all users — all Telegram sends fire concurrently
+  │  buildAndSendAttendancePrompt(bot, config, user, adminCache)
+  │    reads current status from adminCache.sheetSnapshots (in-memory, no disk)
+  │    calls bot.telegram.sendMessage (Telegram API, concurrent per user)
+  │    returns { chatId, awaitingAttendance }
+  │
+  ▼
+batchUpdateUsersByChatId(patches) — single read-modify-write for all users
+  │  serialized by STORAGE_MUTEX_KEY
+  │  reads users.json once, applies all patches, writes once
+  │  updates in-memory users cache
+```
+
+### Background sync cycles
+
+```
+Every 60 s — opportunistic background cycle
+  │  syncManager.runCycle({ force: false })
+  │  skips if a cycle is already running (deduplication)
+  │  flushes queue, refreshes onboarding TTL, refreshes month slices TTL
+  │
+Every 5 min — forced reconciliation cycle
+  │  syncManager.runCycle({ force: true })
+  │  same as above but bypasses TTL gates
+  │  self-healing: detects and repairs appointment name drift in month sheets
+  │
+02:00 daily — structural maintenance cron
+  │  inserts / deletes rows to match canonical ONBOARDING roster
+  │  compacts attendance-queue.ndjson (drops resolved events)
+  │  refreshes attendance option sort order
+```
+
+### Caching layers
+
+| Layer | Backing store | TTL | Governs |
+|---|---|---|---|
+| `usersCache` (storage.js) | `data/users.json` | 30 s | All user record reads |
+| `adminCache.sheetSnapshots` (bot.js) | In-memory Map | No TTL — refreshed by sync cycle | Summary and reminder status reads |
+| `processSpreadsheetCache` (googleSheets.js) | In-memory WeakMap | 45 min | `spreadsheets.get` metadata |
+| `onboardingSlice` (sheet-cache.json) | `data/sheet-cache.json` | 2 min | ONBOARDING roster reads |
+| `monthSlices` (sheet-cache.json) | `data/sheet-cache.json` | 60 s | Monthly attendance reads |
+
+### Concurrency controls
+
+| Mutex / semaphore | Key | Serializes |
+|---|---|---|
+| `runSerialized("storage")` | `STORAGE_MUTEX_KEY` | All `users.json` and registry write operations |
+| `runSerialized("attendance-queue")` | `QUEUE_MUTEX_KEY` | All queue reads and writes |
+| `runSerialized("sheet-operations")` | `SHEET_OPERATION_MUTEX_KEY` | All Sheets sync cycles |
+| `acquireSheetsSemaphore()` | Module-level promise chain | All outgoing Google Sheets API calls |
+
 ## Safety Notes
 
 - Secret codes are generated automatically.
