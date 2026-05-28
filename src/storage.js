@@ -59,24 +59,75 @@ function clearUserBindingFields(user) {
   };
 }
 
+let usersCache = null;
+let usersCacheAt = 0;
+let usersCachedPath = null;
+// chatId → array-index lookup built in sync with usersCache.
+// Eliminates O(n) findIndex on every user read/write.
+let usersByIdIndex = null;
+const USERS_CACHE_TTL_MS = 30_000;
+
+function buildUsersByIdIndex(users) {
+  return new Map(users.map((u, i) => [String(u.chatId), i]));
+}
+
 async function readUsers() {
-  return readJsonFile(getUsersFile(), []);
+  const filePath = getUsersFile();
+  if (
+    usersCache !== null &&
+    filePath === usersCachedPath &&
+    Date.now() - usersCacheAt < USERS_CACHE_TTL_MS
+  ) {
+    return usersCache;
+  }
+  const users = await readJsonFile(filePath, []);
+  usersCache = users;
+  usersByIdIndex = buildUsersByIdIndex(users);
+  usersCachedPath = filePath;
+  usersCacheAt = Date.now();
+  return users;
 }
 
 async function writeUsers(users) {
-  await writeJsonFile(getUsersFile(), users);
+  const filePath = getUsersFile();
+  await writeJsonFile(filePath, users);
+  usersCache = users;
+  usersByIdIndex = buildUsersByIdIndex(users);
+  usersCachedPath = filePath;
+  usersCacheAt = Date.now();
 }
 
+let registryCache = null;
+let registryCacheAt = 0;
+let registryCachedPath = null;
+const REGISTRY_CACHE_TTL_MS = 30_000;
+
 async function readAppointmentRegistry() {
-  return readJsonFile(getAppointmentRegistryFile(), {
+  const filePath = getAppointmentRegistryFile();
+  if (
+    registryCache !== null &&
+    filePath === registryCachedPath &&
+    Date.now() - registryCacheAt < REGISTRY_CACHE_TTL_MS
+  ) {
+    return registryCache;
+  }
+  const registry = await readJsonFile(filePath, {
     updatedAt: null,
     appointments: [],
     adminAppointments: []
   });
+  registryCache = registry;
+  registryCachedPath = filePath;
+  registryCacheAt = Date.now();
+  return registry;
 }
 
 async function writeAppointmentRegistry(registry) {
-  await writeJsonFile(getAppointmentRegistryFile(), registry);
+  const filePath = getAppointmentRegistryFile();
+  await writeJsonFile(filePath, registry);
+  registryCache = registry;
+  registryCachedPath = filePath;
+  registryCacheAt = Date.now();
 }
 
 async function readSettings() {
@@ -97,11 +148,20 @@ function normalizeAttendanceOption(value) {
   return String(value ?? "").trim();
 }
 
+// WeakMap keyed on the appointments *array reference* so the index is
+// automatically invalidated whenever registry.appointments is replaced by a
+// new array (e.g. via .map()).  Eliminates O(n) Array.find on every lookup.
+const appointmentNameIndexCache = new WeakMap();
+
 function findAppointmentEntry(registry, appointment) {
-  const normalized = normalizeAppointmentName(appointment);
-  return registry.appointments.find(
-    (entry) => normalizeAppointmentName(entry.appointment) === normalized
-  );
+  let index = appointmentNameIndexCache.get(registry.appointments);
+  if (!index) {
+    index = new Map(
+      registry.appointments.map((entry) => [normalizeAppointmentName(entry.appointment), entry])
+    );
+    appointmentNameIndexCache.set(registry.appointments, index);
+  }
+  return index.get(normalizeAppointmentName(appointment)) ?? null;
 }
 
 function normalizeAppointmentInput(value) {
@@ -127,7 +187,7 @@ function withStorageMutation(operation) {
 export async function upsertUser(user) {
   return withStorageMutation(async () => {
     const users = await readUsers();
-    const index = users.findIndex((entry) => entry.chatId === user.chatId);
+    const index = usersByIdIndex?.get(String(user.chatId)) ?? -1;
 
     if (index >= 0) {
       users[index] = { ...users[index], ...user };
@@ -136,7 +196,7 @@ export async function upsertUser(user) {
     }
 
     await writeUsers(users);
-    return index >= 0 ? users[index] : user;
+    return index >= 0 ? users[index] : users[users.length - 1];
   });
 }
 
@@ -145,14 +205,15 @@ export async function listUsers() {
 }
 
 export async function getUserByChatId(chatId) {
-  const users = await readUsers();
-  return users.find((entry) => entry.chatId === String(chatId)) ?? null;
+  await readUsers(); // ensures cache + index are populated
+  const index = usersByIdIndex?.get(String(chatId));
+  return index !== undefined ? (usersCache[index] ?? null) : null;
 }
 
 export async function updateUserByChatId(chatId, patch) {
   return withStorageMutation(async () => {
     const users = await readUsers();
-    const index = users.findIndex((entry) => entry.chatId === String(chatId));
+    const index = usersByIdIndex?.get(String(chatId)) ?? -1;
 
     if (index === -1) {
       return null;
@@ -161,6 +222,28 @@ export async function updateUserByChatId(chatId, patch) {
     users[index] = { ...users[index], ...patch };
     await writeUsers(users);
     return users[index];
+  });
+}
+
+// Applies multiple patches in a single read-modify-write cycle. Use this
+// instead of calling updateUserByChatId in a loop when many users need updating
+// at once (e.g. after a batch reminder send).
+export async function batchUpdateUsersByChatId(patches) {
+  if (!patches || patches.length === 0) return [];
+  return withStorageMutation(async () => {
+    const users = await readUsers();
+    const results = [];
+    for (const { chatId, patch } of patches) {
+      const index = usersByIdIndex?.get(String(chatId)) ?? -1;
+      if (index === -1) {
+        results.push(null);
+        continue;
+      }
+      users[index] = { ...users[index], ...patch };
+      results.push(users[index]);
+    }
+    await writeUsers(users);
+    return results;
   });
 }
 
@@ -329,16 +412,19 @@ export async function addAppointmentToRegistry(appointment) {
           : entry
       );
     } else {
-      registry.appointments.push({
-        appointment: normalizedAppointment,
-        secretCode,
-        active: true,
-        boundChatId: null,
-        boundUserId: null,
-        boundUsername: null,
-        boundFullName: null,
-        boundAt: null
-      });
+      registry.appointments = [
+        ...registry.appointments,
+        {
+          appointment: normalizedAppointment,
+          secretCode,
+          active: true,
+          boundChatId: null,
+          boundUserId: null,
+          boundUsername: null,
+          boundFullName: null,
+          boundAt: null
+        }
+      ];
     }
 
     registry.updatedAt = new Date().toISOString();
