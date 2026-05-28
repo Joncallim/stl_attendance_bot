@@ -4,3 +4,4 @@ data/*.json
 credentials/
 *.log
 logs/
+.claude/worktrees/festive-einstein/
