@@ -619,10 +619,14 @@ function buildHomeMenu(isAdminUser, timezone) {
   buttons.push(
     Markup.button.callback("⚠️ Deregister", "home:deregister"),
     Markup.button.callback("📊 Summary", "home:summary"),
-    Markup.button.callback("❓ Help", "home:help"),
-    Markup.button.callback("🐛 Report Issue", "home:reportissue"),
-    Markup.button.callback("❌ Close", "home:close")
+    Markup.button.callback("❓ Help", "home:help")
   );
+
+  if (process.env.GITHUB_TOKEN) {
+    buttons.push(Markup.button.callback("🐛 Report Issue", "home:reportissue"));
+  }
+
+  buttons.push(Markup.button.callback("❌ Close", "home:close"));
 
   const rows = [];
 
@@ -2682,6 +2686,7 @@ async function refreshAdminCache(cache, config) {
   cache.transferToCandidates = transferToCandidates;
 
   cache.inviteCandidates = sortAppointmentsForAdmin(cache.inviteCandidates, config);
+  cache.deregisterCandidates = sortAppointmentsForAdmin(cache.deregisterCandidates, config);
   cache.removeAppointmentCandidates = sortAppointmentsForAdmin(cache.removeAppointmentCandidates, config);
   cache.addAdminCandidates = sortAppointmentsForAdmin(cache.addAdminCandidates, config);
   cache.removeAdminCandidates = sortAppointmentsForAdmin(cache.removeAdminCandidates, config);
