@@ -95,6 +95,24 @@ function logBotError(message, details = null) {
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
+// Telegram allows ~30 messages/second per bot. Cap concurrent reminder sends
+// to stay safely within quota and avoid silent 429 delivery failures.
+const TELEGRAM_SEND_CONCURRENCY = 25;
+
+// Runs an array of async factory functions with at most `concurrency` in-flight
+// at once, returning a Promise.allSettled-compatible result array in order.
+async function allSettledConcurrent(fns, concurrency) {
+  const results = new Array(fns.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, fns.length) }, async () => {
+    while (next < fns.length) {
+      const i = next++;
+      results[i] = await Promise.allSettled([fns[i]()]).then(([r]) => r);
+    }
+  });
+  await Promise.allSettled(workers);
+  return results;
+}
 const DEPARTMENT_MEMBER_PAGE_SIZE = 6;
 const DEPARTMENT_WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 const ATTENDANCE_OPTION_DISPLAY_ORDER = [
@@ -2582,7 +2600,9 @@ async function syncRosterState(sheets, config) {
     .filter((entry) => entry.boundChatId)
     .map((entry) => entry.appointment);
 
-  const roster = await syncOnboardingRoster(sheets, config, { boundAppointmentsToRestore });
+  // forceMetadata: true busts the 45-minute process-level spreadsheet metadata
+  // cache so that externally renamed or added sheets are picked up immediately.
+  const roster = await syncOnboardingRoster(sheets, config, { boundAppointmentsToRestore, forceMetadata: true });
 
   if (roster.driftDetected) {
     return roster;
@@ -3274,8 +3294,9 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       return;
     }
 
-    const promptResults = await Promise.allSettled(
-      users.map((user) => buildAndSendAttendancePrompt(bot, config, user, cache))
+    const promptResults = await allSettledConcurrent(
+      users.map((user) => () => buildAndSendAttendancePrompt(bot, config, user, cache)),
+      TELEGRAM_SEND_CONCURRENCY
     );
     const sent = promptResults.filter((r) => r.status === "fulfilled").length;
 
@@ -4330,8 +4351,9 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
           return hasUnfilledAttendance(adminCache, config, user.appointment, now);
         });
 
-        const promptResults = await Promise.allSettled(
-          users.map((user) => buildAndSendAttendancePromptFn(bot, config, user, adminCache))
+        const promptResults = await allSettledConcurrent(
+          users.map((user) => () => buildAndSendAttendancePromptFn(bot, config, user, adminCache)),
+          TELEGRAM_SEND_CONCURRENCY
         );
 
         const promptedAt = new Date().toISOString();
@@ -4718,8 +4740,19 @@ export function createAttendanceBot(config) {
       ctx.session.awaitingSecretCode || storedUser?.awaitingSecretCode === true;
     const awaitingAttendance =
       ctx.session.awaitingAttendance || storedUser?.awaitingAttendance === true;
-    const awaitingWeeklyAttendance =
+    let awaitingWeeklyAttendance =
       ctx.session.awaitingWeeklyAttendance || storedUser?.awaitingWeeklyAttendance === true;
+
+    // Auto-recover from post-restart inconsistency: the flag was persisted but the
+    // weekly flow arrays (held only in the in-memory session) were lost. Reset both
+    // states so the user doesn't appear stuck until they manually /cancel.
+    if (awaitingWeeklyAttendance) {
+      const hasFlowDates = (ctx.session.weeklyAttendanceDates?.length ?? 0) > 0;
+      if (!hasFlowDates) {
+        await clearWeeklyAttendanceState(ctx);
+        awaitingWeeklyAttendance = false;
+      }
+    }
     const awaitingAttendanceOptionAdd = ctx.session.awaitingAttendanceOptionAdd === true;
     const awaitingAppointmentAdd = ctx.session.awaitingAppointmentAdd === true;
     const awaitingIssueReport = ctx.session.awaitingIssueReport === true;

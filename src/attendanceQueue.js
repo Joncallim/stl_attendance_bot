@@ -4,6 +4,9 @@ import { appendJsonLine, appendJsonLines, readJsonLines, runSerialized, writeJso
 
 const QUEUE_MUTEX_KEY = "attendance-queue";
 const ATTENDANCE_QUEUE_FILE = () => getDataFile("attendance-queue.ndjson");
+// After this many consecutive flush failures an event is marked failed_permanent
+// and will no longer be retried. At the 15-minute max retry gap this is ~5 hours.
+const MAX_RETRY_COUNT = 20;
 let cachedQueueState = null;
 let cachedQueueFilePath = null;
 let queueStateLoadPromise = null;
@@ -90,6 +93,18 @@ function createQueueState(records) {
         current.queueStatus = "pending";
         current.conflictReason = null;
         current.lastError = null;
+        current.nextRetryAt = null;
+      }
+    }
+
+    if (record.kind === "attendance_exhausted") {
+      const current = events.get(record.eventId);
+
+      if (current) {
+        current.queueStatus = "failed_permanent";
+        current.failedAt = record.failedAt;
+        current.lastError = record.error;
+        current.retryCount = Number(record.retryCount ?? current.retryCount ?? 0);
         current.nextRetryAt = null;
       }
     }
@@ -372,42 +387,70 @@ export async function flushAttendanceQueue(writeEntries) {
       return { flushedEvents: finalEvents, pendingEvents: [], outcome };
     } catch (error) {
       const failedAt = new Date().toISOString();
-      const maxRetryCount = pendingEvents.reduce((max, event) => Math.max(max, Number(event.retryCount ?? 0)), 0);
-      const nextRetryCount = maxRetryCount + 1;
-      const nextRetryAt = new Date(
-        Date.now() + Math.min(15 * 60 * 1000, 1000 * (2 ** Math.min(nextRetryCount, 5))) + Math.floor(Math.random() * 250)
-      ).toISOString();
-      const retryDelayS = Math.round(
-        (new Date(nextRetryAt).getTime() - Date.now()) / 1000
-      );
-      console.error(
-        `[Queue] Flush failed (will retry in ~${retryDelayS}s): ${error.message}`
-      );
-
-      const failedRecords = pendingEvents.map((event) => ({
-        kind: "attendance_flush_failed",
-        eventId: event.id,
-        failedAt,
-        error: error.message,
-        retryCount: Number(event.retryCount ?? 0) + 1,
-        nextRetryAt
-      }));
-
-      await appendJsonLines(ATTENDANCE_QUEUE_FILE(), failedRecords);
+      const bookkeepingRecords = [];
+      const exhaustedIds = [];
 
       for (const event of pendingEvents) {
-        const record = failedRecords.find((r) => r.eventId === event.id);
-        state.records.push(record);
-        const current = state.events.get(event.id);
+        const nextRetryCount = Number(event.retryCount ?? 0) + 1;
 
-        if (current) {
-          current.queueStatus = "failed_retryable";
-          current.failedAt = failedAt;
-          current.lastError = error.message;
-          current.retryCount = Number(current.retryCount ?? 0) + 1;
-          current.nextRetryAt = nextRetryAt;
+        if (nextRetryCount > MAX_RETRY_COUNT) {
+          console.error(
+            `[Queue] Event ${event.id} permanently failed after ${nextRetryCount - 1} attempts ` +
+            `(appointment=${event.appointment} date=${event.date}): ${error.message}`
+          );
+          const record = {
+            kind: "attendance_exhausted",
+            eventId: event.id,
+            failedAt,
+            error: error.message,
+            retryCount: nextRetryCount
+          };
+          bookkeepingRecords.push(record);
+          exhaustedIds.push(event.id);
+          state.records.push(record);
+          const current = state.events.get(event.id);
+
+          if (current) {
+            current.queueStatus = "failed_permanent";
+            current.failedAt = failedAt;
+            current.lastError = error.message;
+            current.retryCount = nextRetryCount;
+            current.nextRetryAt = null;
+          }
+        } else {
+          const nextRetryAt = new Date(
+            Date.now() + Math.min(15 * 60 * 1000, 1000 * (2 ** Math.min(nextRetryCount, 5))) + Math.floor(Math.random() * 250)
+          ).toISOString();
+          const record = {
+            kind: "attendance_flush_failed",
+            eventId: event.id,
+            failedAt,
+            error: error.message,
+            retryCount: nextRetryCount,
+            nextRetryAt
+          };
+          bookkeepingRecords.push(record);
+          state.records.push(record);
+          const current = state.events.get(event.id);
+
+          if (current) {
+            current.queueStatus = "failed_retryable";
+            current.failedAt = failedAt;
+            current.lastError = error.message;
+            current.retryCount = nextRetryCount;
+            current.nextRetryAt = nextRetryAt;
+          }
         }
       }
+
+      const retryableCount = pendingEvents.length - exhaustedIds.length;
+      if (retryableCount > 0) {
+        console.error(
+          `[Queue] Flush failed (${retryableCount} event(s) will retry): ${error.message}`
+        );
+      }
+
+      await appendJsonLines(ATTENDANCE_QUEUE_FILE(), bookkeepingRecords);
 
       throw error;
     }
@@ -419,6 +462,7 @@ export async function getAttendanceQueueStatus() {
   const events = [...state.events.values()];
   const pending = events.filter((event) => event.queueStatus === "pending" || event.queueStatus === "failed_retryable");
   const conflicted = events.filter((event) => event.queueStatus === "conflicted");
+  const permanentlyFailed = events.filter((event) => event.queueStatus === "failed_permanent");
   const nextRetryAt = pending
     .map((event) => event.nextRetryAt)
     .filter(Boolean)
@@ -427,6 +471,7 @@ export async function getAttendanceQueueStatus() {
   return {
     queueDepth: pending.length,
     conflictedCount: conflicted.length,
+    permanentlyFailedCount: permanentlyFailed.length,
     nextRetryAt
   };
 }
@@ -478,6 +523,7 @@ export async function compactAttendanceQueue() {
         )
         .map((event) => event.id)
     );
+    // failed_permanent events are terminal — treat them like flushed/conflicted and drop them.
 
     if (activeIds.size === state.events.size) {
       return { compacted: false, removedCount: 0 };

@@ -6,6 +6,8 @@ export function createSyncManager({
 }) {
   const state = {
     cyclePromise: null,
+    cycleIsForced: false,
+    pendingForcedOptions: null,
     maintenanceRunning: false,
     lastQueueFlushAt: 0,
     lastOnboardingRefreshAt: 0,
@@ -15,9 +17,23 @@ export function createSyncManager({
 
   async function runCycle(options = {}) {
     if (state.cyclePromise || state.maintenanceRunning) {
+      // If the caller requests a forced cycle but the running one is not forced,
+      // queue a single follow-up forced cycle so the forced params aren't lost.
+      if (options.force && !state.cycleIsForced && !state.pendingForcedOptions) {
+        state.pendingForcedOptions = options;
+        return state.cyclePromise.then(() => {
+          if (state.pendingForcedOptions) {
+            const pending = state.pendingForcedOptions;
+            state.pendingForcedOptions = null;
+            return runCycle(pending);
+          }
+        });
+      }
+
       return state.cyclePromise;
     }
 
+    state.cycleIsForced = options.force === true;
     state.cyclePromise = (async () => {
       if (flushQueue) {
         await flushQueue();
@@ -49,6 +65,7 @@ export function createSyncManager({
       }
     })().finally(() => {
       state.cyclePromise = null;
+      state.cycleIsForced = false;
     });
 
     return state.cyclePromise;

@@ -5,9 +5,14 @@ const PUBLIC_HOLIDAY_FETCH_TIMEOUT_MS = 10000;
 const PUBLIC_HOLIDAY_INTER_FETCH_DELAY_MS = 500;
 const PUBLIC_HOLIDAY_MAX_RETRY_ATTEMPTS = 3;
 const PUBLIC_HOLIDAY_RETRY_INITIAL_DELAY_MS = 2000;
+// When a year's data is not available from the API (e.g. next year not yet
+// published), cache the "not found" result and back off for 24 hours before
+// retrying, rather than hitting the API on every reminder check.
+const PUBLIC_HOLIDAY_MISS_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const publicHolidayCache = {
   years: new Map(),
-  loadingPromise: null
+  loadingPromise: null,
+  missTimestamps: new Map()
 };
 
 function createPublicHolidayTimeoutError(url, timeoutMs) {
@@ -124,11 +129,23 @@ export async function loadSingaporePublicHolidayCache() {
 
 export async function getSingaporePublicHolidaySet(year) {
   if (!publicHolidayCache.years.has(year)) {
-    try {
-      await loadSingaporePublicHolidayCache();
-    } catch (error) {
-      console.error("Failed to load Singapore public holiday cache:", error.message);
-      return new Set();
+    const lastMiss = publicHolidayCache.missTimestamps.get(year);
+    const onCooldown = lastMiss != null &&
+      (Date.now() - new Date(lastMiss).getTime() < PUBLIC_HOLIDAY_MISS_COOLDOWN_MS);
+
+    if (!onCooldown) {
+      try {
+        await loadSingaporePublicHolidayCache();
+      } catch (error) {
+        console.error("Failed to load Singapore public holiday cache:", error.message);
+        return new Set();
+      }
+
+      // If the year is still absent after a successful fetch, record the miss so
+      // we don't hammer the API on every subsequent reminder check.
+      if (!publicHolidayCache.years.has(year)) {
+        publicHolidayCache.missTimestamps.set(year, new Date().toISOString());
+      }
     }
   }
 
