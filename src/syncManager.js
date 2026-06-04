@@ -19,7 +19,9 @@ export function createSyncManager({
     if (state.cyclePromise || state.maintenanceRunning) {
       // If the caller requests a forced cycle but the running one is not forced,
       // queue a single follow-up forced cycle so the forced params aren't lost.
-      if (options.force && !state.cycleIsForced && !state.pendingForcedOptions) {
+      // Only chain when cyclePromise is set — maintenanceRunning can be true while
+      // cyclePromise is null, and chaining on null would throw.
+      if (options.force && !state.cycleIsForced && !state.pendingForcedOptions && state.cyclePromise) {
         state.pendingForcedOptions = options;
         return state.cyclePromise.then(() => {
           if (state.pendingForcedOptions) {

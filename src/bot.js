@@ -96,17 +96,32 @@ function logBotError(message, details = null) {
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
 // Telegram allows ~30 messages/second per bot. Cap concurrent reminder sends
-// to stay safely within quota and avoid silent 429 delivery failures.
+// and enforce a minimum gap between successive send starts to stay safely
+// within quota and avoid silent 429 delivery failures.
 const TELEGRAM_SEND_CONCURRENCY = 25;
+// Minimum gap between successive send starts: 1000ms / 25 sends = 40ms.
+// This caps throughput at ~25 sends/sec regardless of how fast individual
+// sends complete — a pure concurrency cap is not enough because fast RTTs
+// can drain the pool and restart sends faster than 30/sec.
+const TELEGRAM_SEND_INTERVAL_MS = 40;
 
-// Runs an array of async factory functions with at most `concurrency` in-flight
-// at once, returning a Promise.allSettled-compatible result array in order.
+// Runs async factory functions with at most `concurrency` in-flight at once,
+// staggering each send start by TELEGRAM_SEND_INTERVAL_MS to enforce a
+// per-second rate cap. Returns a Promise.allSettled-compatible result array.
 async function allSettledConcurrent(fns, concurrency) {
+  if (fns.length === 0) return [];
   const results = new Array(fns.length);
   let next = 0;
+  let nextAllowedAt = 0;
   const workers = Array.from({ length: Math.min(concurrency, fns.length) }, async () => {
     while (next < fns.length) {
       const i = next++;
+      // Synchronously compute and reserve this send's time slot before any await.
+      // JS is single-threaded so no other worker runs between these lines.
+      const now = Date.now();
+      const delay = Math.max(0, nextAllowedAt - now);
+      nextAllowedAt = Math.max(now, nextAllowedAt) + TELEGRAM_SEND_INTERVAL_MS;
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
       results[i] = await Promise.allSettled([fns[i]()]).then(([r]) => r);
     }
   });
@@ -3996,12 +4011,16 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
   const status = await deps.getAttendanceQueueStatus();
 
   if (status.queueDepth === 0) {
-    const conflictNote = status.conflictedCount > 0
-      ? `\n\n⚠️ ${status.conflictedCount} conflicted ${status.conflictedCount === 1 ? "entry" : "entries"} cannot be pushed until a Sync Roster is run to fix the sheet layout.`
-      : "";
+    const notes = [];
+    if (status.conflictedCount > 0) {
+      notes.push(`⚠️ ${status.conflictedCount} conflicted ${status.conflictedCount === 1 ? "entry" : "entries"} cannot be pushed until a Sync Roster is run to fix the sheet layout.`);
+    }
+    if (status.permanentlyFailedCount > 0) {
+      notes.push(`❌ ${status.permanentlyFailedCount} attendance ${status.permanentlyFailedCount === 1 ? "entry" : "entries"} permanently failed after exhausting retries and cannot be recovered automatically. Check the logs for details.`);
+    }
     await deps.sendOrUpdateAdminMessage(
       ctx,
-      `✅ No pending attendance entries to push.${conflictNote}`,
+      `✅ No pending attendance entries to push.${notes.length > 0 ? `\n\n${notes.join("\n\n")}` : ""}`,
       adminBackMenu
     );
     return;
@@ -4078,8 +4097,9 @@ async function handleQueueStatusAdminAction(ctx, deps) {
 
   const pendingCount = status.queueDepth;
   const conflictedCount = status.conflictedCount;
+  const permanentlyFailedCount = status.permanentlyFailedCount ?? 0;
 
-  if (pendingCount === 0 && conflictedCount === 0) {
+  if (pendingCount === 0 && conflictedCount === 0 && permanentlyFailedCount === 0) {
     await deps.sendOrUpdateAdminMessage(
       ctx,
       "✅ No outstanding attendance entries — the queue is empty.",
@@ -4113,6 +4133,13 @@ async function handleQueueStatusAdminAction(ctx, deps) {
     if (lines.length > 0) lines.push("");
     lines.push(
       `⚠️ ${conflictedCount} conflicted ${conflictedCount === 1 ? "entry" : "entries"} — run 🔄 Sync Roster to fix the sheet layout, then push again.`
+    );
+  }
+
+  if (permanentlyFailedCount > 0) {
+    if (lines.length > 0) lines.push("");
+    lines.push(
+      `❌ ${permanentlyFailedCount} permanently failed ${permanentlyFailedCount === 1 ? "entry" : "entries"} — exhausted all retries and cannot be recovered automatically. Check the bot logs for details.`
     );
   }
 
@@ -4554,6 +4581,7 @@ export function createAttendanceBot(config) {
         `Five-minute reconcile: ${formatSyncStatusTimestamp(syncStatus.lastFiveMinuteReconcileAt, config.timezone)}`,
         `Queue depth: ${queueStatus.queueDepth}`,
         `Conflicted writes: ${queueStatus.conflictedCount}`,
+        `Permanently failed: ${queueStatus.permanentlyFailedCount}`,
         `Next retry: ${queueStatus.nextRetryAt ? formatSyncStatusTimestamp(queueStatus.nextRetryAt, config.timezone) : "No retry scheduled"}`,
         preloadStatus
       ].join("\n")

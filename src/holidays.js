@@ -12,7 +12,11 @@ const PUBLIC_HOLIDAY_MISS_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const publicHolidayCache = {
   years: new Map(),
   loadingPromise: null,
-  missTimestamps: new Map()
+  missTimestamps: new Map(),
+  // Set to true when the last load had at least one per-dataset fetch error.
+  // A miss timestamp is only recorded when this is false so that a transient
+  // per-dataset failure doesn't suppress retries for 24 hours.
+  lastLoadHadErrors: false
 };
 
 function createPublicHolidayTimeoutError(url, timeoutMs) {
@@ -85,6 +89,8 @@ export async function loadSingaporePublicHolidayCache() {
   }
 
   publicHolidayCache.loadingPromise = (async () => {
+    publicHolidayCache.lastLoadHadErrors = false;
+
     const metadata = await fetchJson(
       `https://api-production.data.gov.sg/v2/public/api/collections/${SINGAPORE_PUBLIC_HOLIDAY_COLLECTION_ID}/metadata`
     );
@@ -117,6 +123,7 @@ export async function loadSingaporePublicHolidayCache() {
           publicHolidayCache.years.get(year).add(rawDate);
         }
       } catch (error) {
+        publicHolidayCache.lastLoadHadErrors = true;
         console.error(`Failed to load public holiday dataset ${datasetId}:`, error.message);
       }
     }
@@ -141,9 +148,10 @@ export async function getSingaporePublicHolidaySet(year) {
         return new Set();
       }
 
-      // If the year is still absent after a successful fetch, record the miss so
-      // we don't hammer the API on every subsequent reminder check.
-      if (!publicHolidayCache.years.has(year)) {
+      // Only record a miss when the load completed without any dataset errors.
+      // If a per-dataset fetch failed, the year might still be available — don't
+      // suppress retries for 24 hours based on a transient partial failure.
+      if (!publicHolidayCache.years.has(year) && !publicHolidayCache.lastLoadHadErrors) {
         publicHolidayCache.missTimestamps.set(year, new Date().toISOString());
       }
     }

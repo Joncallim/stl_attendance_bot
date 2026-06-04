@@ -5,7 +5,10 @@ import { appendJsonLine, appendJsonLines, readJsonLines, runSerialized, writeJso
 const QUEUE_MUTEX_KEY = "attendance-queue";
 const ATTENDANCE_QUEUE_FILE = () => getDataFile("attendance-queue.ndjson");
 // After this many consecutive flush failures an event is marked failed_permanent
-// and will no longer be retried. At the 15-minute max retry gap this is ~5 hours.
+// and will no longer be retried. The retry delay formula caps at 15 minutes
+// (exponent clamped at 10, giving 2^10 ≈ 17 min → capped to 15 min). After the
+// backoff saturates (~retry 10, ~34 min total), each further retry adds ~15 min.
+// 20 retries gives roughly 3 hours of coverage during a Sheets outage.
 const MAX_RETRY_COUNT = 20;
 let cachedQueueState = null;
 let cachedQueueFilePath = null;
@@ -419,7 +422,7 @@ export async function flushAttendanceQueue(writeEntries) {
           }
         } else {
           const nextRetryAt = new Date(
-            Date.now() + Math.min(15 * 60 * 1000, 1000 * (2 ** Math.min(nextRetryCount, 5))) + Math.floor(Math.random() * 250)
+            Date.now() + Math.min(15 * 60 * 1000, 1000 * (2 ** Math.min(nextRetryCount, 10))) + Math.floor(Math.random() * 250)
           ).toISOString();
           const record = {
             kind: "attendance_flush_failed",
