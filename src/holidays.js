@@ -134,6 +134,13 @@ export async function loadSingaporePublicHolidayCache() {
   await publicHolidayCache.loadingPromise;
 }
 
+export function __resetPublicHolidayCacheForTesting() {
+  publicHolidayCache.years.clear();
+  publicHolidayCache.loadingPromise = null;
+  publicHolidayCache.missTimestamps.clear();
+  publicHolidayCache.lastLoadHadErrors = false;
+}
+
 export async function getSingaporePublicHolidaySet(year) {
   if (!publicHolidayCache.years.has(year)) {
     const lastMiss = publicHolidayCache.missTimestamps.get(year);

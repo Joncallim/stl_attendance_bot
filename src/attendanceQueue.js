@@ -396,7 +396,7 @@ export async function flushAttendanceQueue(writeEntries) {
       for (const event of pendingEvents) {
         const nextRetryCount = Number(event.retryCount ?? 0) + 1;
 
-        if (nextRetryCount > MAX_RETRY_COUNT) {
+        if (nextRetryCount >= MAX_RETRY_COUNT) {
           console.error(
             `[Queue] Event ${event.id} permanently failed after ${nextRetryCount - 1} attempts ` +
             `(appointment=${event.appointment} date=${event.date}): ${error.message}`

@@ -65,6 +65,7 @@ import {
 import { createSyncManager } from "./syncManager.js";
 import { runSerialized } from "./fileStore.js";
 import { applyStoredConfigOverrides } from "./config.js";
+import { allSettledConcurrent, TELEGRAM_SEND_CONCURRENCY, TELEGRAM_SEND_INTERVAL_MS } from "./concurrency.js";
 import {
   applyWeeklyAttendanceSelection,
   createWeeklyFlowState,
@@ -98,36 +99,6 @@ const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
 // Telegram allows ~30 messages/second per bot. Cap concurrent reminder sends
 // and enforce a minimum gap between successive send starts to stay safely
 // within quota and avoid silent 429 delivery failures.
-const TELEGRAM_SEND_CONCURRENCY = 25;
-// Minimum gap between successive send starts: 1000ms / 25 sends = 40ms.
-// This caps throughput at ~25 sends/sec regardless of how fast individual
-// sends complete — a pure concurrency cap is not enough because fast RTTs
-// can drain the pool and restart sends faster than 30/sec.
-const TELEGRAM_SEND_INTERVAL_MS = 40;
-
-// Runs async factory functions with at most `concurrency` in-flight at once,
-// staggering each send start by TELEGRAM_SEND_INTERVAL_MS to enforce a
-// per-second rate cap. Returns a Promise.allSettled-compatible result array.
-async function allSettledConcurrent(fns, concurrency) {
-  if (fns.length === 0) return [];
-  const results = new Array(fns.length);
-  let next = 0;
-  let nextAllowedAt = 0;
-  const workers = Array.from({ length: Math.min(concurrency, fns.length) }, async () => {
-    while (next < fns.length) {
-      const i = next++;
-      // Synchronously compute and reserve this send's time slot before any await.
-      // JS is single-threaded so no other worker runs between these lines.
-      const now = Date.now();
-      const delay = Math.max(0, nextAllowedAt - now);
-      nextAllowedAt = Math.max(now, nextAllowedAt) + TELEGRAM_SEND_INTERVAL_MS;
-      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-      results[i] = await Promise.allSettled([fns[i]()]).then(([r]) => r);
-    }
-  });
-  await Promise.allSettled(workers);
-  return results;
-}
 const DEPARTMENT_MEMBER_PAGE_SIZE = 6;
 const DEPARTMENT_WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 const ATTENDANCE_OPTION_DISPLAY_ORDER = [
@@ -6274,5 +6245,8 @@ export const __testing = {
   resetSelfHealGuard() { lastSelfHealAt = 0; },
   selfHealLog,
   buildSelfHealLogsText,
-  buildSelfHealLogsMenu
+  buildSelfHealLogsMenu,
+  allSettledConcurrent,
+  TELEGRAM_SEND_INTERVAL_MS,
+  TELEGRAM_SEND_CONCURRENCY
 };
