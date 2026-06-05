@@ -65,6 +65,7 @@ import {
 import { createSyncManager } from "./syncManager.js";
 import { runSerialized } from "./fileStore.js";
 import { applyStoredConfigOverrides } from "./config.js";
+import { allSettledConcurrent, TELEGRAM_SEND_CONCURRENCY, TELEGRAM_SEND_INTERVAL_MS } from "./concurrency.js";
 import {
   applyWeeklyAttendanceSelection,
   createWeeklyFlowState,
@@ -95,6 +96,9 @@ function logBotError(message, details = null) {
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
+// Telegram allows ~30 messages/second per bot. Cap concurrent reminder sends
+// and enforce a minimum gap between successive send starts to stay safely
+// within quota and avoid silent 429 delivery failures.
 const DEPARTMENT_MEMBER_PAGE_SIZE = 6;
 const DEPARTMENT_WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 const ATTENDANCE_OPTION_DISPLAY_ORDER = [
@@ -619,10 +623,14 @@ function buildHomeMenu(isAdminUser, timezone) {
   buttons.push(
     Markup.button.callback("⚠️ Deregister", "home:deregister"),
     Markup.button.callback("📊 Summary", "home:summary"),
-    Markup.button.callback("❓ Help", "home:help"),
-    Markup.button.callback("🐛 Report Issue", "home:reportissue"),
-    Markup.button.callback("❌ Close", "home:close")
+    Markup.button.callback("❓ Help", "home:help")
   );
+
+  if (process.env.GITHUB_TOKEN) {
+    buttons.push(Markup.button.callback("🐛 Report Issue", "home:reportissue"));
+  }
+
+  buttons.push(Markup.button.callback("❌ Close", "home:close"));
 
   const rows = [];
 
@@ -2578,7 +2586,9 @@ async function syncRosterState(sheets, config) {
     .filter((entry) => entry.boundChatId)
     .map((entry) => entry.appointment);
 
-  const roster = await syncOnboardingRoster(sheets, config, { boundAppointmentsToRestore });
+  // forceMetadata: true busts the 45-minute process-level spreadsheet metadata
+  // cache so that externally renamed or added sheets are picked up immediately.
+  const roster = await syncOnboardingRoster(sheets, config, { boundAppointmentsToRestore, forceMetadata: true });
 
   if (roster.driftDetected) {
     return roster;
@@ -2682,6 +2692,7 @@ async function refreshAdminCache(cache, config) {
   cache.transferToCandidates = transferToCandidates;
 
   cache.inviteCandidates = sortAppointmentsForAdmin(cache.inviteCandidates, config);
+  cache.deregisterCandidates = sortAppointmentsForAdmin(cache.deregisterCandidates, config);
   cache.removeAppointmentCandidates = sortAppointmentsForAdmin(cache.removeAppointmentCandidates, config);
   cache.addAdminCandidates = sortAppointmentsForAdmin(cache.addAdminCandidates, config);
   cache.removeAdminCandidates = sortAppointmentsForAdmin(cache.removeAdminCandidates, config);
@@ -3269,8 +3280,9 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       return;
     }
 
-    const promptResults = await Promise.allSettled(
-      users.map((user) => buildAndSendAttendancePrompt(bot, config, user, cache))
+    const promptResults = await allSettledConcurrent(
+      users.map((user) => () => buildAndSendAttendancePrompt(bot, config, user, cache)),
+      TELEGRAM_SEND_CONCURRENCY
     );
     const sent = promptResults.filter((r) => r.status === "fulfilled").length;
 
@@ -3970,12 +3982,16 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
   const status = await deps.getAttendanceQueueStatus();
 
   if (status.queueDepth === 0) {
-    const conflictNote = status.conflictedCount > 0
-      ? `\n\n⚠️ ${status.conflictedCount} conflicted ${status.conflictedCount === 1 ? "entry" : "entries"} cannot be pushed until a Sync Roster is run to fix the sheet layout.`
-      : "";
+    const notes = [];
+    if (status.conflictedCount > 0) {
+      notes.push(`⚠️ ${status.conflictedCount} conflicted ${status.conflictedCount === 1 ? "entry" : "entries"} cannot be pushed until a Sync Roster is run to fix the sheet layout.`);
+    }
+    if (status.permanentlyFailedCount > 0) {
+      notes.push(`❌ ${status.permanentlyFailedCount} attendance ${status.permanentlyFailedCount === 1 ? "entry" : "entries"} permanently failed after exhausting retries and cannot be recovered automatically. Check the logs for details.`);
+    }
     await deps.sendOrUpdateAdminMessage(
       ctx,
-      `✅ No pending attendance entries to push.${conflictNote}`,
+      `✅ No pending attendance entries to push.${notes.length > 0 ? `\n\n${notes.join("\n\n")}` : ""}`,
       adminBackMenu
     );
     return;
@@ -4052,8 +4068,9 @@ async function handleQueueStatusAdminAction(ctx, deps) {
 
   const pendingCount = status.queueDepth;
   const conflictedCount = status.conflictedCount;
+  const permanentlyFailedCount = status.permanentlyFailedCount ?? 0;
 
-  if (pendingCount === 0 && conflictedCount === 0) {
+  if (pendingCount === 0 && conflictedCount === 0 && permanentlyFailedCount === 0) {
     await deps.sendOrUpdateAdminMessage(
       ctx,
       "✅ No outstanding attendance entries — the queue is empty.",
@@ -4087,6 +4104,13 @@ async function handleQueueStatusAdminAction(ctx, deps) {
     if (lines.length > 0) lines.push("");
     lines.push(
       `⚠️ ${conflictedCount} conflicted ${conflictedCount === 1 ? "entry" : "entries"} — run 🔄 Sync Roster to fix the sheet layout, then push again.`
+    );
+  }
+
+  if (permanentlyFailedCount > 0) {
+    if (lines.length > 0) lines.push("");
+    lines.push(
+      `❌ ${permanentlyFailedCount} permanently failed ${permanentlyFailedCount === 1 ? "entry" : "entries"} — exhausted all retries and cannot be recovered automatically. Check the bot logs for details.`
     );
   }
 
@@ -4325,8 +4349,9 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
           return hasUnfilledAttendance(adminCache, config, user.appointment, now);
         });
 
-        const promptResults = await Promise.allSettled(
-          users.map((user) => buildAndSendAttendancePromptFn(bot, config, user, adminCache))
+        const promptResults = await allSettledConcurrent(
+          users.map((user) => () => buildAndSendAttendancePromptFn(bot, config, user, adminCache)),
+          TELEGRAM_SEND_CONCURRENCY
         );
 
         const promptedAt = new Date().toISOString();
@@ -4527,6 +4552,7 @@ export function createAttendanceBot(config) {
         `Five-minute reconcile: ${formatSyncStatusTimestamp(syncStatus.lastFiveMinuteReconcileAt, config.timezone)}`,
         `Queue depth: ${queueStatus.queueDepth}`,
         `Conflicted writes: ${queueStatus.conflictedCount}`,
+        `Permanently failed: ${queueStatus.permanentlyFailedCount}`,
         `Next retry: ${queueStatus.nextRetryAt ? formatSyncStatusTimestamp(queueStatus.nextRetryAt, config.timezone) : "No retry scheduled"}`,
         preloadStatus
       ].join("\n")
@@ -4713,8 +4739,19 @@ export function createAttendanceBot(config) {
       ctx.session.awaitingSecretCode || storedUser?.awaitingSecretCode === true;
     const awaitingAttendance =
       ctx.session.awaitingAttendance || storedUser?.awaitingAttendance === true;
-    const awaitingWeeklyAttendance =
+    let awaitingWeeklyAttendance =
       ctx.session.awaitingWeeklyAttendance || storedUser?.awaitingWeeklyAttendance === true;
+
+    // Auto-recover from post-restart inconsistency: the flag was persisted but the
+    // weekly flow arrays (held only in the in-memory session) were lost. Reset both
+    // states so the user doesn't appear stuck until they manually /cancel.
+    if (awaitingWeeklyAttendance) {
+      const hasFlowDates = (ctx.session.weeklyAttendanceDates?.length ?? 0) > 0;
+      if (!hasFlowDates) {
+        await clearWeeklyAttendanceState(ctx);
+        awaitingWeeklyAttendance = false;
+      }
+    }
     const awaitingAttendanceOptionAdd = ctx.session.awaitingAttendanceOptionAdd === true;
     const awaitingAppointmentAdd = ctx.session.awaitingAppointmentAdd === true;
     const awaitingIssueReport = ctx.session.awaitingIssueReport === true;
@@ -6208,5 +6245,8 @@ export const __testing = {
   resetSelfHealGuard() { lastSelfHealAt = 0; },
   selfHealLog,
   buildSelfHealLogsText,
-  buildSelfHealLogsMenu
+  buildSelfHealLogsMenu,
+  allSettledConcurrent,
+  TELEGRAM_SEND_INTERVAL_MS,
+  TELEGRAM_SEND_CONCURRENCY
 };

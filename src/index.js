@@ -36,6 +36,13 @@ async function main() {
   logStartup(`Config ready. timezone=${config.timezone} | onboarding=${config.onboardingSheetTitle}`);
 
   // 4. Bot instance and Telegram long-polling.
+  if (process.env.GOOGLE_SHEETS_VERIFY_WRITES === "true") {
+    logStartup(
+      "WARNING: GOOGLE_SHEETS_VERIFY_WRITES is enabled — each write costs 2 API quota slots. " +
+      "Disable in production to stay within the 60 req/min limit."
+    );
+  }
+
   logStartup(`Creating bot instance (${BOT_VERSION})…`);
   const bot = createAttendanceBot(config);
 

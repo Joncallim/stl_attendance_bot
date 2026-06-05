@@ -353,6 +353,7 @@ npm test
 - `ONBOARDING_SHEET_TITLE`
 - `LOG_FILE_PATH`
 - `SETTINGS_FILE_PATH`
+- `GITHUB_TOKEN`
 
 ### Notes
 
@@ -361,6 +362,7 @@ npm test
 - `ONBOARDING_SHEET_TITLE` defaults to `ONBOARDING`.
 - `SETTINGS_FILE_PATH` defaults to `./settings.yaml`.
 - `ROSTER_STOP_MARKERS` is still present in config, but the bot now uses `ONBOARDING` as the canonical roster source and does not rely on `Remarks`.
+- `GITHUB_TOKEN` is a GitHub Personal Access Token with `repo` scope. When set, users can submit bug reports from the bot via the "🐛 Report Issue" button. The button is hidden when this variable is not configured.
 
 ## Google Setup
 

@@ -3582,7 +3582,7 @@ export function createGoogleSheetsClient(config) {
 export async function syncOnboardingRoster(sheets, config, options = {}) {
   const cache = options.cache ?? (await readLocalSheetCache());
   const title = config.onboardingSheetTitle;
-  await ensureSheet(sheets, config.spreadsheetId, title, { cache });
+  await ensureSheet(sheets, config.spreadsheetId, title, { cache, forceMetadata: options.forceMetadata === true });
   await ensureHeaderRowIfBlank(
     sheets,
     config.spreadsheetId,
