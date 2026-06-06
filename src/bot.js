@@ -4373,13 +4373,13 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   }
 }
 
-export function createAttendanceBot(config) {
+export async function createAttendanceBot(config) {
   const bot = new Telegraf(config.telegramBotToken, {
     telegram: {
       agent: ipv4HttpsAgent
     }
   });
-  const sheets = createGoogleSheetsClient(config);
+  const sheets = await createGoogleSheetsClient(config);
   const adminCache = createAdminCache();
   adminCache.syncManager = createSyncManager({
     // Do NOT pass force:true — that triggers a forced spreadsheets.get (metadata) on every
@@ -4758,10 +4758,11 @@ export function createAttendanceBot(config) {
     const awaitingSpreadsheetIdChange = ctx.session.awaitingSpreadsheetIdChange === true;
 
     if (awaitingIssueReport) {
-      ctx.session.awaitingIssueReport = false;
       const description = message.trim();
 
       if (!description) {
+        // Keep awaitingIssueReport=true so the user can try again without
+        // clicking the button again.
         await sendOrUpdateAdminMessage(
           ctx,
           "Issue description cannot be empty. Please try again.",
@@ -4773,6 +4774,7 @@ export function createAttendanceBot(config) {
         return;
       }
 
+      ctx.session.awaitingIssueReport = false;
       const username = ctx.from?.username ? `@${ctx.from.username}` : ctx.from?.first_name ?? "Unknown";
       const titleText = description.length > 60 ? `${description.slice(0, 57)}…` : description;
       const issueTitle = `[User Report] ${titleText}`;
