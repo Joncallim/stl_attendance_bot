@@ -44,7 +44,7 @@ async function main() {
   }
 
   logStartup(`Creating bot instance (${BOT_VERSION})…`);
-  const bot = createAttendanceBot(config);
+  const bot = await createAttendanceBot(config);
 
   logStartup("Launching Telegram bot (connecting to Telegram API)…");
   await bot.launch();

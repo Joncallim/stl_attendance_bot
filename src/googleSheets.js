@@ -1,4 +1,3 @@
-import { google } from "googleapis";
 import { getDataFile } from "./dataDir.js";
 import {
   readJsonFile as readJsonFileFromStore,
@@ -1888,10 +1887,31 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
     }
   }
 
-  if (parsed.stopRowNumber) {
+  // Clear the stop marker from its pre-operation position when rowDelta <= 0:
+  //   rowDelta < 0: deleteDimension shifts the marker up; old row is now
+  //                 in the unmanaged area and may hold stale content.
+  //   rowDelta = 0: no structural change; the bot intentionally clears the
+  //                 "legacy remarks boundary" text so future parses don't
+  //                 mistake it for an appointment name (boundary is implicit).
+  // NOT cleared for rowDelta > 0: insertDimension already placed a blank row
+  // at the old position, which the data loop has since filled with the new
+  // appointment — clearing it would wipe that newly written row.
+  if (parsed.stopRowNumber && rowDelta <= 0) {
     data.push({
       range: `'${title}'!A${parsed.stopRowNumber}:B${parsed.stopRowNumber}`,
       values: [["", ""]]
+    });
+  }
+
+  // When no stop marker exists and the caller provided one, write it at the
+  // row immediately after the last appointment (accounting for any rowDelta).
+  // boundaryRowNumber is always set to managedRows.length+2 as fallback when
+  // stopMarkerMissing is true, so boundaryRowNumber+rowDelta == nextCount+2.
+  if (parsed.stopMarkerMissing && stopMarkers.length > 0) {
+    const stopMarkerRow = boundaryRowNumber + rowDelta;
+    data.push({
+      range: `'${title}'!A${stopMarkerRow}:B${stopMarkerRow}`,
+      values: [[stopMarkers[0], ""]]
     });
   }
 
@@ -3569,7 +3589,8 @@ function getRecentMonthTitles(baseDate, timezone, count) {
   return titles;
 }
 
-export function createGoogleSheetsClient(config) {
+export async function createGoogleSheetsClient(config) {
+  const { google } = await import("googleapis");
   const auth = new google.auth.JWT({
     email: config.googleServiceAccountEmail,
     key: config.googlePrivateKey,
