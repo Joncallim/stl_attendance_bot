@@ -3629,29 +3629,17 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
       force: true,
       persist: false
     });
-  } else if (onboardingSlice.stopMarkerMissing) {
-    // Sort before writing the stop-marker fix so only ONE write is needed.
-    // Writing unsorted then sorting separately causes two batchUpdate calls,
-    // doubling the quota usage and timeout risk.
-    const sortedForStopMarker = orderAppointmentsCanonically(onboardingSlice.appointments);
-    await writeAppointmentColumn(
-      sheets,
-      config.spreadsheetId,
-      title,
-      sortedForStopMarker,
-      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
-    );
-    onboardingSlice = await refreshOnboardingSlice(sheets, config, {
-      cache,
-      force: true,
-      persist: false
-    });
   }
-  // Pre-Step 1: Physically delete any blank rows from the ONBOARDING sheet.
-  // Blank rows cause hasBlankRowDrift=true which triggers the driftDetected early
-  // return at the end of Step 1, preventing month-sheet updates.  writeOnboardingRows
-  // does not delete rows — it compares by sequential index — so we must use
-  // deleteDimension requests to remove them before reconciliation.
+  // Pre-Step 1: Physically delete any blank rows from the ONBOARDING sheet BEFORE
+  // any structural repair (e.g. writing a missing stop marker).  Blank rows cause
+  // hasBlankRowDrift=true, which shifts boundaryRowNumber to a fallback value that
+  // may land on a real appointment row — writing the stop marker there would silently
+  // destroy that entry.  Deleting blanks first lets parseOnboardingManagedRows compute
+  // a correct boundaryRowNumber, so the stop-marker write below targets the right row.
+  // Blank rows also trigger the driftDetected early-return at the end of Step 1,
+  // preventing month-sheet updates, so they must be removed before reconciliation.
+  // writeOnboardingRows does not delete rows (it compares by sequential index), so we
+  // must use deleteDimension requests here.
   if (onboardingSlice.hasBlankRowDrift && (onboardingSlice.blankRowNumbers?.length ?? 0) > 0) {
     const { sheetId: onboardingSheetId, blankRowNumbers } = onboardingSlice;
     logSheetsSuccess(
@@ -3677,6 +3665,24 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
       )
     );
     onboardingSlice = await refreshOnboardingSlice(sheets, config, { cache, force: true, persist: false });
+  }
+  // After blank rows are gone, boundaryRowNumber is now reliable — safe to write the
+  // stop marker.  Sort before writing so only ONE write is needed (writing unsorted
+  // then sorting separately doubles quota usage and timeout risk).
+  if (onboardingSlice.appointments.length > 0 && onboardingSlice.stopMarkerMissing) {
+    const sortedForStopMarker = orderAppointmentsCanonically(onboardingSlice.appointments);
+    await writeAppointmentColumn(
+      sheets,
+      config.spreadsheetId,
+      title,
+      sortedForStopMarker,
+      { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
+    );
+    onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+      cache,
+      force: true,
+      persist: false
+    });
   }
 
   // Pre-Step 1b: Restore any bound appointments that were removed from the sheet
