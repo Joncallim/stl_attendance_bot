@@ -5049,7 +5049,17 @@ export async function createAttendanceBot(config) {
 
   bot.catch((error, ctx) => {
     logBotError("[Telegram] Unhandled bot error.", { error: error.message, stack: error.stack });
-    ctx.reply("Something went wrong while processing your request. Try again.");
+    // "query is too old" means the user's tap expired before we answered it (Telegram's
+    // ~90 s window).  The operation itself may have succeeded — don't send a spurious
+    // "something went wrong" that contradicts a success message the user may have already
+    // received or that will arrive shortly from an in-flight write.
+    if (
+      typeof error.message === "string" &&
+      error.message.includes("query is too old")
+    ) {
+      return;
+    }
+    ctx.reply("Something went wrong while processing your request. Try again.").catch(() => {});
   });
 
   bot.action(/home:(.+)/, async (ctx) => {
@@ -5338,6 +5348,8 @@ export async function createAttendanceBot(config) {
         return;
       }
 
+      await ctx.answerCbQuery("Attendance updated");
+
       const targetDate = new Date(target.date);
       await queueAttendanceSelection(
         adminCache,
@@ -5352,7 +5364,6 @@ export async function createAttendanceBot(config) {
         awaitingAttendance: false,
         lastSubmittedAt: new Date().toISOString()
       });
-      await ctx.answerCbQuery("Attendance updated");
       await renderDepartmentView(ctx, config, adminCache, user, {
         departmentKey: target.departmentKey,
         weekOffset: target.weekOffset,
@@ -5453,6 +5464,10 @@ export async function createAttendanceBot(config) {
         return;
       }
 
+      // Answer the callback query immediately so Telegram removes the loading
+      // spinner and doesn't expire the query_id while we do async work below.
+      await ctx.answerCbQuery("Attendance updated");
+
       const recordedAt = new Date();
       await queueAttendanceSelection(
         adminCache,
@@ -5482,8 +5497,6 @@ export async function createAttendanceBot(config) {
         awaitingAttendance: false,
         lastSubmittedAt: new Date().toISOString()
       });
-
-      await ctx.answerCbQuery("Attendance updated");
 
       await sendOrUpdateAdminMessage(
         ctx,
