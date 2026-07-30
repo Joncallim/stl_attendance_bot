@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { getDataFile } from "./dataDir.js";
 import { readJsonFile, runSerialized, writeJsonFile } from "./fileStore.js";
 
@@ -26,6 +26,44 @@ function normalizeCode(code) {
 
 function normalizeAppointmentName(value) {
   return String(value ?? "").trim().toUpperCase();
+}
+
+function isDeliberatelyRemoved(entry) {
+  return Boolean(entry?.removedByBotAt);
+}
+
+function invalidateRegistryIntegrity(registry) {
+  registry.integrity = null;
+}
+
+export function computeRosterChecksum(appointments) {
+  const canonicalAppointments = [...new Set(
+    (appointments ?? [])
+      .map(normalizeAppointmentName)
+      .filter(Boolean)
+  )].sort();
+
+  return createHash("sha256")
+    .update(canonicalAppointments.join("\n"))
+    .digest("hex");
+}
+
+function computeBindingChecksum(bindings) {
+  const canonicalBindings = [...new Set(
+    (bindings ?? [])
+      .map(({ appointment, chatId }) => {
+        const normalizedAppointment = normalizeAppointmentName(appointment);
+        const normalizedChatId = String(chatId ?? "").trim();
+        return normalizedAppointment && normalizedChatId
+          ? `${normalizedAppointment}:${normalizedChatId}`
+          : "";
+      })
+      .filter(Boolean)
+  )].sort();
+
+  return createHash("sha256")
+    .update(canonicalBindings.join("\n"))
+    .digest("hex");
 }
 
 function generateSecretCode(existingCodes) {
@@ -184,6 +222,47 @@ function withStorageMutation(operation) {
   return runSerialized(STORAGE_MUTEX_KEY, operation);
 }
 
+let pendingUserUpdateBatch = null;
+
+function createUserUpdateBatch() {
+  const requests = [];
+  const ready = new Promise((resolve) => setImmediate(resolve));
+  const flushPromise = withStorageMutation(async () => {
+    // One event-loop turn collects attendance submissions that arrived in the
+    // same Telegram update burst. The mutation is registered with the storage
+    // serializer immediately, preserving its order relative to other writes.
+    await ready;
+
+    if (pendingUserUpdateBatch?.requests === requests) {
+      pendingUserUpdateBatch = null;
+    }
+
+    const users = await readUsers();
+    const results = [];
+
+    for (const { chatId, patch } of requests) {
+      const index = usersByIdIndex?.get(String(chatId)) ?? -1;
+
+      if (index === -1) {
+        results.push(null);
+        continue;
+      }
+
+      users[index] = { ...users[index], ...patch };
+      results.push(users[index]);
+    }
+
+    if (requests.length > 0) {
+      await writeUsers(users);
+    }
+
+    return results;
+  });
+  const batch = { requests, flushPromise };
+  pendingUserUpdateBatch = batch;
+  return batch;
+}
+
 export async function upsertUser(user) {
   return withStorageMutation(async () => {
     const users = await readUsers();
@@ -211,18 +290,10 @@ export async function getUserByChatId(chatId) {
 }
 
 export async function updateUserByChatId(chatId, patch) {
-  return withStorageMutation(async () => {
-    const users = await readUsers();
-    const index = usersByIdIndex?.get(String(chatId)) ?? -1;
-
-    if (index === -1) {
-      return null;
-    }
-
-    users[index] = { ...users[index], ...patch };
-    await writeUsers(users);
-    return users[index];
-  });
+  const batch = pendingUserUpdateBatch ?? createUserUpdateBatch();
+  const resultIndex = batch.requests.push({ chatId, patch }) - 1;
+  const results = await batch.flushPromise;
+  return results[resultIndex] ?? null;
 }
 
 // Applies multiple patches in a single read-modify-write cycle. Use this
@@ -247,130 +318,328 @@ export async function batchUpdateUsersByChatId(patches) {
   });
 }
 
-export async function syncAppointmentRegistry(appointments) {
+export async function syncAppointmentRegistry(appointments = null) {
   return withStorageMutation(async () => {
     const registry = await readAppointmentRegistry();
     const users = await readUsers();
+    const now = new Date().toISOString();
+    const sheetWasProvided = Array.isArray(appointments);
+    const sheetAppointmentsByIdentity = new Map();
 
-    // Build a lookup of chatIds that are confirmed active in the users list
-    // AND whose appointment field matches some registry entry.  Used below to
-    // detect "orphaned" registry bindings where the user record has been
-    // removed or their appointment field was cleared.
-    const activeUserByChatId = new Map(
-      users
-        .filter((u) => u.chatId && u.appointment)
-        .map((u) => [String(u.chatId), normalizeAppointmentName(u.appointment)])
+    for (const value of appointments ?? []) {
+      const appointment = String(value ?? "").trim();
+      const identity = normalizeAppointmentName(appointment);
+
+      if (identity && !sheetAppointmentsByIdentity.has(identity)) {
+        sheetAppointmentsByIdentity.set(identity, appointment);
+      }
+    }
+
+    const existingByIdentity = new Map();
+
+    for (const entry of registry.appointments ?? []) {
+      const identity = normalizeAppointmentName(entry.appointment);
+
+      if (identity && !existingByIdentity.has(identity)) {
+        existingByIdentity.set(identity, entry);
+      }
+    }
+
+    const deliberatelyRemovedIdentities = new Set(
+      [...existingByIdentity.entries()]
+        .filter(([, entry]) => isDeliberatelyRemoved(entry))
+        .map(([identity]) => identity)
     );
+    const activeIdentities = new Set();
 
-    const uniqueAppointments = [...new Set(
-      appointments.map((value) => value.trim()).filter(Boolean)
-    )];
-    const currentSet = new Set(uniqueAppointments);
-    const currentNormalizedSet = new Set(uniqueAppointments.map(normalizeAppointmentName));
+    // The active roster is the union of Google ONBOARDING and the main local
+    // registry. A one-sided disappearance is treated as an interrupted write
+    // and repaired, never as permission to delete. Only a bot tombstone wins
+    // over this union.
+    for (const identity of sheetAppointmentsByIdentity.keys()) {
+      if (!deliberatelyRemovedIdentities.has(identity)) {
+        activeIdentities.add(identity);
+      }
+    }
+
+    for (const [identity, entry] of existingByIdentity) {
+      const recoverableLegacyBinding = !entry.active && entry.boundChatId && !isDeliberatelyRemoved(entry);
+
+      if ((entry.active || recoverableLegacyBinding) && !deliberatelyRemovedIdentities.has(identity)) {
+        activeIdentities.add(identity);
+      }
+    }
+
     const existingCodes = new Set(
-      registry.appointments.map((entry) => normalizeCode(entry.secretCode))
+      (registry.appointments ?? []).map((entry) => normalizeCode(entry.secretCode)).filter(Boolean)
     );
+    const orderedActiveIdentities = [
+      ...sheetAppointmentsByIdentity.keys(),
+      ...[...activeIdentities].filter((identity) => !sheetAppointmentsByIdentity.has(identity))
+    ].filter((identity, index, values) =>
+      activeIdentities.has(identity) && values.indexOf(identity) === index
+    );
+    const nextAppointments = orderedActiveIdentities.map((identity) => {
+      const existing = existingByIdentity.get(identity);
+      const appointment = sheetAppointmentsByIdentity.get(identity) ?? existing?.appointment ?? identity;
+      let secretCode = normalizeCode(existing?.secretCode);
 
-    const nextAppointments = uniqueAppointments.map((appointment) => {
-      const existing = registry.appointments.find((entry) => entry.appointment === appointment);
-
-      if (existing) {
-        // Detect orphaned binding: registry claims a user is bound but the
-        // users list has no matching active record for this appointment.
-        // This can happen after a partial data loss, manual file edit, or
-        // redeployment that reset the users store while the registry survived.
-        // → Clear the stale binding and issue a fresh code so the slot is
-        //   available again and the sheet no longer shows "IN-USE".
-        if (existing.boundChatId) {
-          const boundChatIdStr = String(existing.boundChatId);
-          const userAppointment = activeUserByChatId.get(boundChatIdStr);
-          const isOrphaned =
-            !userAppointment ||
-            userAppointment !== normalizeAppointmentName(existing.appointment);
-
-          if (isOrphaned) {
-            const secretCode = generateSecretCode(existingCodes);
-            existingCodes.add(secretCode);
-            logStorageSuccess(
-              `# Cleared orphaned binding and regenerated code. {"appointment":"${appointment}","staleBoundChatId":"${existing.boundChatId}"}`
-            );
-            return {
-              ...existing,
-              appointment,
-              secretCode,
-              boundChatId: null,
-              boundUserId: null,
-              boundUsername: null,
-              boundFullName: null,
-              boundAt: null,
-              active: true
-            };
-          }
-        }
-
-        // If the entry has a blank secret code (and is not bound to a user),
-        // generate a fresh code so the ONBOARDING sheet cell is never empty.
-        if (!existing.secretCode && !existing.boundChatId) {
-          const secretCode = generateSecretCode(existingCodes);
-          existingCodes.add(secretCode);
-          logStorageSuccess(`# Generated secret code for existing appointment with blank code. {"appointment":"${appointment}"}`);
-          return { ...existing, appointment, secretCode, active: true };
-        }
-        return {
-          ...existing,
-          appointment,
-          active: true
-        };
+      if (!secretCode) {
+        secretCode = generateSecretCode(existingCodes);
+        existingCodes.add(secretCode);
       }
 
-      const secretCode = generateSecretCode(existingCodes);
-      existingCodes.add(secretCode);
-
       return {
+        ...existing,
         appointment,
         secretCode,
         active: true,
-        boundChatId: null,
-        boundUserId: null,
-        boundUsername: null,
-        boundFullName: null,
-        boundAt: null
+        boundChatId: existing?.boundChatId ?? null,
+        boundUserId: existing?.boundUserId ?? null,
+        boundUsername: existing?.boundUsername ?? null,
+        boundFullName: existing?.boundFullName ?? null,
+        boundAt: existing?.boundAt ?? null,
+        removedByBotAt: null,
+        removalReason: null
       };
     });
 
-    // Rule 1: bound entries not in the sheet are kept (active:false) so
-    // syncRosterState can restore them to the sheet on the next sync.
-    // Rule 2: unbound entries not in the sheet are pruned from the JSON entirely —
-    // they are stale slots that serve no purpose and only create noise.
-    const droppedUnbound = registry.appointments.filter(
-      (entry) => !currentSet.has(entry.appointment) && !entry.boundChatId
+    const tombstones = [...existingByIdentity.entries()]
+      .filter(([identity, entry]) =>
+        deliberatelyRemovedIdentities.has(identity) && !activeIdentities.has(identity) && isDeliberatelyRemoved(entry)
+      )
+      .map(([, entry]) => ({ ...entry, active: false }));
+    const legacyInactiveAppointments = [...existingByIdentity.entries()]
+      .filter(([identity, entry]) =>
+        !activeIdentities.has(identity) && !isDeliberatelyRemoved(entry)
+      )
+      .map(([, entry]) => ({ ...entry, active: false }));
+    const nextByIdentity = new Map(
+      nextAppointments.map((entry) => [normalizeAppointmentName(entry.appointment), entry])
     );
-    if (droppedUnbound.length > 0) {
-      logStorageSuccess(
-        `# Pruned ${droppedUnbound.length} unbound appointment(s) not in sheet: ${droppedUnbound.map((e) => e.appointment).join(", ")}`
-      );
+    const nextUsers = users.map((user) => ({ ...user }));
+    const userIndexByChatId = new Map(
+      nextUsers.map((user, index) => [String(user.chatId), index])
+    );
+    const userCandidatesByAppointment = new Map();
+    const bindingConflicts = [];
+    const repairedUserBindings = [];
+    const repairedRegistryBindings = [];
+    const clearedUserBindings = [];
+
+    for (const user of nextUsers) {
+      const identity = normalizeAppointmentName(user.appointment);
+
+      if (!identity) {
+        continue;
+      }
+
+      if (!activeIdentities.has(identity)) {
+        Object.assign(user, clearUserBindingFields(user));
+        clearedUserBindings.push(String(user.chatId));
+        continue;
+      }
+
+      if (!userCandidatesByAppointment.has(identity)) {
+        userCandidatesByAppointment.set(identity, []);
+      }
+      userCandidatesByAppointment.get(identity).push(user);
     }
 
-    const inactiveAppointments = registry.appointments
-      .filter((entry) => !currentSet.has(entry.appointment) && entry.boundChatId)
-      .map((entry) => ({
-        ...entry,
-        active: false
-      }));
+    const registryAppointmentsByChatId = new Map();
+
+    for (const entry of nextAppointments) {
+      if (!entry.boundChatId) {
+        continue;
+      }
+
+      const chatId = String(entry.boundChatId);
+      const existingAppointment = registryAppointmentsByChatId.get(chatId);
+
+      if (existingAppointment && existingAppointment !== entry.appointment) {
+        bindingConflicts.push({
+          reason: "registry_chat_bound_twice",
+          chatId,
+          appointments: [existingAppointment, entry.appointment]
+        });
+        continue;
+      }
+      registryAppointmentsByChatId.set(chatId, entry.appointment);
+
+      const userIndex = userIndexByChatId.get(chatId);
+
+      if (userIndex === undefined) {
+        const recoveredUser = {
+          chatId,
+          userId: entry.boundUserId ? String(entry.boundUserId) : "",
+          username: entry.boundUsername ?? "",
+          firstName: "",
+          lastName: "",
+          fullName: entry.boundFullName ?? "",
+          appointment: entry.appointment,
+          onboardingSecretCode: entry.secretCode,
+          onboardingCompletedAt: entry.boundAt ?? now,
+          awaitingAttendance: false,
+          awaitingSecretCode: false,
+          awaitingWeeklyAttendance: false,
+          weeklyAttendanceDates: [],
+          weeklyAttendanceIndex: 0,
+          weeklyAttendanceResults: [],
+          weeklyAttendanceEntries: [],
+          recoveredFromRegistryAt: now,
+          updatedAt: now
+        };
+        userIndexByChatId.set(chatId, nextUsers.length);
+        nextUsers.push(recoveredUser);
+        repairedUserBindings.push(chatId);
+        continue;
+      }
+
+      const user = nextUsers[userIndex];
+      const userIdentity = normalizeAppointmentName(user.appointment);
+      const entryIdentity = normalizeAppointmentName(entry.appointment);
+
+      if (userIdentity && userIdentity !== entryIdentity) {
+        bindingConflicts.push({
+          reason: "chat_appointment_mismatch",
+          chatId,
+          registryAppointment: entry.appointment,
+          userAppointment: user.appointment
+        });
+        continue;
+      }
+
+      if (!userIdentity || user.appointment !== entry.appointment) {
+        Object.assign(user, {
+          appointment: entry.appointment,
+          onboardingSecretCode: entry.secretCode,
+          onboardingCompletedAt: user.onboardingCompletedAt ?? entry.boundAt ?? now,
+          awaitingSecretCode: false,
+          repairedFromRegistryAt: now,
+          updatedAt: now
+        });
+        repairedUserBindings.push(chatId);
+      }
+    }
+
+    for (const [identity, candidates] of userCandidatesByAppointment) {
+      const entry = nextByIdentity.get(identity);
+
+      if (!entry || entry.boundChatId) {
+        if (entry?.boundChatId) {
+          const boundChatId = String(entry.boundChatId);
+          for (const candidate of candidates) {
+            if (String(candidate.chatId) !== boundChatId) {
+              bindingConflicts.push({
+                reason: "appointment_claimed_by_multiple_users",
+                appointment: entry.appointment,
+                registryChatId: boundChatId,
+                userChatId: String(candidate.chatId)
+              });
+            }
+          }
+        }
+        continue;
+      }
+
+      if (candidates.length !== 1) {
+        bindingConflicts.push({
+          reason: "appointment_claimed_by_multiple_users",
+          appointment: entry.appointment,
+          userChatIds: candidates.map((user) => String(user.chatId))
+        });
+        continue;
+      }
+
+      const user = candidates[0];
+      const chatId = String(user.chatId);
+      const otherAppointment = registryAppointmentsByChatId.get(chatId);
+
+      if (otherAppointment && normalizeAppointmentName(otherAppointment) !== identity) {
+        bindingConflicts.push({
+          reason: "user_chat_bound_to_different_registry_appointment",
+          chatId,
+          registryAppointment: otherAppointment,
+          userAppointment: user.appointment
+        });
+        continue;
+      }
+
+      Object.assign(entry, {
+        boundChatId: chatId,
+        boundUserId: user.userId ? String(user.userId) : null,
+        boundUsername: user.username ?? "",
+        boundFullName: user.fullName ?? "",
+        boundAt: user.onboardingCompletedAt ?? user.updatedAt ?? now
+      });
+      registryAppointmentsByChatId.set(chatId, entry.appointment);
+      repairedRegistryBindings.push(chatId);
+    }
+
+    const activeAppointmentNames = nextAppointments.map((entry) => entry.appointment);
+    const sheetAppointmentNames = [...sheetAppointmentsByIdentity.values()];
+    const checksum = computeRosterChecksum(activeAppointmentNames);
+    const sheetChecksum = sheetWasProvided ? computeRosterChecksum(sheetAppointmentNames) : null;
+    const registryBindingChecksum = computeBindingChecksum(
+      nextAppointments
+        .filter((entry) => entry.boundChatId)
+        .map((entry) => ({ appointment: entry.appointment, chatId: entry.boundChatId }))
+    );
+    const userBindingChecksum = computeBindingChecksum(
+      nextUsers
+        .filter((user) => user.appointment)
+        .map((user) => ({ appointment: user.appointment, chatId: user.chatId }))
+    );
 
     const nextRegistry = {
-      updatedAt: new Date().toISOString(),
-      appointments: [...nextAppointments, ...inactiveAppointments],
+      ...registry,
+      updatedAt: now,
+      appointments: [...nextAppointments, ...tombstones, ...legacyInactiveAppointments],
       adminAppointments: pruneUnboundAdminAppointments({
         ...registry,
-        appointments: [...nextAppointments, ...inactiveAppointments],
-        adminAppointments: (registry.adminAppointments ?? []).filter((appointment) =>
-          currentNormalizedSet.has(normalizeAppointmentName(appointment))
-        )
-      })
+        appointments: nextAppointments,
+        adminAppointments: registry.adminAppointments ?? []
+      }),
+      integrity: {
+        version: 1,
+        checkedAt: now,
+        checksum,
+        sheetChecksum,
+        registryChecksum: checksum,
+        registryBindingChecksum,
+        userBindingChecksum,
+        rosterConsistent: sheetChecksum === null ? null : sheetChecksum === checksum,
+        bindingsConsistent:
+          registryBindingChecksum === userBindingChecksum && bindingConflicts.length === 0,
+        sheetCount: sheetWasProvided ? sheetAppointmentNames.length : null,
+        registryCount: activeAppointmentNames.length,
+        repairedUserBindings,
+        repairedRegistryBindings,
+        clearedUserBindings,
+        conflicts: bindingConflicts
+      }
     };
 
     await writeAppointmentRegistry(nextRegistry);
+
+    if (
+      repairedUserBindings.length > 0 ||
+      clearedUserBindings.length > 0 ||
+      nextUsers.length !== users.length ||
+      repairedRegistryBindings.length > 0
+    ) {
+      await writeUsers(nextUsers);
+    }
+
+    logStorageSuccess("# Roster integrity checksum completed.", {
+      checksum,
+      rosterConsistent: nextRegistry.integrity.rosterConsistent,
+      bindingsConsistent: nextRegistry.integrity.bindingsConsistent,
+      repairedUserBindings: repairedUserBindings.length,
+      repairedRegistryBindings: repairedRegistryBindings.length,
+      clearedUserBindings: clearedUserBindings.length,
+      conflicts: bindingConflicts.length
+    });
     return nextRegistry;
   });
 }
@@ -403,6 +672,8 @@ export async function addAppointmentToRegistry(appointment) {
             appointment: normalizedAppointment,
             secretCode,
             active: true,
+            removedByBotAt: null,
+            removalReason: null,
             boundChatId: null,
             boundUserId: null,
             boundUsername: null,
@@ -418,6 +689,8 @@ export async function addAppointmentToRegistry(appointment) {
           appointment: normalizedAppointment,
           secretCode,
           active: true,
+          removedByBotAt: null,
+          removalReason: null,
           boundChatId: null,
           boundUserId: null,
           boundUsername: null,
@@ -428,6 +701,7 @@ export async function addAppointmentToRegistry(appointment) {
     }
 
     registry.updatedAt = new Date().toISOString();
+    invalidateRegistryIntegrity(registry);
     await writeAppointmentRegistry(registry);
     logStorageSuccess("Generated secret code for new appointment.", {
       appointment: normalizedAppointment
@@ -445,11 +719,14 @@ export async function removeAppointmentFromRegistry(appointment) {
       return { ok: false, reason: "appointment_not_found" };
     }
 
+    const removedAt = new Date().toISOString();
     registry.appointments = registry.appointments.map((entry) =>
       normalizeAppointmentName(entry.appointment) === normalizeAppointmentName(target.appointment)
         ? {
           ...entry,
           active: false,
+          removedByBotAt: removedAt,
+          removalReason: "bot",
           boundChatId: null,
           boundUserId: null,
           boundUsername: null,
@@ -459,7 +736,8 @@ export async function removeAppointmentFromRegistry(appointment) {
         : entry
     );
     registry.adminAppointments = pruneUnboundAdminAppointments(registry);
-    registry.updatedAt = new Date().toISOString();
+    registry.updatedAt = removedAt;
+    invalidateRegistryIntegrity(registry);
     await writeAppointmentRegistry(registry);
 
     const users = await readUsers();
@@ -632,6 +910,7 @@ export async function removeAdminAppointment(appointment, defaultAdminAppointmen
     registry.adminAppointments = after;
     registry.adminAppointments = pruneUnboundAdminAppointments(registry);
     registry.updatedAt = new Date().toISOString();
+    invalidateRegistryIntegrity(registry);
     await writeAppointmentRegistry(registry);
     return { ok: true, appointment: target?.appointment ?? appointment.trim() };
   });
@@ -675,11 +954,12 @@ export async function deregisterAppointmentBinding(appointment) {
     );
     registry.adminAppointments = pruneUnboundAdminAppointments(registry);
     registry.updatedAt = new Date().toISOString();
+    invalidateRegistryIntegrity(registry);
     await writeAppointmentRegistry(registry);
 
     const users = await readUsers();
     const nextUsers = users.map((user) =>
-      user.chatId === target.boundChatId
+      String(user.chatId) === String(target.boundChatId)
         ? clearUserBindingFields(user)
         : user
     );
@@ -762,6 +1042,7 @@ export async function transferAppointmentBinding(fromAppointment, toAppointment)
 
     registry.adminAppointments = pruneUnboundAdminAppointments(registry);
     registry.updatedAt = new Date().toISOString();
+    invalidateRegistryIntegrity(registry);
     await writeAppointmentRegistry(registry);
 
     const users = await readUsers();
@@ -821,6 +1102,7 @@ export async function bindAppointmentCode(secretCode, telegramUser) {
   return withStorageMutation(async () => {
     const normalizedCode = normalizeCode(secretCode);
     const registry = await readAppointmentRegistry();
+    const users = await readUsers();
     const targetIndex = registry.appointments.findIndex(
       (entry) => normalizeCode(entry.secretCode) === normalizedCode
     );
@@ -837,14 +1119,17 @@ export async function bindAppointmentCode(secretCode, telegramUser) {
 
     if (
       target.boundChatId &&
-      (target.boundChatId !== telegramUser.chatId || target.boundUserId !== telegramUser.userId)
+      (
+        String(target.boundChatId) !== String(telegramUser.chatId) ||
+        String(target.boundUserId) !== String(telegramUser.userId)
+      )
     ) {
       return { ok: false, reason: "code_already_claimed", appointment: target.appointment };
     }
 
     registry.appointments = registry.appointments.map((entry) => {
       if (
-        entry.boundChatId === telegramUser.chatId &&
+        String(entry.boundChatId ?? "") === String(telegramUser.chatId) &&
         entry.appointment !== target.appointment
       ) {
         return {
@@ -860,18 +1145,50 @@ export async function bindAppointmentCode(secretCode, telegramUser) {
       return entry;
     });
 
+    const boundAt = new Date().toISOString();
     registry.appointments[targetIndex] = {
       ...registry.appointments[targetIndex],
-      boundChatId: telegramUser.chatId,
-      boundUserId: telegramUser.userId,
+      boundChatId: String(telegramUser.chatId),
+      boundUserId: String(telegramUser.userId),
       boundUsername: telegramUser.username,
       boundFullName: telegramUser.fullName,
-      boundAt: new Date().toISOString()
+      boundAt
     };
     registry.adminAppointments = pruneUnboundAdminAppointments(registry);
-    registry.updatedAt = new Date().toISOString();
+    registry.updatedAt = boundAt;
+    invalidateRegistryIntegrity(registry);
 
     await writeAppointmentRegistry(registry);
+
+    const userIndex = usersByIdIndex?.get(String(telegramUser.chatId)) ?? -1;
+    const userPatch = {
+      chatId: String(telegramUser.chatId),
+      userId: String(telegramUser.userId),
+      username: telegramUser.username ?? "",
+      fullName: telegramUser.fullName ?? "",
+      appointment: registry.appointments[targetIndex].appointment,
+      onboardingSecretCode: registry.appointments[targetIndex].secretCode,
+      onboardingCompletedAt: boundAt,
+      awaitingSecretCode: false,
+      updatedAt: boundAt
+    };
+
+    if (userIndex >= 0) {
+      users[userIndex] = { ...users[userIndex], ...userPatch };
+    } else {
+      users.push({
+        firstName: "",
+        lastName: "",
+        awaitingAttendance: false,
+        awaitingWeeklyAttendance: false,
+        weeklyAttendanceDates: [],
+        weeklyAttendanceIndex: 0,
+        weeklyAttendanceResults: [],
+        weeklyAttendanceEntries: [],
+        ...userPatch
+      });
+    }
+    await writeUsers(users);
 
     return {
       ok: true,

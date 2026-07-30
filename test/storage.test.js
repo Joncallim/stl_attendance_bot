@@ -7,6 +7,7 @@ import {
   addAdminAppointment,
   addAppointmentToRegistry,
   bindAppointmentCode,
+  computeRosterChecksum,
   deregisterAppointmentBinding,
   getAppointmentRegistry,
   getOnboardingInvite,
@@ -89,7 +90,7 @@ test("binding is serialized and deregistration clears binding and custom admin a
   });
 });
 
-test("syncAppointmentRegistry clears orphaned bindings when user record is missing", async () => {
+test("syncAppointmentRegistry repairs a user-side binding from the main registry", async () => {
   await withTempDataDir(async () => {
     // Set up an appointment and bind it to a user.
     await syncAppointmentRegistry(["CHARLIE"]);
@@ -118,18 +119,20 @@ test("syncAppointmentRegistry clears orphaned bindings when user record is missi
     const beforeEntry = beforeRegistry.appointments.find((e) => e.appointment === "CHARLIE");
     assert.equal(beforeEntry.boundChatId, "chat-orphan");
 
-    // Simulate user record being lost: clear the appointment field on the user
-    // so the registry binding becomes "orphaned" (no matching user → appointment).
+    // Simulate a partial write/data restore: the user-side appointment was lost
+    // while the main registry binding survived.
     await updateUserByChatId("chat-orphan", { appointment: null });
 
-    // Sync should detect the orphaned binding, clear it, and issue a fresh code.
+    // Sync repairs the missing side. It must not discard the surviving binding.
     await syncAppointmentRegistry(["CHARLIE"]);
 
     const afterRegistry = await getAppointmentRegistry();
     const afterEntry = afterRegistry.appointments.find((e) => e.appointment === "CHARLIE");
-    assert.equal(afterEntry.boundChatId, null, "orphaned boundChatId cleared");
-    assert.ok(afterEntry.secretCode, "new secret code generated");
-    assert.notEqual(afterEntry.secretCode, invite.secretCode, "fresh code different from original");
+    const afterUser = await getUserByChatId("chat-orphan");
+    assert.equal(afterEntry.boundChatId, "chat-orphan", "surviving registry binding preserved");
+    assert.equal(afterEntry.secretCode, invite.secretCode, "secret code is not rotated");
+    assert.equal(afterUser.appointment, "CHARLIE", "missing user-side appointment repaired");
+    assert.equal(afterRegistry.integrity.bindingsConsistent, true);
   });
 });
 
@@ -166,7 +169,7 @@ test("syncAppointmentRegistry preserves valid bindings where user record matches
   });
 });
 
-test("syncAppointmentRegistry registry-sheet reconciliation rules", async () => {
+test("syncAppointmentRegistry preserves the union of sheet and main registry records", async () => {
   await withTempDataDir(async () => {
     // Seed: three appointments known to the registry.
     await syncAppointmentRegistry(["ALPHA", "BRAVO", "CHARLIE"]);
@@ -198,16 +201,18 @@ test("syncAppointmentRegistry registry-sheet reconciliation rules", async () => 
 
     const registry = await getAppointmentRegistry();
 
-    // Rule 1 — bound appointment (ALPHA) not in sheet: kept in JSON (active:false)
-    //           so syncRosterState can restore it to the sheet.
+    // Rule 1 — anything present in the main registry remains active so
+    // syncRosterState can restore it to Google ONBOARDING.
     const alphaEntry = registry.appointments.find((e) => e.appointment === "ALPHA");
     assert.ok(alphaEntry, "ALPHA must be retained (bound, missing from sheet)");
-    assert.equal(alphaEntry.active, false, "ALPHA marked inactive");
+    assert.equal(alphaEntry.active, true, "ALPHA remains active for sheet repair");
     assert.equal(alphaEntry.boundChatId, "chat-alpha", "ALPHA binding preserved");
 
-    // Rule 2 — unbound appointment (BRAVO) not in sheet: pruned from JSON entirely.
+    // Rule 2 — unbound main-registry records are also preserved. Absence from
+    // one side is not treated as deletion permission.
     const bravoEntry = registry.appointments.find((e) => e.appointment === "BRAVO");
-    assert.equal(bravoEntry, undefined, "BRAVO must be pruned (unbound, missing from sheet)");
+    assert.ok(bravoEntry, "BRAVO must be retained for sheet repair");
+    assert.equal(bravoEntry.active, true);
 
     // Rule 3 — appointment in sheet but not in JSON (DELTA): inserted as new entry.
     const deltaEntry = registry.appointments.find((e) => e.appointment === "DELTA");
@@ -215,6 +220,102 @@ test("syncAppointmentRegistry registry-sheet reconciliation rules", async () => 
     assert.equal(deltaEntry.active, true);
     assert.ok(deltaEntry.secretCode, "DELTA gets a fresh secret code");
     assert.equal(deltaEntry.boundChatId, null);
+
+    assert.equal(registry.integrity.rosterConsistent, false);
+    assert.equal(
+      registry.integrity.registryChecksum,
+      computeRosterChecksum(["ALPHA", "BRAVO", "CHARLIE", "DELTA"])
+    );
+  });
+});
+
+test("syncAppointmentRegistry restores a missing registry binding from users.json", async () => {
+  await withTempDataDir(async () => {
+    await syncAppointmentRegistry(["ALPHA"]);
+    await upsertUser({
+      chatId: "chat-user-only",
+      userId: "user-only",
+      username: "alpha",
+      fullName: "Alpha User",
+      appointment: "ALPHA",
+      onboardingCompletedAt: "2026-07-01T00:00:00.000Z",
+      updatedAt: "2026-07-01T00:00:00.000Z"
+    });
+
+    const registry = await syncAppointmentRegistry(["ALPHA"]);
+    const alpha = registry.appointments.find((entry) => entry.appointment === "ALPHA");
+
+    assert.equal(alpha.boundChatId, "chat-user-only");
+    assert.equal(alpha.boundUserId, "user-only");
+    assert.equal(registry.integrity.bindingsConsistent, true);
+    assert.deepEqual(registry.integrity.repairedRegistryBindings, ["chat-user-only"]);
+  });
+});
+
+test("checksum clears a user binding only when appointment is absent from sheet and main registry", async () => {
+  await withTempDataDir(async () => {
+    await syncAppointmentRegistry(["ALPHA"]);
+    await upsertUser({
+      chatId: "chat-ghost",
+      userId: "ghost",
+      username: "ghost",
+      fullName: "Ghost User",
+      appointment: "GHOST",
+      onboardingCompletedAt: "2026-07-01T00:00:00.000Z",
+      updatedAt: "2026-07-01T00:00:00.000Z"
+    });
+
+    const registry = await syncAppointmentRegistry(["ALPHA"]);
+    const user = await getUserByChatId("chat-ghost");
+
+    assert.equal(user.appointment, null);
+    assert.deepEqual(registry.integrity.clearedUserBindings, ["chat-ghost"]);
+    assert.equal(registry.integrity.rosterConsistent, true);
+  });
+});
+
+test("a deliberate bot-removal tombstone prevents stale sheet data from resurrecting a user", async () => {
+  await withTempDataDir(async () => {
+    await syncAppointmentRegistry(["ALPHA", "BRAVO"]);
+    const result = await removeAppointmentFromRegistry("BRAVO");
+    assert.equal(result.ok, true);
+
+    // Simulate a partial Sheets deletion: BRAVO is still visible remotely.
+    const registry = await syncAppointmentRegistry(["ALPHA", "BRAVO"]);
+    const bravo = registry.appointments.find((entry) => entry.appointment === "BRAVO");
+
+    assert.equal(bravo.active, false);
+    assert.ok(bravo.removedByBotAt);
+    assert.equal(registry.integrity.registryCount, 1);
+    assert.equal(registry.integrity.sheetCount, 2);
+    assert.equal(registry.integrity.rosterConsistent, false, "stale sheet row remains visible to checksum");
+  });
+});
+
+test("checksum reports contradictory bindings without guessing or moving the user", async () => {
+  await withTempDataDir(async () => {
+    await syncAppointmentRegistry(["ALPHA", "BRAVO"]);
+    const invite = await getOnboardingInvite("ALPHA");
+    await bindAppointmentCode(invite.secretCode, {
+      chatId: "chat-conflict",
+      userId: "user-conflict",
+      username: "conflict",
+      fullName: "Conflict User"
+    });
+
+    // Simulate contradictory surviving records. Picking either appointment
+    // automatically could move future attendance to the wrong row.
+    await updateUserByChatId("chat-conflict", { appointment: "BRAVO" });
+    const registry = await syncAppointmentRegistry(["ALPHA", "BRAVO"]);
+    const alpha = registry.appointments.find((entry) => entry.appointment === "ALPHA");
+    const bravo = registry.appointments.find((entry) => entry.appointment === "BRAVO");
+    const user = await getUserByChatId("chat-conflict");
+
+    assert.equal(alpha.boundChatId, "chat-conflict");
+    assert.equal(bravo.boundChatId, null);
+    assert.equal(user.appointment, "BRAVO");
+    assert.equal(registry.integrity.bindingsConsistent, false);
+    assert.ok(registry.integrity.conflicts.length >= 1);
   });
 });
 

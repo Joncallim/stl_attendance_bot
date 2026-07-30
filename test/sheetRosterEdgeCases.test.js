@@ -566,6 +566,51 @@ test("syncOnboardingRoster restores bound appointments that were manually delete
   }));
 });
 
+test("syncOnboardingRoster restores any active main-registry appointment, even when unbound", async () => {
+  await withMockedFetch(() => withTempDataDir(async () => {
+    const config = makeConfig();
+    const fake = createInMemorySheets({
+      ONBOARDING: {
+        sheetId: 1,
+        values: [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", "A1"],
+          ["Remarks", ""]
+        ]
+      }
+    });
+
+    const result = await syncOnboardingRoster(fake.client, config, {
+      appointmentsToRestore: ["BRAVO"]
+    });
+
+    assert.ok(result.onboardingAppointments.includes("BRAVO"));
+  }));
+});
+
+test("syncOnboardingRoster removes a stale sheet appointment only with a bot tombstone", async () => {
+  await withMockedFetch(() => withTempDataDir(async () => {
+    const config = makeConfig();
+    const fake = createInMemorySheets({
+      ONBOARDING: {
+        sheetId: 1,
+        values: [
+          ["Appointment", "Secret Code"],
+          ["ALPHA", "A1"],
+          ["BRAVO", "B1"],
+          ["Remarks", ""]
+        ]
+      }
+    });
+
+    const result = await syncOnboardingRoster(fake.client, config, {
+      appointmentsToRemove: ["BRAVO"]
+    });
+
+    assert.deepEqual(result.onboardingAppointments, ["ALPHA"]);
+  }));
+});
+
 // ── Month boundary edge cases ─────────────────────────────────────────────────
 
 test("shiftMonth handles December → January year rollover correctly", () => {

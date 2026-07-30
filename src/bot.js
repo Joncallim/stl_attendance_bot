@@ -70,6 +70,7 @@ import {
   applyWeeklyAttendanceSelection,
   createWeeklyFlowState,
   getStagedAttendanceStatus,
+  resolveWeeklyAttendanceEntries,
   upsertWeeklyAttendanceEntry
 } from "./weeklyFlow.js";
 
@@ -96,6 +97,7 @@ function logBotError(message, details = null) {
 
 const WEEK_SKIP_LABEL = "Skip Day";
 const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
+const MAX_TRACKED_ATTENDANCE_PROMPTS = 8;
 // Telegram allows ~30 messages/second per bot. Cap concurrent reminder sends
 // and enforce a minimum gap between successive send starts to stay safely
 // within quota and avoid silent 429 delivery failures.
@@ -890,8 +892,10 @@ async function sendOrUpdateAdminMessage(ctx, text, replyMarkup, extraOptions = {
   };
 
   if (ctx.callbackQuery?.message) {
+    let editedMessage = null;
+
     try {
-      await ctx.editMessageText(text, messageOptions);
+      editedMessage = await ctx.editMessageText(text, messageOptions);
     } catch (error) {
       const description = error?.response?.description ?? error?.message ?? "";
 
@@ -912,10 +916,66 @@ async function sendOrUpdateAdminMessage(ctx, text, replyMarkup, extraOptions = {
       }
     }
 
-    return;
+    return editedMessage || ctx.callbackQuery.message;
   }
 
-  await ctx.reply(text, messageOptions);
+  return ctx.reply(text, messageOptions);
+}
+
+function getMessageId(message) {
+  const messageId = Number(message?.message_id);
+  return Number.isInteger(messageId) && messageId > 0 ? messageId : null;
+}
+
+function appendAttendancePromptMessageId(user, messageId) {
+  const existingIds = Array.isArray(user?.attendancePromptMessageIds)
+    ? user.attendancePromptMessageIds
+    : [];
+  const normalizedIds = existingIds
+    .map(Number)
+    .filter((value) => Number.isInteger(value) && value > 0);
+
+  if (Number.isInteger(messageId) && messageId > 0) {
+    normalizedIds.push(messageId);
+  }
+
+  return [...new Set(normalizedIds)].slice(-MAX_TRACKED_ATTENDANCE_PROMPTS);
+}
+
+async function removeObsoleteAttendancePromptMessages(
+  telegram,
+  chatId,
+  messageIds,
+  keepMessageId = null
+) {
+  const obsoleteIds = [...new Set(
+    (Array.isArray(messageIds) ? messageIds : [])
+      .map(Number)
+      .filter((messageId) =>
+        Number.isInteger(messageId) &&
+        messageId > 0 &&
+        messageId !== keepMessageId
+      )
+  )];
+
+  await Promise.allSettled(obsoleteIds.map(async (messageId) => {
+    try {
+      await telegram.deleteMessage(chatId, messageId);
+    } catch {
+      // Telegram only allows message deletion for a limited time. If an old
+      // reminder can no longer be deleted, at least retire its active buttons.
+      try {
+        await telegram.editMessageReplyMarkup(
+          chatId,
+          messageId,
+          undefined,
+          { inline_keyboard: [] }
+        );
+      } catch {
+        // Missing/already-deleted messages need no further cleanup.
+      }
+    }
+  }));
 }
 
 function buildInviteMessage(invite, bot, options = {}) {
@@ -2085,58 +2145,132 @@ async function clearWeeklyAttendanceState(ctx) {
   });
 }
 
-async function finalizeWeeklyAttendanceFlow(ctx, config, appointment, cache) {
-  const entries = Array.isArray(ctx.session.weeklyAttendanceEntries)
-    ? ctx.session.weeklyAttendanceEntries
-    : [];
-  const dates = Array.isArray(ctx.session.weeklyAttendanceDates)
-    ? ctx.session.weeklyAttendanceDates
-    : [];
+function getWeeklyAttendanceState(ctx, user) {
+  const hasSessionFlow =
+    Array.isArray(ctx.session.weeklyAttendanceDates) &&
+    ctx.session.weeklyAttendanceDates.length > 0;
 
-  if (entries.length > 0) {
-    const queuedEntries = entries.map((entry) => ({
+  return {
+    dates: hasSessionFlow
+      ? ctx.session.weeklyAttendanceDates
+      : Array.isArray(user?.weeklyAttendanceDates)
+        ? user.weeklyAttendanceDates
+        : [],
+    index: hasSessionFlow
+      ? Number(ctx.session.weeklyAttendanceIndex ?? 0)
+      : Number(user?.weeklyAttendanceIndex ?? 0),
+    entries: hasSessionFlow
+      ? (Array.isArray(ctx.session.weeklyAttendanceEntries)
+          ? ctx.session.weeklyAttendanceEntries
+          : [])
+      : Array.isArray(user?.weeklyAttendanceEntries)
+        ? user.weeklyAttendanceEntries
+        : []
+  };
+}
+
+function restoreWeeklyAttendanceSession(ctx, state) {
+  ctx.session.awaitingWeeklyAttendance = true;
+  ctx.session.weeklyAttendanceDates = state.dates;
+  ctx.session.weeklyAttendanceIndex = state.index;
+  ctx.session.weeklyAttendanceEntries = state.entries;
+}
+
+async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
+  const appointment = user?.appointment;
+  const weeklyState = getWeeklyAttendanceState(ctx, user);
+  const dates = weeklyState.dates;
+  const stagedEntries = weeklyState.entries;
+
+  if (!appointment || dates.length === 0) {
+    await clearWeeklyAttendanceState(ctx);
+    await sendOrUpdateAdminMessage(
+      ctx,
+      "Weekly attendance flow expired. Run /week to start again.",
+      Markup.inlineKeyboard([
+        [
+          Markup.button.callback("🔙 Back", "home:main"),
+          Markup.button.callback("❌ Close", "home:close")
+        ]
+      ])
+    );
+    return false;
+  }
+
+  const resolvedEntries = resolveWeeklyAttendanceEntries(
+    dates,
+    stagedEntries,
+    (date) => getCachedAttendanceStatus(cache, config, appointment, date),
+    (value) => toIsoDateString(value, config.timezone)
+  );
+  const missingEntries = resolvedEntries.filter((entry) => !entry.status);
+
+  if (missingEntries.length > 0) {
+    // Restore persisted state into the in-memory session after a restart so
+    // the user can complete the missing days without beginning again.
+    restoreWeeklyAttendanceSession(ctx, weeklyState);
+    const missingLabels = missingEntries.map((entry) =>
+      formatWeekDateLabel(new Date(`${entry.date}T12:00:00.000Z`), config.timezone)
+    );
+    const { message, keyboard } = buildWeeklyAttendanceOverview(
+      dates,
+      stagedEntries,
+      cache,
+      config,
+      user
+    );
+
+    await sendOrUpdateAdminMessage(
+      ctx,
+      [
+        `Select attendance for every weekday before submitting. Missing: ${missingLabels.join(", ")}.`,
+        "",
+        message
+      ].join("\n"),
+      keyboard
+    );
+    return false;
+  }
+
+  const queuedEntries = resolvedEntries.map((entry) => {
+    const date = new Date(`${entry.date}T12:00:00.000Z`);
+    return {
       appointment,
       status: entry.status,
-      date: new Date(entry.date),
+      date,
       source: "weekly",
       ...buildQueuedAttendanceEventMetadata(cache.sheetSnapshots, config, {
         appointment,
         status: entry.status,
-        date: new Date(entry.date)
+        date
       })
-    }));
-    await enqueueAttendanceEvents(
+    };
+  });
+  await enqueueAttendanceEvents(config, queuedEntries);
+
+  if (cache.sheetSnapshots) {
+    cache.sheetSnapshots = applyAttendanceEntriesToSnapshotBundle(
+      cache.sheetSnapshots,
       config,
       queuedEntries
     );
-
-    if (cache.sheetSnapshots) {
-      cache.sheetSnapshots = applyAttendanceEntriesToSnapshotBundle(
-        cache.sheetSnapshots,
-        config,
-        queuedEntries
-      );
-      cache.summaryMemo.clear();
-      cache.summaryMemoVersion = cache.sheetSnapshots?.synchronizedAt ?? null;
-    }
+    cache.summaryMemo.clear();
+    cache.summaryMemoVersion = cache.sheetSnapshots?.synchronizedAt ?? null;
   }
 
-  const results = dates.map((dateValue) => {
-    const date = new Date(dateValue);
-    const label = formatWeekDateLabel(date, config.timezone);
-    const staged = getStagedAttendanceStatus(entries, dateValue, (v) => toIsoDateString(v, config.timezone));
-    const cached = getCachedAttendanceStatus(cache, config, appointment, date);
-    const status = staged || cached || "—";
-    return `${label}: ${status}`;
+  const results = resolvedEntries.map((entry) => {
+    const date = new Date(`${entry.date}T12:00:00.000Z`);
+    return `${formatWeekDateLabel(date, config.timezone)}: ${entry.status}`;
   });
 
   await clearWeeklyAttendanceState(ctx);
-  const weeklyHeader = entries.length > 0
-    ? "Weekly attendance updated and queued for Google Sheets sync:"
-    : "Weekly attendance reviewed. No new entries were submitted.";
   await sendOrUpdateAdminMessage(
     ctx,
-    [weeklyHeader, "", ...results].join("\n"),
+    [
+      `Weekly attendance recorded for all ${resolvedEntries.length} weekdays and queued for Google Sheets sync:`,
+      "",
+      ...results
+    ].join("\n"),
     Markup.inlineKeyboard([
       [
         Markup.button.callback("🔙 Back", "home:main"),
@@ -2144,6 +2278,7 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, appointment, cache) {
       ]
     ])
   );
+  return true;
 }
 
 async function submitGitHubIssue(title, body) {
@@ -2261,15 +2396,6 @@ async function askAttendance(ctx, config, user = null, cache = null) {
   ctx.session.weeklyAttendanceIndex = 0;
   ctx.session.weeklyAttendanceResults = [];
   ctx.session.weeklyAttendanceEntries = [];
-  await updateUserByChatId(ctx.chat.id, {
-    awaitingAttendance: true,
-    awaitingWeeklyAttendance: false,
-    weeklyAttendanceDates: [],
-    weeklyAttendanceIndex: 0,
-    weeklyAttendanceResults: [],
-    weeklyAttendanceEntries: [],
-    promptedAt: new Date().toISOString()
-  });
   const date = new Date();
   const message = buildTodayAttendancePromptMessage(
     config,
@@ -2277,7 +2403,7 @@ async function askAttendance(ctx, config, user = null, cache = null) {
     user?.appointment ?? null,
     cache
   );
-  await sendOrUpdateAdminMessage(
+  const promptMessage = await sendOrUpdateAdminMessage(
     ctx,
     message,
     buildInlineAttendanceMenu(
@@ -2288,6 +2414,19 @@ async function askAttendance(ctx, config, user = null, cache = null) {
       "home:main"
     )
   );
+  const messageId = getMessageId(promptMessage) ??
+    getMessageId(ctx.callbackQuery?.message);
+
+  await updateUserByChatId(ctx.chat.id, {
+    awaitingAttendance: true,
+    awaitingWeeklyAttendance: false,
+    weeklyAttendanceDates: [],
+    weeklyAttendanceIndex: 0,
+    weeklyAttendanceResults: [],
+    weeklyAttendanceEntries: [],
+    promptedAt: new Date().toISOString(),
+    attendancePromptMessageIds: appendAttendancePromptMessageId(user, messageId)
+  });
 }
 
 function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config, user) {
@@ -2304,6 +2443,7 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
   const message = [
     "Weekly attendance update",
     "Public holidays are prefilled as PH.",
+    "Every weekday must have a status before submission.",
     "",
     ...dayLines,
     "",
@@ -2339,23 +2479,35 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
 }
 
 async function showWeeklyAttendanceOverview(ctx, config, user, cache) {
-  const weeklyDates = ctx.session.weeklyAttendanceDates ?? [];
-  const weeklyEntries = ctx.session.weeklyAttendanceEntries ?? [];
-  const { message, keyboard } = buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config, user);
+  const weeklyState = getWeeklyAttendanceState(ctx, user);
+
+  if (weeklyState.dates.length > 0) {
+    restoreWeeklyAttendanceSession(ctx, weeklyState);
+  }
+
+  const { message, keyboard } = buildWeeklyAttendanceOverview(
+    weeklyState.dates,
+    weeklyState.entries,
+    cache,
+    config,
+    user
+  );
   await sendOrUpdateAdminMessage(ctx, message, keyboard);
 }
 
 async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
-  const dateValue = ctx.session.weeklyAttendanceDates?.[ctx.session.weeklyAttendanceIndex];
+  const weeklyState = getWeeklyAttendanceState(ctx, user);
+  const dateValue = weeklyState.dates[weeklyState.index];
 
   if (!dateValue) {
     return;
   }
 
+  restoreWeeklyAttendanceSession(ctx, weeklyState);
   const date = new Date(dateValue);
   const label = formatAttendanceDateLabel(date, config.timezone);
   const stagedStatus = getStagedAttendanceStatus(
-    ctx.session.weeklyAttendanceEntries ?? [],
+    weeklyState.entries,
     date,
     (value) => toIsoDateString(value, config.timezone)
   );
@@ -2367,7 +2519,8 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
     : `Select attendance for ${label}.`;
   const message = [
     "Weekly attendance update",
-    "Public holidays are prefilled as PH. Use Skip to keep the current entry unchanged.",
+    "Public holidays are prefilled as PH. Use Skip only to keep an existing entry unchanged.",
+    "Every weekday must have a status before submission.",
     "",
     detailLine
   ].join("\n");
@@ -2572,23 +2725,36 @@ async function queueAttendanceSelection(cache, config, appointment, status, date
   return queuedEntry;
 }
 
+function buildRegistrySheetReconciliationOptions(registry) {
+  return {
+    appointmentsToRestore: (registry.appointments ?? [])
+      .filter((entry) =>
+        !entry.removedByBotAt && (entry.active || (!entry.active && entry.boundChatId))
+      )
+      .map((entry) => entry.appointment),
+    appointmentsToRemove: (registry.appointments ?? [])
+      .filter((entry) => entry.removedByBotAt)
+      .map((entry) => entry.appointment)
+  };
+}
+
 async function syncRosterState(sheets, config) {
   // Re-read settings.yaml before every sync so admin edits (new appointments,
   // reordered hierarchy, updated officer types) are picked up without restart.
   await applyStoredConfigOverrides();
 
-  // Collect currently-bound appointments from the registry so that any that
-  // have been accidentally removed from the sheet are restored.
-  // Include inactive entries: a bound entry can become active:false if it
-  // was previously absent from the sheet; it still needs to be restored.
+  // Reconcile by union: any active main-registry appointment missing from
+  // Google ONBOARDING is restored. Automatic removal is allowed only when the
+  // bot recorded an explicit removal tombstone.
   const preRegistry = await getAppointmentRegistry();
-  const boundAppointmentsToRestore = preRegistry.appointments
-    .filter((entry) => entry.boundChatId)
-    .map((entry) => entry.appointment);
+  const reconciliationOptions = buildRegistrySheetReconciliationOptions(preRegistry);
 
   // forceMetadata: true busts the 45-minute process-level spreadsheet metadata
   // cache so that externally renamed or added sheets are picked up immediately.
-  const roster = await syncOnboardingRoster(sheets, config, { boundAppointmentsToRestore, forceMetadata: true });
+  const roster = await syncOnboardingRoster(sheets, config, {
+    ...reconciliationOptions,
+    forceMetadata: true
+  });
 
   if (roster.driftDetected) {
     return roster;
@@ -2600,7 +2766,7 @@ async function syncRosterState(sheets, config) {
     config,
     registry.appointments.filter((entry) => entry.active)
   );
-  return roster;
+  return { ...roster, integrity: registry.integrity };
 }
 
 async function preloadSheetSnapshots(sheets, config, cache, options = {}) {
@@ -2779,11 +2945,16 @@ async function addManagedAppointment(sheets, config, cache, appointment) {
       return registryResult;
     }
 
-    await addAppointmentToSheets(sheets, config, registryResult.appointment);
+    const sheetAppointments = await addAppointmentToSheets(
+      sheets,
+      config,
+      registryResult.appointment
+    );
+    const registry = await syncAppointmentRegistry(sheetAppointments);
     await syncOnboardingCodeColumn(
       sheets,
       config,
-      (await getAppointmentRegistry()).appointments.filter((entry) => entry.active)
+      registry.appointments.filter((entry) => entry.active)
     );
     await refreshAdminCache(cache, config);
     await preloadSheetSnapshots(sheets, config, cache, { force: true });
@@ -2799,11 +2970,16 @@ async function removeManagedAppointment(sheets, config, cache, appointment) {
       return registryResult;
     }
 
-    await removeAppointmentFromSheets(sheets, config, registryResult.appointment);
+    const sheetAppointments = await removeAppointmentFromSheets(
+      sheets,
+      config,
+      registryResult.appointment
+    );
+    const registry = await syncAppointmentRegistry(sheetAppointments);
     await syncOnboardingCodeColumn(
       sheets,
       config,
-      (await getAppointmentRegistry()).appointments.filter((entry) => entry.active)
+      registry.appointments.filter((entry) => entry.active)
     );
     await refreshAdminCache(cache, config);
     await preloadSheetSnapshots(sheets, config, cache, { force: true });
@@ -3291,8 +3467,19 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
 
     for (let i = 0; i < promptResults.length; i++) {
       if (promptResults[i].status === "fulfilled") {
-        const { chatId, awaitingAttendance } = promptResults[i].value;
-        patches.push({ chatId, patch: { awaitingAttendance, promptedAt } });
+        const {
+          chatId,
+          awaitingAttendance,
+          attendancePromptMessageIds
+        } = promptResults[i].value;
+        patches.push({
+          chatId,
+          patch: {
+            awaitingAttendance,
+            attendancePromptMessageIds,
+            promptedAt
+          }
+        });
       } else {
         logBotError("Failed to send prompt.", { chatId: users[i].chatId, error: promptResults[i].reason?.message });
       }
@@ -3403,7 +3590,7 @@ async function buildAndSendAttendancePrompt(bot, config, user, cache) {
   const promptMessage = currentStatus
     ? `Your attendance for ${dateLabel} is currently ${currentStatus}. Update it if needed.`
     : `You have not updated your attendance for ${dateLabel}. ${message}`;
-  await bot.telegram.sendMessage(
+  const sentMessage = await bot.telegram.sendMessage(
     user.chatId,
     promptMessage,
     buildInlineAttendanceMenu(
@@ -3414,16 +3601,27 @@ async function buildAndSendAttendancePrompt(bot, config, user, cache) {
       "home:main"
     )
   );
-  return { chatId: user.chatId, awaitingAttendance: !currentStatus };
+  return {
+    chatId: user.chatId,
+    awaitingAttendance: !currentStatus,
+    attendancePromptMessageIds: appendAttendancePromptMessageId(
+      user,
+      getMessageId(sentMessage)
+    )
+  };
 }
 
 async function sendPromptToChat(bot, config, chatId, cache = null) {
   const user = await getUserByChatId(chatId);
-  const { awaitingAttendance } = await buildAndSendAttendancePrompt(bot, config, user, cache);
+  const {
+    awaitingAttendance,
+    attendancePromptMessageIds
+  } = await buildAndSendAttendancePrompt(bot, config, user, cache);
   // Only set awaitingAttendance if no status is on file; users who already filed
   // should not be put into a text-prompt state just from receiving the reminder.
   await updateUserByChatId(chatId, {
     awaitingAttendance,
+    attendancePromptMessageIds,
     promptedAt: new Date().toISOString()
   });
 }
@@ -3842,7 +4040,7 @@ async function runSelfHealingCycle(sheets, config, adminCache) {
   }
 
   logBot("[SelfHeal] Cycle complete.", {
-    divergentSheets: allDivergences.length,
+    divergentSheets: divergences.length,
     appointmentsAdded: addResults.filter((r) => r.ok).length,
     syncFailed
   });
@@ -3923,6 +4121,24 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
       `Current month: ${roster.currentMonthTitle}`,
       `Next month: ${roster.nextMonthTitle}`
     ];
+    const integrity = roster.integrity;
+
+    if (integrity?.checksum) {
+      summaryLines.push(`Roster checksum: ${integrity.checksum.slice(0, 12)}`);
+      const repairCount =
+        (integrity.repairedUserBindings?.length ?? 0) +
+        (integrity.repairedRegistryBindings?.length ?? 0) +
+        (integrity.clearedUserBindings?.length ?? 0);
+
+      if (repairCount > 0) {
+        summaryLines.push(`Integrity repairs applied: ${repairCount}`);
+      }
+      if (!integrity.bindingsConsistent) {
+        summaryLines.push(
+          `⚠️ Binding conflicts need review: ${integrity.conflicts?.length ?? 0}`
+        );
+      }
+    }
 
     if (resetResult.resetCount > 0) {
       summaryLines.push(`\n⚠️ ${resetResult.resetCount} previously stuck attendance ${resetResult.resetCount === 1 ? "entry" : "entries"} re-queued for retry.`);
@@ -4166,7 +4382,17 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   const isReminderWorkingDayFn = deps.isReminderWorkingDayFn ?? isReminderWorkingDay;
   const listUsersFn = deps.listUsersFn ?? listUsers;
   const sendPromptToChatFn = deps.sendPromptToChatFn ?? sendPromptToChat;
-  const buildAndSendAttendancePromptFn = deps.buildAndSendAttendancePromptFn ?? buildAndSendAttendancePrompt;
+  const buildAndSendAttendancePromptFn = deps.buildAndSendAttendancePromptFn ??
+    (deps.sendPromptToChatFn
+      ? async (targetBot, targetConfig, user, cache) => {
+          await sendPromptToChatFn(targetBot, targetConfig, user.chatId, cache);
+          return {
+            chatId: user.chatId,
+            awaitingAttendance: true,
+            attendancePromptMessageIds: user.attendancePromptMessageIds ?? []
+          };
+        }
+      : buildAndSendAttendancePrompt);
   const batchUpdateUsersByChatIdFn = deps.batchUpdateUsersByChatIdFn ?? batchUpdateUsersByChatId;
   const runDailySheetMaintenanceFn = deps.runDailySheetMaintenanceFn ?? runDailySheetMaintenance;
   const runStartupSheetCleanupFn = deps.runStartupSheetCleanupFn ?? runStartupSheetCleanup;
@@ -4222,8 +4448,13 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
             // Wait for the startup sync cycle + option sort to finish before
             // issuing more API calls.
             await startupSyncPromise;
-            await runDailySheetMaintenanceFn(sheets, config);
-            await syncAppointmentRegistry();
+            const registryBeforeMaintenance = await getAppointmentRegistry();
+            const maintenance = await runDailySheetMaintenanceFn(
+              sheets,
+              config,
+              buildRegistrySheetReconciliationOptions(registryBeforeMaintenance)
+            );
+            await syncAppointmentRegistry(maintenance?.onboardingAppointments);
             await syncOnboardingCodeColumn(
               sheets,
               config,
@@ -4277,8 +4508,13 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
       // fire a redundant preload while runDailySheetMaintenance is running.
       adminCache.syncManager.setMaintenanceRunning(true);
       try {
-        await runDailySheetMaintenanceFn(sheets, config);
-        await syncAppointmentRegistry();
+        const registryBeforeMaintenance = await getAppointmentRegistry();
+        const maintenance = await runDailySheetMaintenanceFn(
+          sheets,
+          config,
+          buildRegistrySheetReconciliationOptions(registryBeforeMaintenance)
+        );
+        await syncAppointmentRegistry(maintenance?.onboardingAppointments);
         await syncOnboardingCodeColumn(
           sheets,
           config,
@@ -4359,8 +4595,19 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
 
         for (let i = 0; i < promptResults.length; i++) {
           if (promptResults[i].status === "fulfilled") {
-            const { chatId, awaitingAttendance } = promptResults[i].value;
-            patches.push({ chatId, patch: { awaitingAttendance, promptedAt } });
+            const {
+              chatId,
+              awaitingAttendance,
+              attendancePromptMessageIds
+            } = promptResults[i].value;
+            patches.push({
+              chatId,
+              patch: {
+                awaitingAttendance,
+                attendancePromptMessageIds,
+                promptedAt
+              }
+            });
           } else {
             logBotError(`[Reminder] Failed to send ${reminderTime} prompt.`, { chatId: users[i].chatId, error: promptResults[i].reason?.message });
           }
@@ -4742,14 +4989,19 @@ export async function createAttendanceBot(config) {
     let awaitingWeeklyAttendance =
       ctx.session.awaitingWeeklyAttendance || storedUser?.awaitingWeeklyAttendance === true;
 
-    // Auto-recover from post-restart inconsistency: the flag was persisted but the
-    // weekly flow arrays (held only in the in-memory session) were lost. Reset both
-    // states so the user doesn't appear stuck until they manually /cancel.
+    // Rehydrate a persisted weekly flow after restart. Only clear an inconsistent
+    // awaiting flag when neither the session nor the stored user has week dates.
     if (awaitingWeeklyAttendance) {
       const hasFlowDates = (ctx.session.weeklyAttendanceDates?.length ?? 0) > 0;
       if (!hasFlowDates) {
-        await clearWeeklyAttendanceState(ctx);
-        awaitingWeeklyAttendance = false;
+        const persistedWeeklyState = getWeeklyAttendanceState(ctx, storedUser);
+
+        if (persistedWeeklyState.dates.length > 0) {
+          restoreWeeklyAttendanceSession(ctx, persistedWeeklyState);
+        } else {
+          await clearWeeklyAttendanceState(ctx);
+          awaitingWeeklyAttendance = false;
+        }
       }
     }
     const awaitingAttendanceOptionAdd = ctx.session.awaitingAttendanceOptionAdd === true;
@@ -5449,7 +5701,6 @@ export async function createAttendanceBot(config) {
     }
 
     if (action.startsWith("pick:attendance:")) {
-      triggerBackgroundSheetRefresh(adminCache, "home:pick:attendance");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -5493,21 +5744,35 @@ export async function createAttendanceBot(config) {
         );
       }
 
-      await updateUserByChatId(ctx.chat.id, {
-        awaitingAttendance: false,
-        lastSubmittedAt: new Date().toISOString()
-      });
+      ctx.session.awaitingAttendance = false;
+      const currentMessageId = getMessageId(ctx.callbackQuery?.message);
 
-      await sendOrUpdateAdminMessage(
-        ctx,
-        confirmationLines.join("\n"),
-        Markup.inlineKeyboard([
-          [
-            Markup.button.callback("🔙 Back", "home:main"),
-            Markup.button.callback("❌ Close", "home:close")
-          ]
-        ])
-      );
+      // The queue append above is already durable. Complete the user-visible
+      // response, persist state, and clean older reminders concurrently.
+      await Promise.all([
+        updateUserByChatId(ctx.chat.id, {
+          awaitingAttendance: false,
+          attendancePromptMessageIds: [],
+          lastSubmittedAt: new Date().toISOString()
+        }),
+        sendOrUpdateAdminMessage(
+          ctx,
+          confirmationLines.join("\n"),
+          Markup.inlineKeyboard([
+            [
+              Markup.button.callback("🔙 Back", "home:main"),
+              Markup.button.callback("❌ Close", "home:close")
+            ]
+          ])
+        ),
+        removeObsoleteAttendancePromptMessages(
+          ctx.telegram,
+          ctx.chat.id,
+          user.attendancePromptMessageIds,
+          currentMessageId
+        )
+      ]);
+      triggerBackgroundSheetRefresh(adminCache, "home:pick:attendance");
       return;
     }
 
@@ -5551,7 +5816,11 @@ export async function createAttendanceBot(config) {
       }
 
       const dayIndex = Number(action.split(":")[2]);
-      ctx.session.weeklyAttendanceIndex = dayIndex;
+      const weeklyState = getWeeklyAttendanceState(ctx, user);
+      restoreWeeklyAttendanceSession(ctx, {
+        ...weeklyState,
+        index: dayIndex
+      });
       await updateUserByChatId(ctx.chat.id, { weeklyAttendanceIndex: dayIndex });
       await ctx.answerCbQuery();
       await promptWeeklyAttendanceDay(ctx, config, user, adminCache);
@@ -5559,7 +5828,6 @@ export async function createAttendanceBot(config) {
     }
 
     if (action === "week:submit") {
-      triggerBackgroundSheetRefresh(adminCache, "home:week:submit");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
@@ -5567,7 +5835,16 @@ export async function createAttendanceBot(config) {
       }
 
       await ctx.answerCbQuery("Submitting…");
-      await finalizeWeeklyAttendanceFlow(ctx, config, user.appointment, adminCache);
+      const submitted = await finalizeWeeklyAttendanceFlow(
+        ctx,
+        config,
+        user,
+        adminCache
+      );
+
+      if (submitted) {
+        triggerBackgroundSheetRefresh(adminCache, "home:week:submit");
+      }
       return;
     }
 
@@ -5580,18 +5857,10 @@ export async function createAttendanceBot(config) {
       }
 
       const storedUser = await getUserByChatId(ctx.chat.id);
-      const weeklyDates =
-        ctx.session.weeklyAttendanceDates?.length > 0
-          ? ctx.session.weeklyAttendanceDates
-          : storedUser?.weeklyAttendanceDates ?? [];
-      const weeklyIndex = Number.isInteger(ctx.session.weeklyAttendanceIndex)
-        ? ctx.session.weeklyAttendanceIndex
-        : Number(storedUser?.weeklyAttendanceIndex ?? 0);
-      const weeklyEntries = Array.isArray(ctx.session.weeklyAttendanceEntries)
-        ? ctx.session.weeklyAttendanceEntries
-        : Array.isArray(storedUser?.weeklyAttendanceEntries)
-          ? storedUser.weeklyAttendanceEntries
-          : [];
+      const weeklyState = getWeeklyAttendanceState(ctx, storedUser);
+      const weeklyDates = weeklyState.dates;
+      const weeklyIndex = weeklyState.index;
+      const weeklyEntries = weeklyState.entries;
       const dateValue = weeklyDates[weeklyIndex];
 
       if (!dateValue) {
@@ -5643,7 +5912,10 @@ export async function createAttendanceBot(config) {
         await ctx.answerCbQuery("Skipped");
       }
 
-      ctx.session.weeklyAttendanceEntries = nextEntries;
+      restoreWeeklyAttendanceSession(ctx, {
+        ...weeklyState,
+        entries: nextEntries
+      });
 
       await updateUserByChatId(ctx.chat.id, {
         weeklyAttendanceEntries: nextEntries,
@@ -6236,6 +6508,7 @@ export const __testing = {
   buildInviteMessage,
   buildManageAdminsDescription,
   buildHomeMenuText,
+  appendAttendancePromptMessageId,
   formatDepartmentViewMessage,
   buildSummaryMenu,
   formatSummaryMessage,
@@ -6243,6 +6516,7 @@ export const __testing = {
   getCanonicalAttendanceOptions,
   getDepartmentKeyForAppointment,
   getLatestHomeSynchronizationTimestamp,
+  getWeeklyAttendanceState,
   handleInviteCommand,
   handleOnboardCommand,
   handleOptionsResetAction,
@@ -6252,6 +6526,8 @@ export const __testing = {
   triggerBackgroundSheetRefresh,
   renderInviteSubmenu,
   renderAttendanceOptionsMenu,
+  removeObsoleteAttendancePromptMessages,
+  restoreWeeklyAttendanceSession,
   registerBackgroundSchedules,
   resetRosterSyncGuard() { rosterSyncInProgress = false; },
   detectSnapshotDivergences,

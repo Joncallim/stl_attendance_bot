@@ -5,6 +5,7 @@ import path from "node:path";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import {
   __testing,
+  applyAttendanceEntriesToSnapshotBundle,
   preloadAttendanceSnapshots,
   reconcilePendingAttendanceWithSheets,
   summarizeAttendanceOptionUsage,
@@ -583,6 +584,84 @@ test("month slice canonicalizes common free-text attendance aliases", () => {
       { rowNumber: 2, columnIndex: 2, normalizedValue: "PH" },
       { rowNumber: 2, columnIndex: 3, normalizedValue: "WFH" }
     ]
+  );
+});
+
+test("burst snapshot updates apply every event while rebuilding each month safely", () => {
+  const snapshot = __testing.createMonthSliceFromValues(
+    new Date("2026-03-01T12:00:00.000Z"),
+    [
+      ["Appointment", "1 Mar", "2 Mar"],
+      ["ALPHA", "PRESENT", ""],
+      ["BRAVO", "", "WFH"]
+    ],
+    {
+      timezone: "Asia/Singapore",
+      rosterStopMarkers: []
+    },
+    ["ALPHA", "BRAVO"]
+  ).snapshot;
+  const originalDayOne = [...snapshot.statusesByDay.get(1)];
+
+  const updated = applyAttendanceEntriesToSnapshotBundle(
+    { synchronizedAt: null, snapshots: new Map([["Mar 26", snapshot]]) },
+    { timezone: "Asia/Singapore" },
+    [
+      {
+        appointment: "ALPHA",
+        status: "OS",
+        date: new Date("2026-03-01T12:00:00.000Z")
+      },
+      {
+        appointment: "BRAVO",
+        status: "MC",
+        date: new Date("2026-03-01T12:00:00.000Z")
+      },
+      {
+        appointment: "ALPHA",
+        status: "WFH",
+        date: new Date("2026-03-02T12:00:00.000Z")
+      }
+    ]
+  );
+  const updatedSnapshot = updated.snapshots.get("Mar 26");
+
+  assert.deepEqual(updatedSnapshot.statusesByDay.get(1), ["OS", "MC"]);
+  assert.deepEqual(updatedSnapshot.statusesByDay.get(2), ["WFH", "WFH"]);
+  assert.deepEqual(snapshot.statusesByDay.get(1), originalDayOne, "source snapshot is not mutated");
+});
+
+test("attendance preflight fails closed when a row moved before the write", async () => {
+  const sheets = {
+    spreadsheets: {
+      values: {
+        batchGet: async () => ({
+          data: {
+            valueRanges: [
+              { values: [["BRAVO"]] },
+              { values: [["24 Mar"]] },
+              { values: [["PRESENT"]] }
+            ]
+          }
+        })
+      }
+    }
+  };
+
+  await assert.rejects(
+    __testing.validateAttendanceWriteTargets(
+      sheets,
+      "spreadsheet-id",
+      [{
+        range: "'Mar 26'!B2",
+        appointmentRange: "'Mar 26'!A2",
+        dateHeaderRange: "'Mar 26'!B1",
+        expectedAppointment: "ALPHA",
+        expectedDateLabel: "24 Mar",
+        expectedPreviousValue: "PRESENT"
+      }]
+    ),
+    (error) => error.code === "ATTENDANCE_TARGET_CHANGED"
   );
 });
 
@@ -2311,4 +2390,3 @@ test("reconcileOnboardingWithConfig: officer variants cluster with their primary
   assert.ok(meInIdx < ws1Idx, "ME (In) sorts before unmatched WS 1");
   assert.equal(changed, true);
 });
-

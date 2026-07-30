@@ -140,6 +140,83 @@ test("admin menu description includes the current pre-v1 version", () => {
   assert.match(description, /^Admin Menu \(v0\.9\.23\)/);
 });
 
+test("attendance prompt tracking is deduplicated and bounded", () => {
+  const user = {
+    attendancePromptMessageIds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 9, "bad"]
+  };
+
+  assert.deepEqual(
+    __testing.appendAttendancePromptMessageId(user, 10),
+    [3, 4, 5, 6, 7, 8, 9, 10]
+  );
+});
+
+test("completed attendance removes old prompts and retires undeletable buttons", async () => {
+  const deleted = [];
+  const retired = [];
+  const telegram = {
+    async deleteMessage(chatId, messageId) {
+      deleted.push([chatId, messageId]);
+      if (messageId === 11) {
+        throw new Error("message is too old to delete");
+      }
+    },
+    async editMessageReplyMarkup(chatId, messageId, inlineMessageId, markup) {
+      retired.push([chatId, messageId, inlineMessageId, markup]);
+    }
+  };
+
+  await __testing.removeObsoleteAttendancePromptMessages(
+    telegram,
+    "chat-1",
+    [11, 12, 13, 12],
+    13
+  );
+
+  assert.deepEqual(deleted.sort((left, right) => left[1] - right[1]), [
+    ["chat-1", 11],
+    ["chat-1", 12]
+  ]);
+  assert.deepEqual(retired, [[
+    "chat-1",
+    11,
+    undefined,
+    { inline_keyboard: [] }
+  ]]);
+});
+
+test("weekly flow state is restored from persisted user data after restart", () => {
+  const ctx = {
+    session: {
+      weeklyAttendanceDates: [],
+      weeklyAttendanceIndex: 0,
+      weeklyAttendanceEntries: []
+    }
+  };
+  const user = {
+    weeklyAttendanceDates: [
+      "2026-03-23T12:00:00.000Z",
+      "2026-03-24T12:00:00.000Z"
+    ],
+    weeklyAttendanceIndex: 1,
+    weeklyAttendanceEntries: [
+      { date: "2026-03-23", status: "PRESENT" }
+    ]
+  };
+
+  const state = __testing.getWeeklyAttendanceState(ctx, user);
+  __testing.restoreWeeklyAttendanceSession(ctx, state);
+
+  assert.deepEqual(state, {
+    dates: user.weeklyAttendanceDates,
+    index: 1,
+    entries: user.weeklyAttendanceEntries
+  });
+  assert.equal(ctx.session.awaitingWeeklyAttendance, true);
+  assert.deepEqual(ctx.session.weeklyAttendanceDates, user.weeklyAttendanceDates);
+  assert.deepEqual(ctx.session.weeklyAttendanceEntries, user.weeklyAttendanceEntries);
+});
+
 test("triggerBackgroundSheetRefresh starts a non-blocking refresh when idle", () => {
   const runCycleCalls = [];
   const result = __testing.triggerBackgroundSheetRefresh({
@@ -211,7 +288,12 @@ test("syncroster admin action refreshes sheets and reports current and next mont
   );
   assert.equal(
     messages[1],
-    "Roster synced from ONBOARDING. Last month: Feb 26. Current month: Mar 26. Next month: Apr 26."
+    [
+      "✅ Roster synced from ONBOARDING.",
+      "Last month: Feb 26",
+      "Current month: Mar 26",
+      "Next month: Apr 26"
+    ].join("\n")
   );
 });
 
@@ -310,7 +392,12 @@ test("syncroster admin action rejects concurrent sync attempts", async () => {
   );
   assert.equal(
     messages[2],
-    "Roster synced from ONBOARDING. Last month: Feb 26. Current month: Mar 26. Next month: Apr 26."
+    [
+      "✅ Roster synced from ONBOARDING.",
+      "Last month: Feb 26",
+      "Current month: Mar 26",
+      "Next month: Apr 26"
+    ].join("\n")
   );
 });
 
