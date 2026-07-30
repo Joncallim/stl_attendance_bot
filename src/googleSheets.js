@@ -2636,6 +2636,28 @@ function planManagedRowStructureChanges(existingAppointments, nextAppointments) 
   };
 }
 
+const snapshotAppointmentIndexCache = new WeakMap();
+
+function getSnapshotAppointmentIndex(snapshot, appointment) {
+  if (!snapshot?.appointments) {
+    return -1;
+  }
+
+  let cached = snapshotAppointmentIndexCache.get(snapshot.appointments);
+
+  if (!cached || cached.length !== snapshot.appointments.length) {
+    cached = {
+      length: snapshot.appointments.length,
+      index: new Map(
+        snapshot.appointments.map((value, index) => [value, index])
+      )
+    };
+    snapshotAppointmentIndexCache.set(snapshot.appointments, cached);
+  }
+
+  return cached.index.get(appointment) ?? -1;
+}
+
 function createEmptyMonthlySnapshot(date, timezone, appointments = []) {
   const monthLength = daysInMonth(date, timezone);
   const statusesByDay = new Map();
@@ -2654,10 +2676,13 @@ function createEmptyMonthlySnapshot(date, timezone, appointments = []) {
 
 function alignSnapshotToAppointments(snapshot, appointments, date, timezone) {
   const alignedSnapshot = createEmptyMonthlySnapshot(date, timezone, appointments);
+  const sourceIndexByAppointment = new Map(
+    snapshot.appointments.map((appointment, index) => [appointment, index])
+  );
 
   for (let index = 0; index < appointments.length; index += 1) {
     const appointment = appointments[index];
-    const sourceIndex = snapshot.appointments.findIndex((value) => value === appointment);
+    const sourceIndex = sourceIndexByAppointment.get(appointment) ?? -1;
 
     if (sourceIndex === -1) {
       continue;
@@ -2742,6 +2767,9 @@ function createMonthSliceFromValues(date, values, config, appointments) {
   const missingAppointments = [];
   const aliasCorrections = [];
   const snapshot = createEmptyMonthlySnapshot(date, config.timezone, appointments);
+  const snapshotIndexByAppointment = new Map(
+    appointments.map((appointment, index) => [appointment, index])
+  );
 
   for (const appointment of appointments) {
     const matchingRows = liveRowsByIdentity.get(normalizeAppointmentIdentity(appointment)) ?? [];
@@ -2749,7 +2777,7 @@ function createMonthSliceFromValues(date, values, config, appointments) {
     if (matchingRows.length === 1) {
       const liveRow = matchingRows[0];
       rowNumbersByAppointment[appointment] = liveRow.rowNumber;
-      const appointmentIndex = snapshot.appointments.findIndex((value) => value === appointment);
+      const appointmentIndex = snapshotIndexByAppointment.get(appointment);
 
       for (let day = 1; day <= daysInMonth(date, config.timezone); day += 1) {
         const columnIndex = dateColumnMap.get(day);
@@ -2933,7 +2961,7 @@ function getSnapshotCellValue(snapshot, appointment, day) {
     return "";
   }
 
-  const appointmentIndex = snapshot.appointments.findIndex((value) => value === appointment);
+  const appointmentIndex = getSnapshotAppointmentIndex(snapshot, appointment);
 
   if (appointmentIndex === -1) {
     return "";
@@ -2943,7 +2971,7 @@ function getSnapshotCellValue(snapshot, appointment, day) {
 }
 
 function setSnapshotCellValue(snapshot, appointment, day, value) {
-  const appointmentIndex = snapshot.appointments.findIndex((entry) => entry === appointment);
+  const appointmentIndex = getSnapshotAppointmentIndex(snapshot, appointment);
 
   if (appointmentIndex === -1) {
     return snapshot;
@@ -3130,48 +3158,65 @@ export function applyAttendanceEntriesToSnapshotBundle(snapshotBundle, config, e
   }
 
   const snapshots = new Map(snapshotBundle.snapshots ?? []);
+  const entriesByTitle = new Map();
 
   for (const entry of entries) {
     const date = entry.date ?? new Date();
     const { title } = getMonthParts(date, config.timezone);
+    if (!entriesByTitle.has(title)) {
+      entriesByTitle.set(title, []);
+    }
+    entriesByTitle.get(title).push({ ...entry, date });
+  }
+
+  // Align/copy each affected month once. The previous implementation rebuilt
+  // every day × appointment cell once per event, which became noticeably slow
+  // when a burst of users submitted at the same time.
+  for (const [title, monthEntries] of entriesByTitle) {
+    const referenceDate = monthEntries[0].date;
     const existingSnapshot = snapshots.get(title)
       ? alignSnapshotToAppointments(
         snapshots.get(title),
         snapshots.get(title).appointments,
-        date,
+        referenceDate,
         config.timezone
       )
-      : createEmptyMonthlySnapshot(date, config.timezone, [entry.appointment]);
+      : createEmptyMonthlySnapshot(referenceDate, config.timezone);
+    const appointmentIndex = new Map(
+      existingSnapshot.appointments.map((appointment, index) => [appointment, index])
+    );
 
-    if (!existingSnapshot.appointments.includes(entry.appointment)) {
-      existingSnapshot.appointments.push(entry.appointment);
+    for (const entry of monthEntries) {
+      if (!appointmentIndex.has(entry.appointment)) {
+        appointmentIndex.set(entry.appointment, existingSnapshot.appointments.length);
+        existingSnapshot.appointments.push(entry.appointment);
 
-      for (let day = 1; day <= daysInMonth(date, config.timezone); day += 1) {
-        const values = existingSnapshot.statusesByDay.get(day) ?? [];
+        for (let day = 1; day <= daysInMonth(referenceDate, config.timezone); day += 1) {
+          const values = existingSnapshot.statusesByDay.get(day) ?? [];
 
-        while (values.length < existingSnapshot.appointments.length) {
-          values.push("");
+          while (values.length < existingSnapshot.appointments.length) {
+            values.push("");
+          }
+
+          existingSnapshot.statusesByDay.set(day, values);
         }
-
-        existingSnapshot.statusesByDay.set(day, values);
       }
+
+      const index = appointmentIndex.get(entry.appointment);
+      const day = dayOfMonth(entry.date, config.timezone);
+      const dayValues = existingSnapshot.statusesByDay.get(day) ?? Array.from(
+        { length: existingSnapshot.appointments.length },
+        () => ""
+      );
+
+      while (dayValues.length < existingSnapshot.appointments.length) {
+        dayValues.push("");
+      }
+
+      dayValues[index] = String(entry.status ?? "").trim();
+      existingSnapshot.statusesByDay.set(day, dayValues);
     }
 
-    const appointmentIndex = existingSnapshot.appointments.findIndex(
-      (value) => value === entry.appointment
-    );
-    const day = dayOfMonth(date, config.timezone);
-    const dayValues = existingSnapshot.statusesByDay.get(day) ?? Array.from(
-      { length: existingSnapshot.appointments.length },
-      () => ""
-    );
-
-    while (dayValues.length < existingSnapshot.appointments.length) {
-      dayValues.push("");
-    }
-
-    dayValues[appointmentIndex] = String(entry.status ?? "").trim();
-    existingSnapshot.statusesByDay.set(day, dayValues);
     existingSnapshot.synchronizedAt = new Date().toISOString();
     snapshots.set(title, existingSnapshot);
   }
@@ -3187,7 +3232,7 @@ export function buildQueuedAttendanceEventMetadata(snapshotBundle, config, entry
   const { title } = getMonthParts(date, config.timezone);
   const snapshot = snapshotBundle?.snapshots?.get(title);
   const day = dayOfMonth(date, config.timezone);
-  const appointmentIndex = snapshot?.appointments?.findIndex((value) => value === entry.appointment) ?? -1;
+  const appointmentIndex = getSnapshotAppointmentIndex(snapshot, entry.appointment);
   const expectedPreviousValue = appointmentIndex === -1
     ? ""
     : String(snapshot?.statusesByDay?.get(day)?.[appointmentIndex] ?? "").trim();
@@ -3282,41 +3327,55 @@ async function persistAttendanceEntriesToLocalCache(sheets, config, entries) {
     persist: false
   });
   const canonicalSet = new Set(canonicalAppointments);
+  const canonicalIndex = new Map(
+    canonicalAppointments.map((appointment, index) => [appointment, index])
+  );
+  const entriesByTitle = new Map();
 
   for (const entry of entries) {
     const date = entry.date ?? new Date();
     const { title } = getMonthParts(date, config.timezone);
+
+    if (!entriesByTitle.has(title)) {
+      entriesByTitle.set(title, []);
+    }
+    entriesByTitle.get(title).push({ ...entry, date });
+  }
+
+  for (const [title, monthEntries] of entriesByTitle) {
+    const referenceDate = monthEntries[0].date;
     const existingSnapshot = alignSnapshotToAppointments(
-      deserializeSnapshot(snapshots[title]) ?? createEmptyMonthlySnapshot(date, config.timezone),
+      deserializeSnapshot(snapshots[title]) ??
+        createEmptyMonthlySnapshot(referenceDate, config.timezone),
       canonicalAppointments,
-      date,
+      referenceDate,
       config.timezone
     );
 
-    if (!canonicalSet.has(entry.appointment)) {
-      continue;
+    for (const entry of monthEntries) {
+      if (!canonicalSet.has(entry.appointment)) {
+        continue;
+      }
+
+      const appointmentIndex = canonicalIndex.get(entry.appointment);
+      const day = dayOfMonth(entry.date, config.timezone);
+
+      if (!existingSnapshot.statusesByDay.has(day)) {
+        existingSnapshot.statusesByDay.set(
+          day,
+          Array.from({ length: existingSnapshot.appointments.length }, () => "")
+        );
+      }
+
+      const dayValues = existingSnapshot.statusesByDay.get(day);
+
+      while (dayValues.length < existingSnapshot.appointments.length) {
+        dayValues.push("");
+      }
+
+      dayValues[appointmentIndex] = String(entry.status ?? "").trim();
     }
 
-    const appointmentIndex = existingSnapshot.appointments.findIndex(
-      (value) => value === entry.appointment
-    );
-
-    const day = dayOfMonth(date, config.timezone);
-
-    if (!existingSnapshot.statusesByDay.has(day)) {
-      existingSnapshot.statusesByDay.set(
-        day,
-        Array.from({ length: existingSnapshot.appointments.length }, () => "")
-      );
-    }
-
-    const dayValues = existingSnapshot.statusesByDay.get(day);
-
-    while (dayValues.length < existingSnapshot.appointments.length) {
-      dayValues.push("");
-    }
-
-    dayValues[appointmentIndex] = String(entry.status ?? "").trim();
     existingSnapshot.synchronizedAt = new Date().toISOString();
     snapshots[title] = serializeSnapshot(existingSnapshot);
 
@@ -3473,6 +3532,91 @@ async function verifyBatchWrite(sheets, spreadsheetId, writes, options = {}) {
   }
 
   return { ok: discrepancies.length === 0, discrepancies };
+}
+
+/**
+ * Re-checks appointment labels, date headers, and current cell values in one
+ * batch immediately before an attendance write. This narrows the race window
+ * between resolving a live row and writing it, and fails the whole batch closed
+ * if somebody moved a row or edited a target cell in the meantime.
+ */
+async function validateAttendanceWriteTargets(sheets, spreadsheetId, targets) {
+  if (!targets.length || typeof sheets.spreadsheets.values.batchGet !== "function") {
+    return;
+  }
+
+  const expectationsByRange = new Map();
+
+  for (const target of targets) {
+    const expectations = [
+      {
+        range: target.appointmentRange,
+        expected: target.expectedAppointment,
+        normalize: normalizeAppointmentIdentity
+      },
+      {
+        range: target.dateHeaderRange,
+        expected: target.expectedDateLabel,
+        normalize: (value) => String(value ?? "").trim()
+      },
+      {
+        range: target.range,
+        expected: target.expectedPreviousValue,
+        normalize: (value) => String(value ?? "").trim()
+      }
+    ];
+
+    for (const { range, expected, normalize } of expectations) {
+      const rawExpected = String(expected ?? "").trim();
+      const normalizedExpected = normalize(rawExpected);
+      const existingExpectation = expectationsByRange.get(range);
+
+      if (
+        existingExpectation !== undefined &&
+        existingExpectation.normalizedExpected !== normalizedExpected
+      ) {
+        throw new Error(`Conflicting attendance preflight expectations for ${range}`);
+      }
+      expectationsByRange.set(range, {
+        rawExpected,
+        normalizedExpected,
+        normalize
+      });
+    }
+  }
+
+  const ranges = [...expectationsByRange.keys()];
+  const response = await runGoogleSheetsRequest(
+    `spreadsheets.values.batchGet:attendancePreflight:${ranges.length}range(s)`,
+    (signal) => sheets.spreadsheets.values.batchGet({ spreadsheetId, ranges }, { signal })
+  );
+  const valueRanges = response.data.valueRanges ?? [];
+  const mismatches = [];
+
+  for (let index = 0; index < ranges.length; index += 1) {
+    const range = ranges[index];
+    const expectation = expectationsByRange.get(range);
+    const actual = String(valueRanges[index]?.values?.[0]?.[0] ?? "").trim();
+
+    if (expectation.normalize(actual) !== expectation.normalizedExpected) {
+      mismatches.push({
+        range,
+        expected: expectation.rawExpected,
+        actual
+      });
+    }
+  }
+
+  if (mismatches.length > 0) {
+    const error = new Error(
+      `Attendance write target changed during preflight: ${mismatches
+        .map(({ range, expected, actual }) => `${range} expected "${expected}", found "${actual}"`)
+        .join("; ")}`
+    );
+    error.code = "ATTENDANCE_TARGET_CHANGED";
+    error.mismatches = mismatches;
+    throw error;
+  }
 }
 
 async function readSheetValues(sheets, spreadsheetId, title, range = `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${DEFAULT_MAX_MANAGED_ROWS}`) {
@@ -3685,38 +3829,54 @@ export async function syncOnboardingRoster(sheets, config, options = {}) {
     });
   }
 
-  // Pre-Step 1b: Restore any bound appointments that were removed from the sheet
-  // but are still active in the registry.  These are passed in from the caller
-  // (bot.js syncRosterState) so we don't need a storage import here.
-  // Appointments are only re-added; duplicates (already in ONBOARDING) are skipped.
+  // Pre-Step 1b: Reconcile ONBOARDING with the local main registry.
+  // One-sided active appointments are restored. Rows are removed only when the
+  // registry carries an explicit bot-removal tombstone.
   {
-    const boundToRestore = options.boundAppointmentsToRestore ?? [];
-    if (boundToRestore.length > 0) {
-      const currentIdentities = new Set(
-        onboardingSlice.appointments.map(normalizeAppointmentIdentity)
-      );
-      const missing = boundToRestore.filter(
-        (appt) => !currentIdentities.has(normalizeAppointmentIdentity(appt))
-      );
+    const appointmentsToRestore = options.appointmentsToRestore ??
+      options.boundAppointmentsToRestore ??
+      [];
+    const removalIdentities = new Set(
+      (options.appointmentsToRemove ?? []).map(normalizeAppointmentIdentity)
+    );
+    const retainedAppointments = onboardingSlice.appointments.filter(
+      (appointment) => !removalIdentities.has(normalizeAppointmentIdentity(appointment))
+    );
+    const retainedIdentities = new Set(
+      retainedAppointments.map(normalizeAppointmentIdentity)
+    );
+    const missing = appointmentsToRestore.filter((appointment) => {
+      const identity = normalizeAppointmentIdentity(appointment);
+      return identity && !removalIdentities.has(identity) && !retainedIdentities.has(identity);
+    });
+    const removed = onboardingSlice.appointments.filter((appointment) =>
+      removalIdentities.has(normalizeAppointmentIdentity(appointment))
+    );
+
+    if (missing.length > 0 || removed.length > 0) {
       if (missing.length > 0) {
         logSheetsSuccess(
-          `[ONBOARDING] Restoring ${missing.length} bound appointment(s) removed from sheet: ${missing.join(", ")}`
+          `[ONBOARDING] Restoring ${missing.length} appointment(s) from the main registry: ${missing.join(", ")}`
         );
-        // Append missing entries; reconciliation will sort them into position.
-        const restoredList = [...onboardingSlice.appointments, ...missing];
-        await writeAppointmentColumn(
-          sheets,
-          config.spreadsheetId,
-          title,
-          restoredList,
-          { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
-        );
-        onboardingSlice = await refreshOnboardingSlice(sheets, config, {
-          cache,
-          force: true,
-          persist: false
-        });
       }
+      if (removed.length > 0) {
+        logSheetsSuccess(
+          `[ONBOARDING] Applying ${removed.length} deliberate bot removal(s): ${removed.join(", ")}`
+        );
+      }
+
+      await writeAppointmentColumn(
+        sheets,
+        config.spreadsheetId,
+        title,
+        [...retainedAppointments, ...missing],
+        { trimTrailingRows: true, stopMarkers: config.rosterStopMarkers, cache }
+      );
+      onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+        cache,
+        force: true,
+        persist: false
+      });
     }
   }
 
@@ -3941,6 +4101,7 @@ export async function addAppointmentToSheets(sheets, config, appointment) {
     appointment,
     appointmentCount: nextAppointments.length
   });
+  return nextAppointments;
 }
 
 export async function removeAppointmentFromSheets(sheets, config, appointment) {
@@ -3976,6 +4137,7 @@ export async function removeAppointmentFromSheets(sheets, config, appointment) {
     appointment,
     appointmentCount: nextAppointments.length
   });
+  return nextAppointments;
 }
 
 export async function writeAttendanceStatus(sheets, config, entry) {
@@ -4126,6 +4288,7 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
 
   const results = [];
   const writtenEventIds = [];
+  const writtenEntries = [];
   const skippedEvents = [];
   const conflictedEvents = [];
   const cache = await readLocalSheetCache();
@@ -4145,8 +4308,8 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
 
     // Build appointment → 1-indexed row number from column A, stopping at the
     // roster stop marker. Track duplicates so we can report the right reason.
-    const rowNumbersByAppointment = {};
-    const appointmentRowCounts = {};
+    const rowNumbersByIdentity = new Map();
+    const appointmentRowCounts = new Map();
     for (let i = 1; i < values.length; i++) {
       const appointment = normalizeAppointmentLabel(String(values[i]?.[0] ?? "").trim());
       if (!appointment) {
@@ -4155,36 +4318,65 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
       if (isStopMarker(appointment, config.rosterStopMarkers)) {
         break;
       }
-      appointmentRowCounts[appointment] = (appointmentRowCounts[appointment] ?? 0) + 1;
-      if (!rowNumbersByAppointment[appointment]) {
-        rowNumbersByAppointment[appointment] = i + 1; // values is 0-indexed; rows are 1-indexed
+      const identity = normalizeAppointmentIdentity(appointment);
+      appointmentRowCounts.set(identity, (appointmentRowCounts.get(identity) ?? 0) + 1);
+      if (!rowNumbersByIdentity.has(identity)) {
+        rowNumbersByIdentity.set(identity, i + 1); // values is 0-indexed; rows are 1-indexed
       }
     }
 
     const data = [];
+    const writeTargets = [];
 
     for (const entry of sheetEntries) {
-      const rowNumber = rowNumbersByAppointment[entry.appointment];
+      const identity = normalizeAppointmentIdentity(entry.appointment);
+      const expectedIdentity = normalizeAppointmentIdentity(
+        entry.expectedAppointment ?? entry.appointment
+      );
+      const rowNumber = rowNumbersByIdentity.get(identity);
+
+      if (expectedIdentity !== identity) {
+        conflictedEvents.push({
+          eventId: entry.id,
+          reason: "appointment_identity_changed",
+          error: `Queued appointment identity does not match ${entry.appointment}`
+        });
+        continue;
+      }
+
+      if ((appointmentRowCounts.get(identity) ?? 0) > 1) {
+        conflictedEvents.push({
+          eventId: entry.id,
+          reason: "duplicate_appointment_row",
+          error: `Multiple appointment rows found for ${entry.appointment} in ${sheetTitle}`
+        });
+        continue;
+      }
 
       if (!rowNumber) {
         conflictedEvents.push({
           eventId: entry.id,
-          reason: (appointmentRowCounts[entry.appointment] ?? 0) > 1
-            ? "duplicate_appointment_row"
-            : "appointment_missing",
+          reason: "appointment_missing",
           error: `Appointment row not found for ${entry.appointment} in ${sheetTitle}`
         });
         continue;
       }
 
       const expectedDateLabel = entry.expectedDateLabel ?? getExpectedDateHeaderLabel(entry.date, config.timezone);
-      const columnIndex = headerRow.findIndex((value) => value === expectedDateLabel);
+      const matchingColumnIndices = headerRow
+        .map((value, index) => value === expectedDateLabel ? index : -1)
+        .filter((index) => index >= 0);
+      const columnIndex = matchingColumnIndices[0] ?? -1;
 
-      if (columnIndex === -1) {
+      if (matchingColumnIndices.length !== 1) {
         conflictedEvents.push({
           eventId: entry.id,
-          reason: "date_column_changed",
-          error: `Date column not found for ${expectedDateLabel} in ${sheetTitle}`
+          reason: matchingColumnIndices.length > 1
+            ? "duplicate_date_column"
+            : "date_column_changed",
+          error: matchingColumnIndices.length > 1
+            ? `Multiple date columns found for ${expectedDateLabel} in ${sheetTitle}`
+            : `Date column not found for ${expectedDateLabel} in ${sheetTitle}`
         });
         continue;
       }
@@ -4218,13 +4410,28 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
         cell
       });
       writtenEventIds.push(entry.id);
+      writtenEntries.push(entry);
+      const range = `'${sheetTitle}'!${cell}`;
       data.push({
-        range: `'${sheetTitle}'!${cell}`,
+        range,
         values: [[entry.status]]
+      });
+      writeTargets.push({
+        range,
+        appointmentRange: `'${sheetTitle}'!A${rowNumber}`,
+        dateHeaderRange: `'${sheetTitle}'!${columnNumberToLabel(columnNumber)}1`,
+        expectedAppointment: entry.appointment,
+        expectedDateLabel,
+        expectedPreviousValue: liveValue
       });
     }
 
     if (data.length > 0) {
+      await validateAttendanceWriteTargets(
+        sheets,
+        config.spreadsheetId,
+        writeTargets
+      );
       await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${sheetTitle}:attendanceWrite`, (signal) =>
         sheets.spreadsheets.values.batchUpdate({
           spreadsheetId: config.spreadsheetId,
@@ -4238,8 +4445,7 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
     }
   }
 
-  const successfulEntries = entries.filter((entry) => writtenEventIds.includes(entry.id) || !entry.id);
-  await persistAttendanceEntriesToLocalCache(sheets, config, successfulEntries);
+  await persistAttendanceEntriesToLocalCache(sheets, config, writtenEntries);
 
   return { results, writtenEventIds, skippedEvents, conflictedEvents };
 }
@@ -4260,9 +4466,17 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
       date: entry.date ?? new Date(`${entry.date}T12:00:00.000Z`)
     }))
   );
-  const monthTitles = [...new Set(
-    entries.map((entry) => entry.targetSheetTitle ?? getMonthParts(entry.date, config.timezone).title)
-  )];
+  const entriesByMonth = new Map();
+
+  for (const entry of entries) {
+    const title = entry.targetSheetTitle ?? getMonthParts(entry.date, config.timezone).title;
+
+    if (!entriesByMonth.has(title)) {
+      entriesByMonth.set(title, []);
+    }
+    entriesByMonth.get(title).push(entry);
+  }
+  const monthTitles = [...entriesByMonth.keys()];
 
   // Metadata (sheet IDs) doesn't change between reconcile cycles; always use cache to avoid
   // a slow spreadsheets.get on every 5-minute flush.
@@ -4288,6 +4502,7 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
   }
 
   const data = [];
+  const writeTargets = [];
   const results = [];
   const writtenEventIds = [];
   const skippedEvents = [];
@@ -4304,9 +4519,7 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
       getDateFromMonthTitle(title) ?? new Date(),
       config.timezone
     );
-    const monthEntries = entries.filter(
-      (entry) => (entry.targetSheetTitle ?? getMonthParts(entry.date, config.timezone).title) === title
-    );
+    const monthEntries = entriesByMonth.get(title) ?? [];
 
     if ((remoteSlice.unexpectedAppointments?.length ?? 0) > 0) {
       conflictedEvents.push(
@@ -4327,6 +4540,19 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
       const day = dayOfMonth(entry.date, config.timezone);
       const columnIndex = Number(remoteSlice.recognizedDateColumns?.[String(day)] ?? -1);
       const rowNumber = Number(remoteSlice.rowNumbersByAppointment?.[entry.appointment] ?? 0);
+      const expectedIdentity = normalizeAppointmentIdentity(
+        entry.expectedAppointment ?? entry.appointment
+      );
+      const identity = normalizeAppointmentIdentity(entry.appointment);
+
+      if (expectedIdentity !== identity) {
+        conflictedEvents.push({
+          eventId: entry.id,
+          reason: "appointment_identity_changed",
+          error: `Queued appointment identity does not match ${entry.appointment}`
+        });
+        continue;
+      }
 
       if (!rowNumber) {
         conflictedEvents.push({
@@ -4339,11 +4565,25 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
         continue;
       }
 
-      if (columnIndex < 0) {
+      const expectedDateLabel = entry.expectedDateLabel ??
+        getExpectedDateHeaderLabel(entry.date, config.timezone);
+      const matchingColumnIndices = (remoteSlice.headerRow ?? [])
+        .map((value, index) => value === expectedDateLabel ? index : -1)
+        .filter((index) => index >= 0);
+
+      if (
+        columnIndex < 0 ||
+        matchingColumnIndices.length !== 1 ||
+        matchingColumnIndices[0] !== columnIndex
+      ) {
         conflictedEvents.push({
           eventId: entry.id,
-          reason: "date_column_changed",
-          error: `Date column not found for ${entry.expectedDateLabel ?? getExpectedDateHeaderLabel(entry.date, config.timezone)}`
+          reason: matchingColumnIndices.length > 1
+            ? "duplicate_date_column"
+            : "date_column_changed",
+          error: matchingColumnIndices.length > 1
+            ? `Multiple date columns found for ${expectedDateLabel}`
+            : `Date column not found for ${expectedDateLabel}`
         });
         continue;
       }
@@ -4351,6 +4591,11 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
       const previousValue = getSnapshotCellValue(previousSnapshot, entry.appointment, day);
       const remoteValue = getSnapshotCellValue(remoteSlice.snapshot, entry.appointment, day);
       const referenceValue = getSnapshotCellValue(referenceSnapshot, entry.appointment, day);
+      const remoteRawValue = remoteSlice.aliasCorrections?.find((correction) =>
+        correction.appointment === entry.appointment &&
+        correction.rowNumber === rowNumber &&
+        correction.columnIndex === columnIndex
+      )?.rawValue ?? remoteValue;
 
       if (remoteValue !== previousValue) {
         if (referenceValue === remoteValue) {
@@ -4371,9 +4616,18 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
       }
 
       const cell = `${columnNumberToLabel(columnIndex + 1)}${rowNumber}`;
+      const range = `'${title}'!${cell}`;
       data.push({
-        range: `'${title}'!${cell}`,
+        range,
         values: [[referenceValue]]
+      });
+      writeTargets.push({
+        range,
+        appointmentRange: `'${title}'!A${rowNumber}`,
+        dateHeaderRange: `'${title}'!${columnNumberToLabel(columnIndex + 1)}1`,
+        expectedAppointment: entry.appointment,
+        expectedDateLabel,
+        expectedPreviousValue: remoteRawValue
       });
       results.push({
         appointment: entry.appointment,
@@ -4399,6 +4653,11 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
   }
 
   if (data.length > 0) {
+    await validateAttendanceWriteTargets(
+      sheets,
+      config.spreadsheetId,
+      writeTargets
+    );
     await runGoogleSheetsRequest("spreadsheets.values.batchUpdate:reconcilePending", (signal) =>
       sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: config.spreadsheetId,
@@ -4484,7 +4743,7 @@ export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
  * This is intentionally expensive and should only be called once a day (midnight cron).
  * Hot-path read cycles should use preloadAttendanceSnapshots({ structural: false }).
  */
-export async function runDailySheetMaintenance(sheets, config) {
+export async function runDailySheetMaintenance(sheets, config, options = {}) {
   const cache = await readLocalSheetCache();
 
   // Stamp the attempt time immediately so that if this run fails and the process
@@ -4493,7 +4752,7 @@ export async function runDailySheetMaintenance(sheets, config) {
   await writeLocalSheetCache(cache);
 
   // Full onboarding + monthly sheet structural sync (row inserts, formatting, protections).
-  await syncOnboardingRoster(sheets, config, { cache });
+  const roster = await syncOnboardingRoster(sheets, config, { cache, ...options });
 
   // Force-refresh snapshots with structural writes + alias normalisation enabled.
   // Pass the same cache object to skip the redundant readLocalSheetCache() inside.
@@ -4511,7 +4770,7 @@ export async function runDailySheetMaintenance(sheets, config) {
     lastStructuralMaintenanceAt: cache.lastStructuralMaintenanceAt
   });
 
-  return { maintenanceAt: cache.lastStructuralMaintenanceAt };
+  return { maintenanceAt: cache.lastStructuralMaintenanceAt, ...roster };
 }
 
 export async function getLastStructuralMaintenanceAt() {
@@ -4814,6 +5073,7 @@ export const __testing = {
   getExpectedDateHeaderLabel,
   getMonthParts,
   shiftMonth,
+  validateAttendanceWriteTargets,
   writeMonthlySheetRows,
   writeAppointmentColumn,
   reconcileOnboardingWithConfig

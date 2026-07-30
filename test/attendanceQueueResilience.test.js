@@ -254,3 +254,57 @@ test("enqueueAttendanceEvents then flush writes last-write-wins across 10 events
     assert.equal(pending.length, 0);
   });
 });
+
+test("new attendance can be enqueued while a remote flush is still running", async () => {
+  await withTempDataDir(async () => {
+    await enqueueAttendanceEvent(CONFIG, makeEvent("HOTEL", "PRESENT"));
+
+    let releaseRemoteWrite;
+    let signalRemoteWriteStarted;
+    const remoteWriteStarted = new Promise((resolve) => {
+      signalRemoteWriteStarted = resolve;
+    });
+    const remoteWriteGate = new Promise((resolve) => {
+      releaseRemoteWrite = resolve;
+    });
+
+    const flushPromise = flushAttendanceQueue(async (entries) => {
+      signalRemoteWriteStarted();
+      await remoteWriteGate;
+      return {
+        writtenEventIds: entries.map((entry) => entry.id),
+        skippedEvents: [],
+        conflictedEvents: []
+      };
+    });
+
+    await remoteWriteStarted;
+
+    try {
+      let enqueueTimeout;
+      const enqueued = await Promise.race([
+        enqueueAttendanceEvent(CONFIG, makeEvent("INDIA", "WFH")),
+        new Promise((_, reject) => {
+          enqueueTimeout = setTimeout(
+            () => reject(new Error("enqueue was blocked by the remote flush")),
+            500
+          );
+        })
+      ]);
+      clearTimeout(enqueueTimeout);
+
+      assert.equal(enqueued.appointment, "INDIA");
+    } finally {
+      releaseRemoteWrite();
+    }
+
+    await flushPromise;
+
+    const pending = await listPendingAttendanceEvents();
+    assert.deepEqual(
+      pending.map((event) => event.appointment),
+      ["INDIA"],
+      "the event added during the flush must remain pending for the next cycle"
+    );
+  });
+});

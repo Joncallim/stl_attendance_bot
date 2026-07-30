@@ -90,11 +90,13 @@ The inline admin menu also includes:
 
 ### Canonical Roster
 
-`ONBOARDING` is the roster source of truth.
+`ONBOARDING` and the local appointment registry are mirrored roster records.
 
 - Column `A` contains appointment names.
 - Column `B` contains the generated secret code for each appointment.
 - The visible managed appointment order in `ONBOARDING` is the canonical order used everywhere else.
+- If an appointment survives in either `ONBOARDING` or `appointment-registry.json`, roster sync restores it to the missing side.
+- Automatic roster deletion requires an explicit bot-removal tombstone; a one-sided disappearance is treated as an interrupted write.
 - The bot no longer relies on `Remarks` as a stop marker.
 - Anything outside the managed `ONBOARDING` columns is treated conservatively and should not be assumed to be bot-owned.
 
@@ -197,7 +199,9 @@ Summary features include:
 
 The bot is intentionally conservative when people edit spreadsheets manually.
 
-- `ONBOARDING` is the only authoritative source for active roster membership and canonical order.
+- `ONBOARDING` remains authoritative for visible row order; active membership is reconciled as the union of `ONBOARDING` and the local appointment registry.
+- Roster and binding checksums are stored after reconciliation. Missing user/registry bindings are repaired from the surviving side.
+- A user binding is cleared automatically only when its appointment exists in neither active roster record, or when the bot deliberately removed that appointment.
 - Month-sheet writes are resolved by appointment name, not by row position.
 - If the sheet is ambiguous, the bot fails safe instead of guessing.
 - Direct sheet edits are preferred over stale bot assumptions during reconciliation.

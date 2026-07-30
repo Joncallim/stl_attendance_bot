@@ -8,6 +8,7 @@ import {
   getUserByChatId,
   listUsers,
   syncAppointmentRegistry,
+  updateUserByChatId,
   upsertUser
 } from "../src/storage.js";
 
@@ -181,5 +182,33 @@ test("batchUpdateUsersByChatId handles 100-user batches correctly", async () => 
     assert.equal(user50?.awaitingAttendance, false);
     const user49 = await getUserByChatId("49");
     assert.equal(user49?.awaitingAttendance, true);
+  });
+});
+
+test("concurrent single-user patches are coalesced without losing updates", async () => {
+  await withTempDataDir(async () => {
+    const count = 50;
+
+    for (let i = 0; i < count; i++) {
+      await upsertUser(makeUser(String(i), i));
+    }
+
+    const results = await Promise.all(
+      Array.from({ length: count }, (_, i) =>
+        updateUserByChatId(String(i), {
+          awaitingAttendance: false,
+          lastSubmittedAt: `submission-${i}`
+        })
+      )
+    );
+
+    assert.equal(results.length, count);
+    assert.ok(results.every(Boolean));
+
+    const users = await listUsers();
+    assert.deepEqual(
+      users.map((user) => user.lastSubmittedAt),
+      Array.from({ length: count }, (_, i) => `submission-${i}`)
+    );
   });
 });
