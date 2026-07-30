@@ -3456,11 +3456,16 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       return;
     }
 
+    const broadcastStartedAt = Date.now();
+    const broadcastContext = buildAttendancePromptBroadcastContext(config);
     const promptResults = await allSettledConcurrent(
-      users.map((user) => () => buildAndSendAttendancePrompt(bot, config, user, cache)),
+      users.map((user) => () =>
+        buildAndSendAttendancePrompt(bot, config, user, cache, broadcastContext)
+      ),
       TELEGRAM_SEND_CONCURRENCY
     );
     const sent = promptResults.filter((r) => r.status === "fulfilled").length;
+    logAttendancePromptBroadcast("manual", broadcastStartedAt, promptResults);
 
     const promptedAt = new Date().toISOString();
     const patches = [];
@@ -3580,26 +3585,74 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
 // Sends the attendance prompt message to a pre-fetched user object and returns
 // the state patch to apply. Caller is responsible for writing the patch to disk
 // so that bulk sends can batch all writes into a single storage operation.
-async function buildAndSendAttendancePrompt(bot, config, user, cache) {
-  const today = new Date();
-  const dateLabel = formatAttendanceDateLabel(today, config.timezone);
-  const currentStatus = user?.appointment && cache
-    ? getCachedAttendanceStatus(cache, config, user.appointment, today)
-    : "";
-  const message = buildTodayAttendancePromptMessage(config, today, user?.appointment ?? null, cache);
-  const promptMessage = currentStatus
-    ? `Your attendance for ${dateLabel} is currently ${currentStatus}. Update it if needed.`
-    : `You have not updated your attendance for ${dateLabel}. ${message}`;
-  const sentMessage = await bot.telegram.sendMessage(
-    user.chatId,
-    promptMessage,
-    buildInlineAttendanceMenu(
+function buildAttendancePromptBroadcastContext(config, date = new Date()) {
+  const dateLabel = formatAttendanceDateLabel(date, config.timezone);
+
+  return {
+    date,
+    dateLabel,
+    emptyStatusMessage:
+      `You have not updated your attendance for ${dateLabel}. ` +
+      `Select your attendance for ${dateLabel}.`,
+    replyMarkup: buildInlineAttendanceMenu(
       config.attendanceOptions,
       0,
       "home:pick:attendance",
       "home:attendance:page",
       "home:main"
     )
+  };
+}
+
+function logAttendancePromptBroadcast(source, startedAt, results) {
+  const latencies = results
+    .filter((result) => result.status === "fulfilled")
+    .map((result) => Number(result.value?.sendLatencyMs))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  const percentile = (ratio) => {
+    if (latencies.length === 0) {
+      return null;
+    }
+
+    return latencies[Math.min(
+      latencies.length - 1,
+      Math.ceil(latencies.length * ratio) - 1
+    )];
+  };
+
+  logBot("Attendance prompt broadcast completed.", {
+    source,
+    recipients: results.length,
+    sent: results.filter((result) => result.status === "fulfilled").length,
+    failed: results.filter((result) => result.status === "rejected").length,
+    durationMs: Date.now() - startedAt,
+    sendLatencyP50Ms: percentile(0.5),
+    sendLatencyP95Ms: percentile(0.95)
+  });
+}
+
+async function buildAndSendAttendancePrompt(
+  bot,
+  config,
+  user,
+  cache,
+  broadcastContext = null
+) {
+  const context = broadcastContext ?? buildAttendancePromptBroadcastContext(config);
+  const today = context.date;
+  const dateLabel = context.dateLabel;
+  const currentStatus = user?.appointment && cache
+    ? getCachedAttendanceStatus(cache, config, user.appointment, today)
+    : "";
+  const promptMessage = currentStatus
+    ? `Your attendance for ${dateLabel} is currently ${currentStatus}. Update it if needed.`
+    : context.emptyStatusMessage;
+  const sendStartedAt = Date.now();
+  const sentMessage = await bot.telegram.sendMessage(
+    user.chatId,
+    promptMessage,
+    context.replyMarkup
   );
   return {
     chatId: user.chatId,
@@ -3607,7 +3660,8 @@ async function buildAndSendAttendancePrompt(bot, config, user, cache) {
     attendancePromptMessageIds: appendAttendancePromptMessageId(
       user,
       getMessageId(sentMessage)
-    )
+    ),
+    sendLatencyMs: Date.now() - sendStartedAt
   };
 }
 
@@ -4382,14 +4436,18 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   const isReminderWorkingDayFn = deps.isReminderWorkingDayFn ?? isReminderWorkingDay;
   const listUsersFn = deps.listUsersFn ?? listUsers;
   const sendPromptToChatFn = deps.sendPromptToChatFn ?? sendPromptToChat;
+  const usesDefaultPromptBuilder =
+    !deps.buildAndSendAttendancePromptFn && !deps.sendPromptToChatFn;
   const buildAndSendAttendancePromptFn = deps.buildAndSendAttendancePromptFn ??
     (deps.sendPromptToChatFn
       ? async (targetBot, targetConfig, user, cache) => {
+          const sendStartedAt = Date.now();
           await sendPromptToChatFn(targetBot, targetConfig, user.chatId, cache);
           return {
             chatId: user.chatId,
             awaitingAttendance: true,
-            attendancePromptMessageIds: user.attendancePromptMessageIds ?? []
+            attendancePromptMessageIds: user.attendancePromptMessageIds ?? [],
+            sendLatencyMs: Date.now() - sendStartedAt
           };
         }
       : buildAndSendAttendancePrompt);
@@ -4567,10 +4625,24 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
           return;
         }
 
-        try {
-          await adminCache.syncManager.runCycle({ force: true, reason: "reminder" });
-        } catch (error) {
-          logBotWarn(`[Reminder] Sheet refresh failed before ${reminderTime} reminder — using cached data.`, { error: error.message });
+        const isFirstReminder = reminderTime === config.firstReminderTime;
+        const refreshPromise = Promise.resolve()
+          .then(() =>
+            adminCache.syncManager.runCycle({ force: true, reason: "reminder" })
+          )
+          .catch((error) => {
+            logBotWarn(
+              `[Reminder] Sheet refresh failed before ${reminderTime} reminder — using cached data.`,
+              { error: error.message }
+            );
+          });
+
+        // The first reminder always targets every bound user, so fresh Sheets
+        // data is not needed to choose recipients. Let synchronization continue
+        // in parallel. The second reminder must wait because it only targets
+        // people whose attendance is still unfilled.
+        if (!isFirstReminder) {
+          await refreshPromise;
         }
 
         const users = (await listUsersFn()).filter((user) => {
@@ -4578,16 +4650,33 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
             return false;
           }
 
-          if (reminderTime === config.firstReminderTime) {
+          if (isFirstReminder) {
             return true;
           }
 
           return hasUnfilledAttendance(adminCache, config, user.appointment, now);
         });
 
+        const broadcastStartedAt = Date.now();
+        const broadcastContext = usesDefaultPromptBuilder
+          ? buildAttendancePromptBroadcastContext(config, now)
+          : null;
         const promptResults = await allSettledConcurrent(
-          users.map((user) => () => buildAndSendAttendancePromptFn(bot, config, user, adminCache)),
+          users.map((user) => () =>
+            buildAndSendAttendancePromptFn(
+              bot,
+              config,
+              user,
+              adminCache,
+              broadcastContext
+            )
+          ),
           TELEGRAM_SEND_CONCURRENCY
+        );
+        logAttendancePromptBroadcast(
+          `reminder:${reminderTime}`,
+          broadcastStartedAt,
+          promptResults
         );
 
         const promptedAt = new Date().toISOString();

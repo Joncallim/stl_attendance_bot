@@ -1,7 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { allSettledConcurrent, TELEGRAM_SEND_INTERVAL_MS, TELEGRAM_SEND_CONCURRENCY } from "../src/concurrency.js";
+import {
+  __testing,
+  allSettledConcurrent,
+  TELEGRAM_SEND_INTERVAL_MS,
+  TELEGRAM_SEND_CONCURRENCY
+} from "../src/concurrency.js";
+
+test.beforeEach(() => {
+  __testing.resetTelegramSendLimiter();
+});
 
 // ── Correctness ───────────────────────────────────────────────────────────────
 
@@ -138,10 +147,69 @@ test("rate stagger ensures 30 fast tasks take at least (count-1) * INTERVAL ms t
   );
 });
 
+test("overlapping broadcasts share one process-wide send rate", async () => {
+  const startTimes = [];
+  const makeBatch = (batch) =>
+    allSettledConcurrent(
+      Array.from({ length: 8 }, (_, index) => async () => {
+        startTimes.push({ batch, index, startedAt: Date.now() });
+      }),
+      TELEGRAM_SEND_CONCURRENCY
+    );
+
+  await Promise.all([makeBatch("manual"), makeBatch("scheduled")]);
+
+  const sortedStarts = startTimes
+    .map((entry) => entry.startedAt)
+    .sort((left, right) => left - right);
+  const tolerance = 5;
+
+  for (let index = 1; index < sortedStarts.length; index += 1) {
+    assert.ok(
+      sortedStarts[index] - sortedStarts[index - 1] >=
+        TELEGRAM_SEND_INTERVAL_MS - tolerance,
+      "overlapping batches must not reserve independent send slots"
+    );
+  }
+});
+
+test("Telegram 429 responses retry after the requested global pause", async () => {
+  let attempts = 0;
+  const startedAt = Date.now();
+  const [result] = await allSettledConcurrent(
+    [async () => {
+      attempts += 1;
+
+      if (attempts === 1) {
+        const error = new Error("Too Many Requests");
+        error.code = 429;
+        error.parameters = { retry_after: 0.02 };
+        throw error;
+      }
+
+      return "sent";
+    }],
+    TELEGRAM_SEND_CONCURRENCY
+  );
+
+  assert.equal(result.status, "fulfilled");
+  assert.equal(result.value, "sent");
+  assert.equal(attempts, 2);
+  assert.ok(
+    Date.now() - startedAt >= TELEGRAM_SEND_INTERVAL_MS - 5,
+    "retry must pass through the shared rate limiter"
+  );
+});
+
 test("TELEGRAM_SEND_INTERVAL_MS constant enforces < 30 msgs/sec throughput", () => {
   const maxPerSecond = 1000 / TELEGRAM_SEND_INTERVAL_MS;
   assert.ok(
     maxPerSecond <= 30,
     `Rate cap ${maxPerSecond.toFixed(1)} sends/sec should be at most 30; interval=${TELEGRAM_SEND_INTERVAL_MS}ms`
   );
+});
+
+test("in-flight capacity exceeds the launch rate for slow Telegram responses", () => {
+  const launchesPerSecond = 1000 / TELEGRAM_SEND_INTERVAL_MS;
+  assert.ok(TELEGRAM_SEND_CONCURRENCY > launchesPerSecond);
 });

@@ -1,30 +1,141 @@
-export const TELEGRAM_SEND_CONCURRENCY = 25;
-// Minimum gap between successive send starts: 1000ms / 25 sends = 40ms.
-// Caps throughput at ~25 sends/sec regardless of individual RTTs.
+// Keep launch rate below Telegram's approximate free broadcast limit of
+// 30 messages/second, leaving headroom for interactive replies and edits.
 export const TELEGRAM_SEND_INTERVAL_MS = 40;
+// Launch rate and in-flight capacity are separate concerns. Fifty in-flight
+// requests preserves 25 sends/second even when Telegram response latency rises
+// above one second.
+export const TELEGRAM_SEND_CONCURRENCY = 50;
+export const TELEGRAM_SEND_MAX_ATTEMPTS = 3;
+
+function sleep(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+function getTelegramRetryAfterMs(error) {
+  const code = Number(
+    error?.code ??
+    error?.response?.error_code ??
+    error?.response?.status ??
+    error?.status
+  );
+
+  if (code !== 429) {
+    return null;
+  }
+
+  const retryAfterSeconds = Number(
+    error?.parameters?.retry_after ??
+    error?.response?.parameters?.retry_after ??
+    error?.response?.data?.parameters?.retry_after
+  );
+
+  return Number.isFinite(retryAfterSeconds) && retryAfterSeconds >= 0
+    ? Math.ceil(retryAfterSeconds * 1000)
+    : 1000;
+}
+
+function createTelegramSendLimiter(options = {}) {
+  const intervalMs = options.intervalMs ?? TELEGRAM_SEND_INTERVAL_MS;
+  const nowFn = options.nowFn ?? Date.now;
+  const sleepFn = options.sleepFn ?? sleep;
+  let nextAllowedAt = 0;
+  let blockedUntil = 0;
+  let slotTail = Promise.resolve();
+
+  function waitForSlot() {
+    const slot = slotTail.catch(() => {}).then(async () => {
+      while (true) {
+        const now = nowFn();
+        const target = Math.max(nextAllowedAt, blockedUntil);
+        const delayMs = target - now;
+
+        if (delayMs <= 0) {
+          nextAllowedAt = now + intervalMs;
+          return;
+        }
+
+        await sleepFn(delayMs);
+      }
+    });
+
+    slotTail = slot;
+    return slot;
+  }
+
+  function pause(delayMs) {
+    blockedUntil = Math.max(blockedUntil, nowFn() + Math.max(0, delayMs));
+  }
+
+  function reset() {
+    nextAllowedAt = 0;
+    blockedUntil = 0;
+    slotTail = Promise.resolve();
+  }
+
+  return { waitForSlot, pause, reset };
+}
+
+// This singleton is intentionally shared by every allSettledConcurrent call.
+// Separate manual and scheduled broadcasts must contribute to one Telegram
+// launch rate instead of each independently sending 25 messages/second.
+const telegramSendLimiter = createTelegramSendLimiter();
+
+async function runTelegramSend(fn) {
+  let attempt = 0;
+
+  while (attempt < TELEGRAM_SEND_MAX_ATTEMPTS) {
+    attempt += 1;
+    await telegramSendLimiter.waitForSlot();
+
+    try {
+      return await fn();
+    } catch (error) {
+      const retryAfterMs = getTelegramRetryAfterMs(error);
+
+      if (retryAfterMs === null || attempt >= TELEGRAM_SEND_MAX_ATTEMPTS) {
+        throw error;
+      }
+
+      telegramSendLimiter.pause(retryAfterMs);
+    }
+  }
+
+  return null;
+}
 
 /**
- * Runs async factory functions with at most `concurrency` in-flight at once,
- * staggering each send start by TELEGRAM_SEND_INTERVAL_MS to enforce a
- * per-second rate cap. Returns a Promise.allSettled-compatible result array.
+ * Runs async Telegram send factories with bounded in-flight work and one
+ * process-wide launch rate. Results preserve input order and use the
+ * Promise.allSettled shape.
  */
 export async function allSettledConcurrent(fns, concurrency) {
   if (fns.length === 0) return [];
   const results = new Array(fns.length);
   let next = 0;
-  let nextAllowedAt = 0;
-  const workers = Array.from({ length: Math.min(concurrency, fns.length) }, async () => {
+  const workerCount = Math.max(1, Math.min(concurrency, fns.length));
+  const workers = Array.from({ length: workerCount }, async () => {
     while (next < fns.length) {
       const i = next++;
-      // Synchronously compute and reserve this send's time slot before any await.
-      // JS is single-threaded so no other worker runs between these two lines.
-      const now = Date.now();
-      const delay = Math.max(0, nextAllowedAt - now);
-      nextAllowedAt = Math.max(now, nextAllowedAt) + TELEGRAM_SEND_INTERVAL_MS;
-      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-      results[i] = await Promise.allSettled([fns[i]()]).then(([r]) => r);
+
+      try {
+        results[i] = {
+          status: "fulfilled",
+          value: await runTelegramSend(fns[i])
+        };
+      } catch (reason) {
+        results[i] = { status: "rejected", reason };
+      }
     }
   });
-  await Promise.allSettled(workers);
+
+  await Promise.all(workers);
   return results;
 }
+
+export const __testing = {
+  createTelegramSendLimiter,
+  getTelegramRetryAfterMs,
+  resetTelegramSendLimiter() {
+    telegramSendLimiter.reset();
+  }
+};

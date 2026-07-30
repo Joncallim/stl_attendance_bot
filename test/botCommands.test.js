@@ -784,10 +784,14 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
   assert.deepEqual(runCycleCalls, [{ force: false, reason: "startup" }]);
 });
 
-test("scheduled reminder forces a sync before sending prompts", async () => {
+test("first scheduled reminder refreshes Sheets without delaying prompts", async () => {
   const schedules = [];
   const runCycleCalls = [];
   const prompts = [];
+  let releaseReminderSync;
+  const reminderSync = new Promise((resolve) => {
+    releaseReminderSync = resolve;
+  });
 
   __testing.registerBackgroundSchedules({
     bot: {},
@@ -801,6 +805,10 @@ test("scheduled reminder forces a sync before sending prompts", async () => {
       syncManager: {
         runCycle: async (options) => {
           runCycleCalls.push(options);
+
+          if (options.reason === "reminder") {
+            await reminderSync;
+          }
         },
         setMaintenanceRunning: () => {}
       }
@@ -829,13 +837,19 @@ test("scheduled reminder forces a sync before sending prompts", async () => {
   // pending microtasks have drained so the startup runCycle has already pushed
   // its entry before the reminder handler starts.
   await new Promise((resolve) => setImmediate(resolve));
-  await reminderSchedule.fn();
+  const reminderResult = await Promise.race([
+    reminderSchedule.fn().then(() => "sent"),
+    new Promise((resolve) => setTimeout(() => resolve("blocked"), 250))
+  ]);
 
   assert.deepEqual(runCycleCalls, [
     { force: false, reason: "startup" },
     { force: true, reason: "reminder" }
   ]);
+  assert.equal(reminderResult, "sent", "first reminder should not wait for Sheets refresh");
   assert.deepEqual(prompts, ["chat-1"]);
+  releaseReminderSync();
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 test("scheduled reminder still sends prompts when pre-send sync fails", async () => {
@@ -889,6 +903,10 @@ test("scheduled reminder still sends prompts when pre-send sync fails", async ()
 test("0800 reminder only sends to users with unfilled attendance", async () => {
   const schedules = [];
   const prompts = [];
+  let releaseReminderSync;
+  const reminderSync = new Promise((resolve) => {
+    releaseReminderSync = resolve;
+  });
   const fixedNow = new Date("2026-03-24T00:05:00.000Z");
   const RealDate = Date;
 
@@ -917,7 +935,11 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
     },
     adminCache: {
       syncManager: {
-        runCycle: async () => {},
+        runCycle: async (options) => {
+          if (options.reason === "reminder") {
+            await reminderSync;
+          }
+        },
         setMaintenanceRunning: () => {}
       },
       sheetSnapshots: {
@@ -953,7 +975,13 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
 
   try {
     const reminderSchedule = schedules.find((entry) => entry.expression === "0 8 * * *");
-    await reminderSchedule.fn();
+    await new Promise((resolve) => setImmediate(resolve));
+    const reminderResult = reminderSchedule.fn();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(prompts, [], "second reminder must wait for fresh Sheets data");
+    releaseReminderSync();
+    await reminderResult;
   } finally {
     global.Date = RealDate;
   }
