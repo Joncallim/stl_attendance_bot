@@ -151,6 +151,45 @@ test("attendance prompt tracking is deduplicated and bounded", () => {
   );
 });
 
+test("Telegram identity validation only accepts the matching private user", () => {
+  assert.equal(__testing.isPrivateTelegramIdentity({
+    chat: { id: 42, type: "private" },
+    from: { id: 42 }
+  }), true);
+  assert.equal(__testing.isPrivateTelegramIdentity({
+    chat: { id: -100, type: "group" },
+    from: { id: 42 }
+  }), false);
+  assert.equal(__testing.isPrivateTelegramIdentity({
+    chat: { id: 41, type: "private" },
+    from: { id: 42 }
+  }), false);
+});
+
+test("daily attendance callbacks are bound to date and status content", () => {
+  const config = {
+    attendanceOptions: ["PRESENT", "MC"],
+    timezone: "Asia/Singapore"
+  };
+  const menu = __testing.buildDatedAttendanceMenu(
+    config,
+    new Date("2026-07-30T04:00:00.000Z"),
+    0,
+    "home:pick:attendance",
+    "home:attendance:page",
+    "home:main"
+  );
+  const callbacks = menu.reply_markup.inline_keyboard
+    .flat()
+    .map((button) => button.callback_data)
+    .filter((value) => value?.startsWith("home:pick:attendance"));
+
+  assert.equal(callbacks.length, 2);
+  assert.match(callbacks[0], /^home:pick:attendance:2026-07-30:0:[A-Za-z0-9_-]{8}$/);
+  assert.match(callbacks[1], /^home:pick:attendance:2026-07-30:1:[A-Za-z0-9_-]{8}$/);
+  assert.notEqual(callbacks[0].split(":").at(-1), callbacks[1].split(":").at(-1));
+});
+
 test("completed attendance removes old prompts and retires undeletable buttons", async () => {
   const deleted = [];
   const retired = [];

@@ -1,4 +1,4 @@
-import { mkdir, appendFile, writeFile } from "node:fs/promises";
+import { mkdir, appendFile, chmod, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 // ── TTY detection ─────────────────────────────────────────────────────────────
@@ -91,12 +91,14 @@ export async function setupLogging() {
     return;
   }
 
-  await mkdir(path.dirname(logFilePath), { recursive: true });
+  await mkdir(path.dirname(logFilePath), { recursive: true, mode: 0o700 });
+  await chmod(path.dirname(logFilePath), 0o700);
 
   // Truncate the log file on every startup so each pm2 restart begins with a
   // clean slate. Old runs are not retained — if you need history, configure
   // pm2's own log rotation. The log file is excluded from git via .gitignore.
-  await writeFile(logFilePath, "", "utf8");
+  await writeFile(logFilePath, "", { encoding: "utf8", mode: 0o600 });
+  await chmod(logFilePath, 0o600);
 
   const originalLog   = console.log.bind(console);
   const originalError = console.error.bind(console);
@@ -104,7 +106,10 @@ export async function setupLogging() {
 
   function writeFileLine(level, args) {
     const message = serialise(args);
-    appendFile(logFilePath, formatFileLine(level, message), "utf8")
+    appendFile(logFilePath, formatFileLine(level, message), {
+      encoding: "utf8",
+      mode: 0o600
+    })
       .catch((error) => originalError("Failed to write log file:", error));
   }
 

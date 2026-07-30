@@ -2,6 +2,7 @@ import { applyStoredConfigOverrides, config } from "./config.js";
 import { createAttendanceBot, BOT_VERSION } from "./bot.js";
 import { setupLogging } from "./logger.js";
 import { configureNetworkStack } from "./network.js";
+import { secureRuntimeFilePermissions } from "./dataDir.js";
 
 // ── Startup helpers ───────────────────────────────────────────────────────────
 
@@ -22,6 +23,8 @@ function logStartup(message) {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
+  await secureRuntimeFilePermissions();
+
   // 1. Network stack (IPv4-first keep-alive agents) — must come first so all
   //    subsequent HTTP/HTTPS calls use the correct agents.
   configureNetworkStack();

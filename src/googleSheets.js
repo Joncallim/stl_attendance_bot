@@ -1770,7 +1770,7 @@ async function writeMonthlySheetRows(
       sheets.spreadsheets.values.batchUpdate({
         spreadsheetId,
         requestBody: {
-          valueInputOption: "USER_ENTERED",
+          valueInputOption: "RAW",
           data: changedData
         }
       }, { signal })
@@ -1783,7 +1783,7 @@ async function writeHeaderRow(sheets, spreadsheetId, title, header) {
     sheets.spreadsheets.values.update({
       spreadsheetId,
       range: `'${title}'!A1:${columnNumberToLabel(header.length)}1`,
-      valueInputOption: "USER_ENTERED",
+      valueInputOption: "RAW",
       requestBody: {
         values: [header]
       }
@@ -1919,7 +1919,7 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
     sheets.spreadsheets.values.batchUpdate({
       spreadsheetId,
       requestBody: {
-        valueInputOption: "USER_ENTERED",
+        valueInputOption: "RAW",
         data
       }
     }, { signal })
@@ -4155,7 +4155,19 @@ export async function writeAttendanceStatus(sheets, config, entry) {
  *   { title, transferred: true }          — data was moved
  *   { title, skipped: true, reason: "…" } — row not found or no date columns
  */
-export async function transferAttendanceRows(sheets, config, fromAppointment, toAppointment) {
+export async function transferAttendanceRows(
+  sheets,
+  config,
+  fromAppointment,
+  toAppointment,
+  options = {}
+) {
+  const phase = options.phase ?? "copy_and_clear";
+
+  if (!["copy", "clear", "copy_and_clear"].includes(phase)) {
+    throw new Error(`Invalid attendance transfer phase: ${phase}`);
+  }
+
   const dates = [
     shiftMonth(new Date(), config.timezone, -1),
     new Date(),
@@ -4163,6 +4175,8 @@ export async function transferAttendanceRows(sheets, config, fromAppointment, to
   ];
 
   const results = [];
+  const plans = [];
+  let transferBlocked = false;
 
   for (const date of dates) {
     if (!isManagedMonthlyDate(date, config.timezone)) {
@@ -4180,6 +4194,7 @@ export async function transferAttendanceRows(sheets, config, fromAppointment, to
     );
 
     if (!values || values.length === 0) {
+      transferBlocked = true;
       results.push({ title, skipped: true, reason: "empty_sheet" });
       continue;
     }
@@ -4215,10 +4230,12 @@ export async function transferAttendanceRows(sheets, config, fromAppointment, to
     }
 
     if (fromRowNumber === null) {
+      transferBlocked = true;
       results.push({ title, skipped: true, reason: "from_row_not_found" });
       continue;
     }
     if (toRowNumber === null) {
+      transferBlocked = true;
       results.push({ title, skipped: true, reason: "to_row_not_found" });
       continue;
     }
@@ -4226,8 +4243,29 @@ export async function transferAttendanceRows(sheets, config, fromAppointment, to
     // Build contiguous groups of date columns for efficient range writes.
     const groups = groupContiguousIndices(dateColIndices);
     const fromRowValues = values[fromRowNumber - 1] ?? [];
+    const toRowValues = values[toRowNumber - 1] ?? [];
+    const conflictingColumns = dateColIndices.filter((columnIndex) => {
+      const sourceValue = String(fromRowValues[columnIndex] ?? "").trim();
+      const destinationValue = String(toRowValues[columnIndex] ?? "").trim();
+      return phase === "clear"
+        ? Boolean(sourceValue) && destinationValue !== sourceValue
+        : Boolean(destinationValue) && destinationValue !== sourceValue;
+    });
 
-    const data = [];
+    if (conflictingColumns.length > 0) {
+      transferBlocked = true;
+      results.push({
+        title,
+        skipped: true,
+        conflict: true,
+        reason: "destination_has_attendance",
+        conflictingColumns
+      });
+      continue;
+    }
+
+    const copyData = [];
+    const clearData = [];
     for (const group of groups) {
       const startCol = group[0] + 1; // 1-based
       const endCol   = group[group.length - 1] + 1;
@@ -4235,34 +4273,66 @@ export async function transferAttendanceRows(sheets, config, fromAppointment, to
       const endLabel   = columnNumberToLabel(endCol);
 
       // Copy from → to
-      data.push({
+      copyData.push({
         range: `'${title}'!${startLabel}${toRowNumber}:${endLabel}${toRowNumber}`,
         values: [group.map((col) => String(fromRowValues[col] ?? "").trim())]
       });
 
-      // Clear from row
-      data.push({
+      clearData.push({
         range: `'${title}'!${startLabel}${fromRowNumber}:${endLabel}${fromRowNumber}`,
         values: [group.map(() => "")]
       });
     }
 
-    if (data.length > 0) {
+    plans.push({ title, copyData, clearData });
+  }
+
+  if (transferBlocked) {
+    return [
+      ...results,
+      ...plans.map(({ title }) => ({
+        title,
+        skipped: true,
+        reason: "transfer_aborted_due_to_conflict"
+      }))
+    ];
+  }
+
+  for (const { title, copyData, clearData } of plans) {
+    if (copyData.length > 0 && phase !== "clear") {
+      // Copy first. A timeout or crash can leave duplicate data, but can never
+      // erase the only copy. Re-running is idempotent when both rows match.
       await runGoogleSheetsRequest(
-        `spreadsheets.values.batchUpdate:${title}:transferAttendance`,
+        `spreadsheets.values.batchUpdate:${title}:copyTransferAttendance`,
         (signal) =>
           sheets.spreadsheets.values.batchUpdate(
             {
               spreadsheetId: config.spreadsheetId,
-              requestBody: { valueInputOption: "RAW", data }
+              requestBody: { valueInputOption: "RAW", data: copyData }
             },
             { signal }
           )
       );
-      logSheetsSuccess(`[${title}] Transferred attendance: ${fromAppointment} → ${toAppointment}.`);
     }
 
-    results.push({ title, transferred: true });
+    if (clearData.length > 0 && phase !== "copy") {
+      await runGoogleSheetsRequest(
+        `spreadsheets.values.batchUpdate:${title}:clearTransferredAttendance`,
+        (signal) =>
+          sheets.spreadsheets.values.batchUpdate(
+            {
+              spreadsheetId: config.spreadsheetId,
+              requestBody: { valueInputOption: "RAW", data: clearData }
+            },
+            { signal }
+          )
+      );
+    }
+
+    logSheetsSuccess(
+      `[${title}] Attendance transfer ${phase}: ${fromAppointment} → ${toAppointment}.`
+    );
+    results.push({ title, transferred: true, phase });
   }
 
   return results;
@@ -4436,7 +4506,7 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
         sheets.spreadsheets.values.batchUpdate({
           spreadsheetId: config.spreadsheetId,
           requestBody: {
-            valueInputOption: "USER_ENTERED",
+            valueInputOption: "RAW",
             data
           }
         }, { signal })
@@ -4662,7 +4732,7 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
       sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: config.spreadsheetId,
         requestBody: {
-          valueInputOption: "USER_ENTERED",
+          valueInputOption: "RAW",
           data
         }
       }, { signal })

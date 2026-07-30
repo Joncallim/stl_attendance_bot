@@ -6,6 +6,7 @@ export const TELEGRAM_SEND_INTERVAL_MS = 40;
 // above one second.
 export const TELEGRAM_SEND_CONCURRENCY = 50;
 export const TELEGRAM_SEND_MAX_ATTEMPTS = 3;
+export const TELEGRAM_SEND_TIMEOUT_MS = 15_000;
 
 function sleep(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -20,7 +21,7 @@ function getTelegramRetryAfterMs(error) {
   );
 
   if (code !== 429) {
-    return null;
+    return code >= 500 && code <= 599 ? 500 : null;
   }
 
   const retryAfterSeconds = Number(
@@ -86,9 +87,15 @@ async function runTelegramSend(fn) {
   while (attempt < TELEGRAM_SEND_MAX_ATTEMPTS) {
     attempt += 1;
     await telegramSendLimiter.waitForSlot();
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(new Error("Telegram send timed out.")),
+      TELEGRAM_SEND_TIMEOUT_MS
+    );
+    timeout.unref?.();
 
     try {
-      return await fn();
+      return await fn(controller.signal);
     } catch (error) {
       const retryAfterMs = getTelegramRetryAfterMs(error);
 
@@ -97,6 +104,8 @@ async function runTelegramSend(fn) {
       }
 
       telegramSendLimiter.pause(retryAfterMs);
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
