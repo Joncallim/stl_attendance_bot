@@ -3549,19 +3549,39 @@ async function validateAttendanceWriteTargets(sheets, spreadsheetId, targets) {
 
   for (const target of targets) {
     const expectations = [
-      [target.appointmentRange, target.expectedAppointment],
-      [target.dateHeaderRange, target.expectedDateLabel],
-      [target.range, target.expectedPreviousValue]
+      {
+        range: target.appointmentRange,
+        expected: target.expectedAppointment,
+        normalize: normalizeAppointmentIdentity
+      },
+      {
+        range: target.dateHeaderRange,
+        expected: target.expectedDateLabel,
+        normalize: (value) => String(value ?? "").trim()
+      },
+      {
+        range: target.range,
+        expected: target.expectedPreviousValue,
+        normalize: (value) => String(value ?? "").trim()
+      }
     ];
 
-    for (const [range, expected] of expectations) {
-      const normalizedExpected = String(expected ?? "").trim();
-      const existingExpected = expectationsByRange.get(range);
+    for (const { range, expected, normalize } of expectations) {
+      const rawExpected = String(expected ?? "").trim();
+      const normalizedExpected = normalize(rawExpected);
+      const existingExpectation = expectationsByRange.get(range);
 
-      if (existingExpected !== undefined && existingExpected !== normalizedExpected) {
+      if (
+        existingExpectation !== undefined &&
+        existingExpectation.normalizedExpected !== normalizedExpected
+      ) {
         throw new Error(`Conflicting attendance preflight expectations for ${range}`);
       }
-      expectationsByRange.set(range, normalizedExpected);
+      expectationsByRange.set(range, {
+        rawExpected,
+        normalizedExpected,
+        normalize
+      });
     }
   }
 
@@ -3575,11 +3595,15 @@ async function validateAttendanceWriteTargets(sheets, spreadsheetId, targets) {
 
   for (let index = 0; index < ranges.length; index += 1) {
     const range = ranges[index];
-    const expected = expectationsByRange.get(range);
+    const expectation = expectationsByRange.get(range);
     const actual = String(valueRanges[index]?.values?.[0]?.[0] ?? "").trim();
 
-    if (actual !== expected) {
-      mismatches.push({ range, expected, actual });
+    if (expectation.normalize(actual) !== expectation.normalizedExpected) {
+      mismatches.push({
+        range,
+        expected: expectation.rawExpected,
+        actual
+      });
     }
   }
 

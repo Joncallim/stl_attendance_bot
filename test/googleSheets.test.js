@@ -665,6 +665,37 @@ test("attendance preflight fails closed when a row moved before the write", asyn
   );
 });
 
+test("attendance preflight accepts an unambiguous appointment casing difference", async () => {
+  const sheets = {
+    spreadsheets: {
+      values: {
+        batchGet: async () => ({
+          data: {
+            valueRanges: [
+              { values: [["alpha"]] },
+              { values: [["24 Mar"]] },
+              { values: [["PRESENT"]] }
+            ]
+          }
+        })
+      }
+    }
+  };
+
+  await __testing.validateAttendanceWriteTargets(
+    sheets,
+    "spreadsheet-id",
+    [{
+      range: "'Mar 26'!B2",
+      appointmentRange: "'Mar 26'!A2",
+      dateHeaderRange: "'Mar 26'!B1",
+      expectedAppointment: "ALPHA",
+      expectedDateLabel: "24 Mar",
+      expectedPreviousValue: "PRESENT"
+    }]
+  );
+});
+
 test("pure row reordering is repaired by rewriting the managed rows in canonical order", async () => {
   const fake = createInMemorySheets({
     "Mar 26": {
