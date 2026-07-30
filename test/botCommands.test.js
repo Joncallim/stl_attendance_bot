@@ -137,7 +137,7 @@ test("invite command reports missing appointments", async () => {
 test("admin menu description includes the current pre-v1 version", () => {
   const description = __testing.buildAdminMenuDescription();
 
-  assert.match(description, /^Admin Menu \(v0\.9\.23\)/);
+  assert.match(description, /^Admin Menu \(v0\.9\.24\)/);
 });
 
 test("attendance prompt tracking is deduplicated and bounded", () => {
@@ -775,6 +775,7 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
   const intervals = [];
   const schedules = [];
   const runCycleCalls = [];
+  let cleanupCalls = 0;
 
   __testing.registerBackgroundSchedules({
     bot: {},
@@ -803,6 +804,10 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
         return { stop() {} };
       },
       refreshAttendanceOptionUsageFn: async () => {},
+      cleanupExpiredAttendanceButtonsFn: async () => {
+        cleanupCalls += 1;
+        return { attempted: 0, removed: 0, retired: 0, retrying: 0 };
+      },
       runDailySheetMaintenanceFn: async () => {},
       runStartupSheetCleanupFn: async () => {}
     }
@@ -810,13 +815,15 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
 
   assert.deepEqual(
     intervals.map((entry) => entry.delay),
-    [60 * 1000, 5 * 60 * 1000]
+    [60 * 1000, 60 * 1000, 5 * 60 * 1000]
   );
   // First cron is 2 AM structural maintenance; second is 02:05 queue compaction.
   assert.equal(schedules[0].expression, "0 2 * * *");
   assert.equal(schedules[1].expression, "5 2 * * *");
   assert.ok(schedules.some((entry) => entry.expression === "0 7 * * *"));
   assert.ok(schedules.some((entry) => entry.expression === "0 8 * * *"));
+  await intervals[1].fn();
+  assert.equal(cleanupCalls, 1);
   // Startup cycle runs after cleanup (async) — drain microtasks before asserting.
   await new Promise((resolve) => setImmediate(resolve));
   // Startup cycle is now lightweight (force: false).

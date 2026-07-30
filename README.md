@@ -278,6 +278,7 @@ The bot stores local state in `./data`.
 - `data/settings.json`: attendance option overrides and usage data
 - `data/sheet-cache.json`: cached sheet snapshots and sync metadata
 - `data/attendance-queue.ndjson`: append-only queued attendance events
+- `data/attendance-button-cleanup.json`: restart-safe expiry jobs for attendance confirmation buttons
 - `data/logs/attendance-bot.log`: optional human-readable log file if `LOG_FILE_PATH` is set
 
 ## Installation

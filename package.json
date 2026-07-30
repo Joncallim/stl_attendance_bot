@@ -1,13 +1,13 @@
 {
   "name": "attendance-bot",
-  "version": "0.9.21",
+  "version": "0.9.24",
   "description": "Telegram bot that collects attendance and writes responses to Google Sheets.",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "check": "node --check src/index.js && node --check src/bot.js && node --check src/config.js && node --check src/googleSheets.js && node --check src/storage.js && node --check src/attendanceQueue.js && node --check src/fileStore.js && node --check src/holidays.js && node --check src/syncManager.js && node --check src/weeklyFlow.js && node --check src/logger.js",
+    "check": "node --check src/index.js && node --check src/bot.js && node --check src/config.js && node --check src/googleSheets.js && node --check src/storage.js && node --check src/attendanceQueue.js && node --check src/fileStore.js && node --check src/holidays.js && node --check src/syncManager.js && node --check src/weeklyFlow.js && node --check src/messageCleanup.js && node --check src/logger.js",
     "test": "node --test"
   },
   "engines": {

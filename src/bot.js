@@ -69,6 +69,11 @@ import { runSerialized, writePrivateTextFile } from "./fileStore.js";
 import { applyStoredConfigOverrides } from "./config.js";
 import { allSettledConcurrent, TELEGRAM_SEND_CONCURRENCY, TELEGRAM_SEND_INTERVAL_MS } from "./concurrency.js";
 import {
+  cancelAttendanceButtonCleanup,
+  cleanupExpiredAttendanceButtons,
+  scheduleAttendanceButtonCleanup
+} from "./messageCleanup.js";
+import {
   applyWeeklyAttendanceSelection,
   createWeeklyFlowState,
   getStagedAttendanceStatus,
@@ -77,7 +82,7 @@ import {
 } from "./weeklyFlow.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.23";
+export const BOT_VERSION = "v0.9.24";
 
 function logBot(message, details = null) {
   const ts = new Date().toISOString();
@@ -2365,6 +2370,15 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
     getMessageId(ctx.callbackQuery?.message);
   await Promise.all([
     updateUserByChatId(ctx.chat.id, { weeklyPromptMessageIds: [] }),
+    scheduleAttendanceButtonCleanup(
+      ctx.chat.id,
+      currentMessageId,
+      new Date()
+    ).catch((error) => {
+      logBotError("Failed to schedule weekly confirmation button cleanup.", {
+        error: error.message
+      });
+    }),
     removeObsoleteAttendancePromptMessages(
       ctx.telegram,
       ctx.chat.id,
@@ -4636,6 +4650,8 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         }
       : buildAndSendAttendancePrompt);
   const batchUpdateUsersByChatIdFn = deps.batchUpdateUsersByChatIdFn ?? batchUpdateUsersByChatId;
+  const cleanupExpiredAttendanceButtonsFn =
+    deps.cleanupExpiredAttendanceButtonsFn ?? cleanupExpiredAttendanceButtons;
   const runDailySheetMaintenanceFn = deps.runDailySheetMaintenanceFn ?? runDailySheetMaintenance;
   const runStartupSheetCleanupFn = deps.runStartupSheetCleanupFn ?? runStartupSheetCleanup;
 
@@ -4719,6 +4735,20 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
       await adminCache.syncManager.runCycle({ force: false, reason: "background" });
     } catch (error) {
       logBotError("Background sheet preload failed.", { error: error.message });
+    }
+  }, 60 * 1000);
+
+  setIntervalFn(async () => {
+    try {
+      const result = await cleanupExpiredAttendanceButtonsFn(bot.telegram);
+
+      if (result.attempted > 0) {
+        logBot("Expired attendance confirmation buttons cleaned.", result);
+      }
+    } catch (error) {
+      logBotError("Attendance confirmation button cleanup failed.", {
+        error: error.message
+      });
     }
   }, 60 * 1000);
 
@@ -5638,6 +5668,20 @@ export async function createAttendanceBot(config) {
       await ctx.answerCbQuery();
     }
 
+    // Successful attendance confirmations reuse the original Telegram message.
+    // If its Back/Close button is used, cancel the delayed cleanup before that
+    // message is repurposed so the sweeper cannot strip a newer menu's buttons.
+    if (action === "main" || action === "close") {
+      await cancelAttendanceButtonCleanup(
+        ctx.chat.id,
+        getMessageId(ctx.callbackQuery?.message)
+      ).catch((error) => {
+        logBotError("Failed to cancel attendance confirmation button cleanup.", {
+          error: error.message
+        });
+      });
+    }
+
     if (action === "main") {
       await renderHomeMenu(ctx, config, { cache: adminCache });
       return;
@@ -6088,6 +6132,15 @@ export async function createAttendanceBot(config) {
           awaitingAttendance: false,
           attendancePromptMessageIds: [],
           lastSubmittedAt: submittedAt.toISOString()
+        }),
+        scheduleAttendanceButtonCleanup(
+          ctx.chat.id,
+          currentMessageId,
+          submittedAt
+        ).catch((error) => {
+          logBotError("Failed to schedule attendance confirmation button cleanup.", {
+            error: error.message
+          });
         }),
         sendOrUpdateAdminMessage(
           ctx,
