@@ -1,7 +1,11 @@
 node_modules/
 .env
 data/*.json
+data/*.ndjson
 credentials/
 *.log
 logs/
+.codex/
 .claude/worktrees/festive-einstein/
+package-lock.json
+settings.yaml.server-backup
