@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import {
   compactAttendanceQueue,
   enqueueAttendanceEvent,
@@ -133,15 +133,17 @@ test("only exhausted events become failed_permanent; retryable events stay in qu
 
 // ── Compaction ────────────────────────────────────────────────────────────────
 
-test("compactAttendanceQueue drops flushed and failed_permanent records", async () => {
+test("compactAttendanceQueue drops flushed records but retains failed_permanent attendance", async () => {
   await withTempDataDir(async () => {
     // Enqueue two events
     await enqueueAttendanceEvent(CONFIG, makeEvent("D1", "PRESENT", 0));
     await enqueueAttendanceEvent(CONFIG, makeEvent("D2", "MC", 1));
 
-    // Flush D1 successfully
+    // Flush D1 successfully, leaving D2 unresolved.
     await flushAttendanceQueue(async (entries) => ({
-      writtenEventIds: entries.map((e) => e.id),
+      writtenEventIds: entries
+        .filter((event) => event.appointment === "D1")
+        .map((event) => event.id),
       skippedEvents: [],
       conflictedEvents: []
     }));
@@ -165,8 +167,11 @@ test("compactAttendanceQueue drops flushed and failed_permanent records", async 
     assert.ok(result.removedCount > 0);
 
     const afterCompact = await loadAttendanceQueueState();
-    assert.equal(afterCompact.events.size, 0, "all terminal events should be gone after compaction");
-    assert.equal(afterCompact.records.length, 0, "all records should be removed when no active events");
+    assert.equal(afterCompact.events.size, 1);
+    const retained = [...afterCompact.events.values()][0];
+    assert.equal(retained.appointment, "D2");
+    assert.equal(retained.queueStatus, "failed_permanent");
+    assert.ok(afterCompact.records.length > 0, "failed attendance must remain recoverable");
   });
 });
 
@@ -193,6 +198,30 @@ test("compactAttendanceQueue preserves pending events and their records", async 
     const e2 = [...state.events.values()][0];
     assert.equal(e2.appointment, "E2");
     assert.equal(e2.queueStatus, "pending");
+  });
+});
+
+test("compactAttendanceQueue refuses to erase malformed queue bytes", async () => {
+  await withTempDataDir(async (tempDir) => {
+    await enqueueAttendanceEvent(CONFIG, makeEvent("SAFE", "PRESENT", 0));
+    await enqueueAttendanceEvent(CONFIG, makeEvent("DONE", "WFH", 1));
+    await flushAttendanceQueue(async (entries) => ({
+      writtenEventIds: entries
+        .filter((event) => event.appointment === "DONE")
+        .map((event) => event.id),
+      skippedEvents: [],
+      conflictedEvents: []
+    }));
+
+    const queueFile = path.join(tempDir, "attendance-queue.ndjson");
+    await appendFile(queueFile, "{\"kind\":\"attendance_enqueued\"", "utf8");
+    const before = await readFile(queueFile, "utf8");
+
+    await assert.rejects(
+      compactAttendanceQueue(),
+      /refusing destructive rewrite/
+    );
+    assert.equal(await readFile(queueFile, "utf8"), before);
   });
 });
 

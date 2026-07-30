@@ -66,6 +66,30 @@ test("batchUpdateUsersByChatId updates all matched users in a single write", asy
   });
 });
 
+test("broadcast patch cannot restore awaiting state after a newer submission", async () => {
+  await withTempDataDir(async () => {
+    await upsertUser({
+      ...makeUser("race-user", 1),
+      appointment: "ALPHA",
+      lastSubmittedAt: "2026-03-10T07:00:01.000Z"
+    });
+
+    const [result] = await batchUpdateUsersByChatId([{
+      chatId: "race-user",
+      expectedAppointment: "ALPHA",
+      notSubmittedAfter: "2026-03-10T07:00:00.000Z",
+      notPromptedAfter: "2026-03-10T07:00:00.000Z",
+      patch: {
+        awaitingAttendance: true,
+        promptedAt: "2026-03-10T07:00:10.000Z"
+      }
+    }]);
+
+    assert.equal(result, null);
+    assert.equal((await getUserByChatId("race-user")).awaitingAttendance, false);
+  });
+});
+
 test("batchUpdateUsersByChatId returns null for chatIds not in the store", async () => {
   await withTempDataDir(async () => {
     await upsertUser(makeUser("known-id", 1));

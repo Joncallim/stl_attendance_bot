@@ -535,31 +535,34 @@ export async function resetConflictedQueueEntries() {
   });
 }
 
-// Rewrites the queue file keeping only unresolved events (pending / failed_retryable).
-// Terminal events (flushed, skipped, conflicted) are dropped from disk once they no
-// longer affect any active event, preventing unbounded file growth.
+// Rewrites the queue file keeping every unresolved event. Conflicted and
+// permanently-failed events are deliberately retained until an administrator
+// repairs or explicitly resolves them; compaction must never destroy attendance.
 export async function compactAttendanceQueue() {
   return runSerialized(QUEUE_MUTEX_KEY, async () => {
     const state = await loadAttendanceQueueState();
+    const queueFilePath = ATTENDANCE_QUEUE_FILE();
     const activeIds = new Set(
       [...state.events.values()]
-        .filter((event) =>
-          event.queueStatus === "pending" || event.queueStatus === "failed_retryable"
-        )
+        .filter((event) => !["flushed", "skipped"].includes(event.queueStatus))
         .map((event) => event.id)
     );
-    // failed_permanent events are terminal — treat them like flushed/conflicted and drop them.
 
     if (activeIds.size === state.events.size) {
       return { compacted: false, removedCount: 0 };
     }
+
+    // The in-memory state intentionally recovers complete records around a
+    // truncated append. Re-read strictly before rewriting so compaction never
+    // erases malformed bytes that may contain recoverable attendance evidence.
+    await readJsonLines(queueFilePath, { rejectMalformed: true });
 
     const retainedRecords = state.records.filter((record) => {
       const eventId = record.event?.id ?? record.eventId;
       return activeIds.has(eventId);
     });
 
-    await writeJsonLines(ATTENDANCE_QUEUE_FILE(), retainedRecords);
+    await writeJsonLines(queueFilePath, retainedRecords);
 
     const removedCount = state.records.length - retainedRecords.length;
     cachedQueueState = createQueueState(retainedRecords);

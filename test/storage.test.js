@@ -90,6 +90,42 @@ test("binding is serialized and deregistration clears binding and custom admin a
   });
 });
 
+test("deregistration tombstone prevents a stale user file from restoring a binding", async () => {
+  await withTempDataDir(async () => {
+    await syncAppointmentRegistry(["ALPHA"]);
+    const invite = await getOnboardingInvite("ALPHA");
+    await upsertUser({
+      chatId: "chat-stale",
+      userId: "user-stale",
+      username: "stale",
+      fullName: "Stale User",
+      updatedAt: new Date().toISOString()
+    });
+    await bindAppointmentCode(invite.secretCode, {
+      chatId: "chat-stale",
+      userId: "user-stale",
+      username: "stale",
+      fullName: "Stale User"
+    });
+    await deregisterAppointmentBinding("ALPHA");
+
+    // Simulate an old users.json snapshot being restored after the deliberate
+    // removal. The registry tombstone must win during reconciliation.
+    await updateUserByChatId("chat-stale", {
+      appointment: "ALPHA",
+      onboardingCompletedAt: new Date(Date.now() - 60_000).toISOString()
+    });
+    await syncAppointmentRegistry(["ALPHA"]);
+
+    const user = await getUserByChatId("chat-stale");
+    const registry = await getAppointmentRegistry();
+    const alpha = registry.appointments.find((entry) => entry.appointment === "ALPHA");
+    assert.equal(user.appointment, null);
+    assert.equal(alpha.boundChatId, null);
+    assert.ok(alpha.bindingRemovedAt);
+  });
+});
+
 test("syncAppointmentRegistry repairs a user-side binding from the main registry", async () => {
   await withTempDataDir(async () => {
     // Set up an appointment and bind it to a user.

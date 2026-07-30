@@ -151,6 +151,45 @@ test("attendance prompt tracking is deduplicated and bounded", () => {
   );
 });
 
+test("Telegram identity validation only accepts the matching private user", () => {
+  assert.equal(__testing.isPrivateTelegramIdentity({
+    chat: { id: 42, type: "private" },
+    from: { id: 42 }
+  }), true);
+  assert.equal(__testing.isPrivateTelegramIdentity({
+    chat: { id: -100, type: "group" },
+    from: { id: 42 }
+  }), false);
+  assert.equal(__testing.isPrivateTelegramIdentity({
+    chat: { id: 41, type: "private" },
+    from: { id: 42 }
+  }), false);
+});
+
+test("daily attendance callbacks are bound to date and status content", () => {
+  const config = {
+    attendanceOptions: ["PRESENT", "MC"],
+    timezone: "Asia/Singapore"
+  };
+  const menu = __testing.buildDatedAttendanceMenu(
+    config,
+    new Date("2026-07-30T04:00:00.000Z"),
+    0,
+    "home:pick:attendance",
+    "home:attendance:page",
+    "home:main"
+  );
+  const callbacks = menu.reply_markup.inline_keyboard
+    .flat()
+    .map((button) => button.callback_data)
+    .filter((value) => value?.startsWith("home:pick:attendance"));
+
+  assert.equal(callbacks.length, 2);
+  assert.match(callbacks[0], /^home:pick:attendance:2026-07-30:0:[A-Za-z0-9_-]{8}$/);
+  assert.match(callbacks[1], /^home:pick:attendance:2026-07-30:1:[A-Za-z0-9_-]{8}$/);
+  assert.notEqual(callbacks[0].split(":").at(-1), callbacks[1].split(":").at(-1));
+});
+
 test("completed attendance removes old prompts and retires undeletable buttons", async () => {
   const deleted = [];
   const retired = [];
@@ -784,10 +823,14 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
   assert.deepEqual(runCycleCalls, [{ force: false, reason: "startup" }]);
 });
 
-test("scheduled reminder forces a sync before sending prompts", async () => {
+test("first scheduled reminder refreshes Sheets without delaying prompts", async () => {
   const schedules = [];
   const runCycleCalls = [];
   const prompts = [];
+  let releaseReminderSync;
+  const reminderSync = new Promise((resolve) => {
+    releaseReminderSync = resolve;
+  });
 
   __testing.registerBackgroundSchedules({
     bot: {},
@@ -801,6 +844,10 @@ test("scheduled reminder forces a sync before sending prompts", async () => {
       syncManager: {
         runCycle: async (options) => {
           runCycleCalls.push(options);
+
+          if (options.reason === "reminder") {
+            await reminderSync;
+          }
         },
         setMaintenanceRunning: () => {}
       }
@@ -829,13 +876,19 @@ test("scheduled reminder forces a sync before sending prompts", async () => {
   // pending microtasks have drained so the startup runCycle has already pushed
   // its entry before the reminder handler starts.
   await new Promise((resolve) => setImmediate(resolve));
-  await reminderSchedule.fn();
+  const reminderResult = await Promise.race([
+    reminderSchedule.fn().then(() => "sent"),
+    new Promise((resolve) => setTimeout(() => resolve("blocked"), 250))
+  ]);
 
   assert.deepEqual(runCycleCalls, [
     { force: false, reason: "startup" },
     { force: true, reason: "reminder" }
   ]);
+  assert.equal(reminderResult, "sent", "first reminder should not wait for Sheets refresh");
   assert.deepEqual(prompts, ["chat-1"]);
+  releaseReminderSync();
+  await new Promise((resolve) => setImmediate(resolve));
 });
 
 test("scheduled reminder still sends prompts when pre-send sync fails", async () => {
@@ -889,6 +942,10 @@ test("scheduled reminder still sends prompts when pre-send sync fails", async ()
 test("0800 reminder only sends to users with unfilled attendance", async () => {
   const schedules = [];
   const prompts = [];
+  let releaseReminderSync;
+  const reminderSync = new Promise((resolve) => {
+    releaseReminderSync = resolve;
+  });
   const fixedNow = new Date("2026-03-24T00:05:00.000Z");
   const RealDate = Date;
 
@@ -917,7 +974,11 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
     },
     adminCache: {
       syncManager: {
-        runCycle: async () => {},
+        runCycle: async (options) => {
+          if (options.reason === "reminder") {
+            await reminderSync;
+          }
+        },
         setMaintenanceRunning: () => {}
       },
       sheetSnapshots: {
@@ -953,7 +1014,13 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
 
   try {
     const reminderSchedule = schedules.find((entry) => entry.expression === "0 8 * * *");
-    await reminderSchedule.fn();
+    await new Promise((resolve) => setImmediate(resolve));
+    const reminderResult = reminderSchedule.fn();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(prompts, [], "second reminder must wait for fresh Sheets data");
+    releaseReminderSync();
+    await reminderResult;
   } finally {
     global.Date = RealDate;
   }

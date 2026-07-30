@@ -1,6 +1,11 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { getDataFile } from "./dataDir.js";
-import { readJsonFile, runSerialized, writeJsonFile } from "./fileStore.js";
+import {
+  readJsonFile,
+  removePrivateFile,
+  runSerialized,
+  writeJsonFile
+} from "./fileStore.js";
 
 const STORAGE_MUTEX_KEY = "storage";
 const ATTENDANCE_OPTION_SCHEMA_VERSION = 2;
@@ -15,6 +20,10 @@ function getAppointmentRegistryFile() {
 
 function getSettingsFile() {
   return getDataFile("settings.json");
+}
+
+function getStorageTransactionFile() {
+  return getDataFile("storage-transaction.json");
 }
 
 function normalizeCode(code) {
@@ -218,8 +227,55 @@ function pruneUnboundAdminAppointments(registry) {
   );
 }
 
+async function recoverStorageTransaction() {
+  const transaction = await readJsonFile(getStorageTransactionFile(), null);
+
+  if (!transaction) {
+    return;
+  }
+
+  if (
+    transaction.version !== 1 ||
+    !transaction.registry ||
+    !Array.isArray(transaction.users)
+  ) {
+    throw new Error("Invalid storage transaction journal; refusing unsafe recovery.");
+  }
+
+  await writeAppointmentRegistry(transaction.registry);
+  await writeUsers(transaction.users);
+  await removePrivateFile(getStorageTransactionFile());
+  logStorageSuccess("# Recovered interrupted storage transaction.", {
+    transactionId: transaction.id,
+    operation: transaction.operation
+  });
+}
+
+async function commitRegistryAndUsers(registry, users, operation) {
+  const transaction = {
+    version: 1,
+    id: randomUUID(),
+    operation,
+    createdAt: new Date().toISOString(),
+    registry,
+    users
+  };
+
+  await writeJsonFile(getStorageTransactionFile(), transaction);
+  await writeAppointmentRegistry(registry);
+  await writeUsers(users);
+  await removePrivateFile(getStorageTransactionFile());
+}
+
 function withStorageMutation(operation) {
-  return runSerialized(STORAGE_MUTEX_KEY, operation);
+  return runSerialized(STORAGE_MUTEX_KEY, async () => {
+    await recoverStorageTransaction();
+    return operation();
+  });
+}
+
+export async function recoverStorageTransactions() {
+  return runSerialized(STORAGE_MUTEX_KEY, recoverStorageTransaction);
 }
 
 let pendingUserUpdateBatch = null;
@@ -304,13 +360,37 @@ export async function batchUpdateUsersByChatId(patches) {
   return withStorageMutation(async () => {
     const users = await readUsers();
     const results = [];
-    for (const { chatId, patch } of patches) {
+    for (const {
+      chatId,
+      patch,
+      expectedAppointment,
+      notSubmittedAfter,
+      notPromptedAfter
+    } of patches) {
       const index = usersByIdIndex?.get(String(chatId)) ?? -1;
       if (index === -1) {
         results.push(null);
         continue;
       }
-      users[index] = { ...users[index], ...patch };
+      const currentUser = users[index];
+      const submittedAt = Date.parse(currentUser.lastSubmittedAt ?? "");
+      const promptedAt = Date.parse(currentUser.promptedAt ?? "");
+
+      if (
+        (expectedAppointment !== undefined &&
+          normalizeAppointmentName(currentUser.appointment) !==
+            normalizeAppointmentName(expectedAppointment)) ||
+        (notSubmittedAfter &&
+          Number.isFinite(submittedAt) &&
+          submittedAt >= Date.parse(notSubmittedAfter)) ||
+        (notPromptedAfter &&
+          Number.isFinite(promptedAt) &&
+          promptedAt > Date.parse(notPromptedAfter))
+      ) {
+        results.push(null);
+        continue;
+      }
+      users[index] = { ...currentUser, ...patch };
       results.push(users[index]);
     }
     await writeUsers(users);
@@ -525,6 +605,17 @@ export async function syncAppointmentRegistry(appointments = null) {
     for (const [identity, candidates] of userCandidatesByAppointment) {
       const entry = nextByIdentity.get(identity);
 
+      // A binding-removal tombstone is authoritative. It prevents an
+      // interrupted or manually-restored users.json write from silently
+      // re-creating a binding that the bot deliberately removed.
+      if (entry?.bindingRemovedAt && !entry.boundChatId) {
+        for (const candidate of candidates) {
+          Object.assign(candidate, clearUserBindingFields(candidate));
+          clearedUserBindings.push(String(candidate.chatId));
+        }
+        continue;
+      }
+
       if (!entry || entry.boundChatId) {
         if (entry?.boundChatId) {
           const boundChatId = String(entry.boundChatId);
@@ -620,16 +711,7 @@ export async function syncAppointmentRegistry(appointments = null) {
       }
     };
 
-    await writeAppointmentRegistry(nextRegistry);
-
-    if (
-      repairedUserBindings.length > 0 ||
-      clearedUserBindings.length > 0 ||
-      nextUsers.length !== users.length ||
-      repairedRegistryBindings.length > 0
-    ) {
-      await writeUsers(nextUsers);
-    }
+    await commitRegistryAndUsers(nextRegistry, nextUsers, "sync_appointment_registry");
 
     logStorageSuccess("# Roster integrity checksum completed.", {
       checksum,
@@ -738,15 +820,17 @@ export async function removeAppointmentFromRegistry(appointment) {
     registry.adminAppointments = pruneUnboundAdminAppointments(registry);
     registry.updatedAt = removedAt;
     invalidateRegistryIntegrity(registry);
-    await writeAppointmentRegistry(registry);
-
     const users = await readUsers();
     const nextUsers = users.map((user) =>
       normalizeAppointmentName(user.appointment) === normalizeAppointmentName(target.appointment)
         ? clearUserBindingFields(user)
         : user
     );
-    await writeUsers(nextUsers);
+    await commitRegistryAndUsers(
+      registry,
+      nextUsers,
+      "remove_appointment"
+    );
 
     return { ok: true, appointment: target.appointment };
   });
@@ -936,6 +1020,7 @@ export async function deregisterAppointmentBinding(appointment) {
     );
     const rotatedSecretCode = generateSecretCode(existingCodes);
 
+    const bindingRemovedAt = new Date().toISOString();
     const updatedTarget = {
       ...target,
       secretCode: rotatedSecretCode,
@@ -943,7 +1028,9 @@ export async function deregisterAppointmentBinding(appointment) {
       boundUserId: null,
       boundUsername: null,
       boundFullName: null,
-      boundAt: null
+      boundAt: null,
+      bindingRemovedAt,
+      bindingRemovalReason: "deregistered"
     };
 
     registry.appointments = registry.appointments.map((entry) =>
@@ -953,9 +1040,8 @@ export async function deregisterAppointmentBinding(appointment) {
         : entry
     );
     registry.adminAppointments = pruneUnboundAdminAppointments(registry);
-    registry.updatedAt = new Date().toISOString();
+    registry.updatedAt = bindingRemovedAt;
     invalidateRegistryIntegrity(registry);
-    await writeAppointmentRegistry(registry);
 
     const users = await readUsers();
     const nextUsers = users.map((user) =>
@@ -963,7 +1049,7 @@ export async function deregisterAppointmentBinding(appointment) {
         ? clearUserBindingFields(user)
         : user
     );
-    await writeUsers(nextUsers);
+    await commitRegistryAndUsers(registry, nextUsers, "deregister_binding");
 
     return {
       ok: true,
@@ -1014,6 +1100,7 @@ export async function transferAppointmentBinding(fromAppointment, toAppointment)
     );
     const freshCode = generateSecretCode(existingCodes);
 
+    const transferredAt = new Date().toISOString();
     registry.appointments = registry.appointments.map((entry) => {
       const norm = normalizeAppointmentName(entry.appointment);
       if (norm === normalizeAppointmentName(fromEntry.appointment)) {
@@ -1024,7 +1111,9 @@ export async function transferAppointmentBinding(fromAppointment, toAppointment)
           boundUserId: null,
           boundUsername: null,
           boundFullName: null,
-          boundAt: null
+          boundAt: null,
+          bindingRemovedAt: transferredAt,
+          bindingRemovalReason: "transferred"
         };
       }
       if (norm === normalizeAppointmentName(toEntry.appointment)) {
@@ -1034,30 +1123,29 @@ export async function transferAppointmentBinding(fromAppointment, toAppointment)
           boundUserId: fromEntry.boundUserId,
           boundUsername: fromEntry.boundUsername,
           boundFullName: fromEntry.boundFullName,
-          boundAt: fromEntry.boundAt
+          boundAt: fromEntry.boundAt,
+          bindingRemovedAt: null,
+          bindingRemovalReason: null
         };
       }
       return entry;
     });
 
     registry.adminAppointments = pruneUnboundAdminAppointments(registry);
-    registry.updatedAt = new Date().toISOString();
+    registry.updatedAt = transferredAt;
     invalidateRegistryIntegrity(registry);
-    await writeAppointmentRegistry(registry);
 
     const users = await readUsers();
     const nextUsers = users.map((user) =>
       String(user.chatId) === String(fromEntry.boundChatId)
-        ? { ...user, appointment: toEntry.appointment, updatedAt: new Date().toISOString() }
+        ? { ...user, appointment: toEntry.appointment, updatedAt: transferredAt }
         : user
     );
-    await writeUsers(nextUsers);
+    await commitRegistryAndUsers(registry, nextUsers, "transfer_binding");
 
     logStorageSuccess(`# Transferred binding.`, {
       from: fromEntry.appointment,
-      to: toEntry.appointment,
-      chatId: fromEntry.boundChatId,
-      username: fromEntry.boundUsername
+      to: toEntry.appointment
     });
 
     return {
@@ -1152,13 +1240,13 @@ export async function bindAppointmentCode(secretCode, telegramUser) {
       boundUserId: String(telegramUser.userId),
       boundUsername: telegramUser.username,
       boundFullName: telegramUser.fullName,
-      boundAt
+      boundAt,
+      bindingRemovedAt: null,
+      bindingRemovalReason: null
     };
     registry.adminAppointments = pruneUnboundAdminAppointments(registry);
     registry.updatedAt = boundAt;
     invalidateRegistryIntegrity(registry);
-
-    await writeAppointmentRegistry(registry);
 
     const userIndex = usersByIdIndex?.get(String(telegramUser.chatId)) ?? -1;
     const userPatch = {
@@ -1188,7 +1276,7 @@ export async function bindAppointmentCode(secretCode, telegramUser) {
         ...userPatch
       });
     }
-    await writeUsers(users);
+    await commitRegistryAndUsers(registry, users, "bind_appointment");
 
     return {
       ok: true,

@@ -1,5 +1,6 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import cron from "node-cron";
 import { Markup, Telegraf, session } from "telegraf";
 import { ipv4HttpsAgent } from "./network.js";
@@ -53,6 +54,7 @@ import {
   listAdminAppointments,
   listUsers,
   removeAppointmentFromRegistry,
+  recoverStorageTransactions,
   resetAttendanceOptions,
   removeAdminAppointment,
   setAttendanceOptionUsage,
@@ -63,7 +65,7 @@ import {
   upsertUser
 } from "./storage.js";
 import { createSyncManager } from "./syncManager.js";
-import { runSerialized } from "./fileStore.js";
+import { runSerialized, writePrivateTextFile } from "./fileStore.js";
 import { applyStoredConfigOverrides } from "./config.js";
 import { allSettledConcurrent, TELEGRAM_SEND_CONCURRENCY, TELEGRAM_SEND_INTERVAL_MS } from "./concurrency.js";
 import {
@@ -756,7 +758,14 @@ function buildUnaccountedMenu(date, timezone, rows, backTarget, namespace) {
   ]);
 }
 
-function buildPagedSelectionMenu(items, page, itemPrefix, pageCallbackPrefix, backTarget) {
+function buildPagedSelectionMenu(
+  items,
+  page,
+  itemPrefix,
+  pageCallbackPrefix,
+  backTarget,
+  menuOptions = {}
+) {
   const pageSize = 20;
   const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
   const safePage = Math.min(Math.max(page, 0), totalPages - 1);
@@ -766,9 +775,13 @@ function buildPagedSelectionMenu(items, page, itemPrefix, pageCallbackPrefix, ba
 
   for (let index = 0; index < pageItems.length; index += 4) {
     rows.push(
-      pageItems.slice(index, index + 4).map((item, offset) =>
-        Markup.button.callback(item.label, `${itemPrefix}:${startIndex + index + offset}`)
-      )
+      pageItems.slice(index, index + 4).map((item, offset) => {
+        const absoluteIndex = startIndex + index + offset;
+        const token = menuOptions.itemTokenBuilder
+          ? menuOptions.itemTokenBuilder(item, absoluteIndex)
+          : absoluteIndex;
+        return Markup.button.callback(item.label, `${itemPrefix}:${token}`);
+      })
     );
   }
 
@@ -794,13 +807,38 @@ function buildPagedSelectionMenu(items, page, itemPrefix, pageCallbackPrefix, ba
   return Markup.inlineKeyboard(rows);
 }
 
+function stableSelectionFingerprint(value) {
+  return createHash("sha256")
+    .update(String(value ?? ""), "utf8")
+    .digest("base64url")
+    .slice(0, 8);
+}
+
+function fingerprintedSelectionToken(item, index, identityField = "appointment") {
+  return `${index}:${stableSelectionFingerprint(item?.[identityField])}`;
+}
+
+function resolveFingerprintedSelection(items, indexRaw, fingerprint, identityField = "appointment") {
+  const item = items[Number(indexRaw)];
+
+  if (
+    !item ||
+    stableSelectionFingerprint(item?.[identityField]) !== fingerprint
+  ) {
+    return null;
+  }
+
+  return item;
+}
+
 function buildInlineAttendanceMenu(
   options,
   page,
   itemPrefix,
   pagePrefix,
   backTarget,
-  extraRows = []
+  extraRows = [],
+  menuOptions = {}
 ) {
   const pageSize = 20;
   const totalPages = Math.max(1, Math.ceil(options.length / pageSize));
@@ -811,9 +849,13 @@ function buildInlineAttendanceMenu(
 
   for (let index = 0; index < pageItems.length; index += 4) {
     rows.push(
-      pageItems.slice(index, index + 4).map((option, offset) =>
-        Markup.button.callback(option, `${itemPrefix}:${startIndex + index + offset}`)
-      )
+      pageItems.slice(index, index + 4).map((option, offset) => {
+        const absoluteIndex = startIndex + index + offset;
+        const token = menuOptions.itemTokenBuilder
+          ? menuOptions.itemTokenBuilder(option, absoluteIndex)
+          : absoluteIndex;
+        return Markup.button.callback(option, `${itemPrefix}:${token}`);
+      })
     );
   }
 
@@ -839,8 +881,48 @@ function buildInlineAttendanceMenu(
   return Markup.inlineKeyboard(rows);
 }
 
+function attendanceStatusFingerprint(status) {
+  return createHash("sha256")
+    .update(String(status ?? ""), "utf8")
+    .digest("base64url")
+    .slice(0, 8);
+}
+
+function buildDatedAttendanceMenu(
+  config,
+  date,
+  page,
+  itemPrefix,
+  pagePrefix,
+  backTarget,
+  extraRows = []
+) {
+  const isoDate = toIsoDateString(date, config.timezone);
+
+  return buildInlineAttendanceMenu(
+    config.attendanceOptions,
+    page,
+    `${itemPrefix}:${isoDate}`,
+    `${pagePrefix}:${isoDate}`,
+    backTarget,
+    extraRows,
+    {
+      itemTokenBuilder: (option, index) =>
+        `${index}:${attendanceStatusFingerprint(option)}`
+    }
+  );
+}
+
 function formatUserName(from) {
   return [from.first_name, from.last_name].filter(Boolean).join(" ").trim();
+}
+
+function isPrivateTelegramIdentity(ctx) {
+  return Boolean(
+    ctx.chat?.type === "private" &&
+    ctx.from?.id &&
+    String(ctx.chat.id) === String(ctx.from.id)
+  );
 }
 
 function normalizeSecretCode(code) {
@@ -2264,7 +2346,8 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
   });
 
   await clearWeeklyAttendanceState(ctx);
-  await sendOrUpdateAdminMessage(
+  const latestUser = await getUserByChatId(ctx.chat.id);
+  const confirmationMessage = await sendOrUpdateAdminMessage(
     ctx,
     [
       `Weekly attendance recorded for all ${resolvedEntries.length} weekdays and queued for Google Sheets sync:`,
@@ -2278,6 +2361,17 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
       ]
     ])
   );
+  const currentMessageId = getMessageId(confirmationMessage) ??
+    getMessageId(ctx.callbackQuery?.message);
+  await Promise.all([
+    updateUserByChatId(ctx.chat.id, { weeklyPromptMessageIds: [] }),
+    removeObsoleteAttendancePromptMessages(
+      ctx.telegram,
+      ctx.chat.id,
+      latestUser?.weeklyPromptMessageIds,
+      currentMessageId
+    )
+  ]);
   return true;
 }
 
@@ -2352,7 +2446,7 @@ async function updateEnvSpreadsheetId(newSpreadsheetId, config) {
   }
 
   try {
-    await writeFile(envPath, updated, "utf-8");
+    await writePrivateTextFile(envPath, updated);
   } catch (error) {
     logBotError("[SpreadsheetChange] Failed to write .env file.", { error: error.message });
     return { ok: false, reason: error.message };
@@ -2406,8 +2500,9 @@ async function askAttendance(ctx, config, user = null, cache = null) {
   const promptMessage = await sendOrUpdateAdminMessage(
     ctx,
     message,
-    buildInlineAttendanceMenu(
-      config.attendanceOptions,
+    buildDatedAttendanceMenu(
+      config,
+      date,
       0,
       "home:pick:attendance",
       "home:attendance:page",
@@ -2450,8 +2545,9 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
     "Tap a day below to update it, then press Submit when done."
   ].join("\n");
 
-  const dayButtons = weeklyDates.map((dateValue, index) => {
+  const dayButtons = weeklyDates.map((dateValue) => {
     const date = new Date(dateValue);
+    const isoDate = toIsoDateString(date, config.timezone);
     const shortLabel = new Intl.DateTimeFormat("en-GB", {
       timeZone: config.timezone,
       weekday: "short",
@@ -2460,7 +2556,7 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
     const staged = getStagedAttendanceStatus(weeklyEntries, dateValue, (v) => toIsoDateString(v, config.timezone));
     const cached = appointment ? getCachedAttendanceStatus(cache, config, appointment, date) : "";
     const status = staged || cached || "—";
-    return Markup.button.callback(`${shortLabel}: ${status}`, `home:week:day:${index}`);
+    return Markup.button.callback(`${shortLabel}: ${status}`, `home:week:day:${isoDate}`);
   });
 
   const rows = [];
@@ -2469,7 +2565,10 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
     rows.push(dayButtons.slice(i, i + 2));
   }
 
-  rows.push([Markup.button.callback("✅ Submit", "home:week:submit")]);
+  const weekId = weeklyDates[0]
+    ? toIsoDateString(new Date(weeklyDates[0]), config.timezone)
+    : "expired";
+  rows.push([Markup.button.callback("✅ Submit", `home:week:submit:${weekId}`)]);
   rows.push([
     Markup.button.callback("🔙 Back", "home:main"),
     Markup.button.callback("❌ Close", "home:close")
@@ -2492,7 +2591,16 @@ async function showWeeklyAttendanceOverview(ctx, config, user, cache) {
     config,
     user
   );
-  await sendOrUpdateAdminMessage(ctx, message, keyboard);
+  const promptMessage = await sendOrUpdateAdminMessage(ctx, message, keyboard);
+  const messageId = getMessageId(promptMessage) ??
+    getMessageId(ctx.callbackQuery?.message);
+  const latestUser = await getUserByChatId(ctx.chat.id);
+  await updateUserByChatId(ctx.chat.id, {
+    weeklyPromptMessageIds: appendAttendancePromptMessageId(
+      { attendancePromptMessageIds: latestUser?.weeklyPromptMessageIds },
+      messageId
+    )
+  });
 }
 
 async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
@@ -2505,6 +2613,7 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
 
   restoreWeeklyAttendanceSession(ctx, weeklyState);
   const date = new Date(dateValue);
+  const isoDate = toIsoDateString(date, config.timezone);
   const label = formatAttendanceDateLabel(date, config.timezone);
   const stagedStatus = getStagedAttendanceStatus(
     weeklyState.entries,
@@ -2524,18 +2633,28 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
     "",
     detailLine
   ].join("\n");
-  await sendOrUpdateAdminMessage(
+  const promptMessage = await sendOrUpdateAdminMessage(
     ctx,
     message,
-    buildInlineAttendanceMenu(
-      config.attendanceOptions,
+    buildDatedAttendanceMenu(
+      config,
+      date,
       page,
       "home:pick:week",
       "home:week:page",
-      "home:week:overview",
-      [[Markup.button.callback(WEEK_SKIP_LABEL, "home:pick:week:skip")]]
+      `home:week:overview:${toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)}`,
+      [[Markup.button.callback(WEEK_SKIP_LABEL, `home:pick:week:${isoDate}:skip`)]]
     )
   );
+  const messageId = getMessageId(promptMessage) ??
+    getMessageId(ctx.callbackQuery?.message);
+  const latestUser = await getUserByChatId(ctx.chat.id);
+  await updateUserByChatId(ctx.chat.id, {
+    weeklyPromptMessageIds: appendAttendancePromptMessageId(
+      { attendancePromptMessageIds: latestUser?.weeklyPromptMessageIds },
+      messageId
+    )
+  });
 }
 
 async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
@@ -2594,6 +2713,14 @@ async function startWeeklyAttendanceFlow(ctx, config, sheets, user, cache, weekO
 async function registerUser(ctx) {
   const from = ctx.from;
 
+  if (
+    ctx.chat?.type !== "private" ||
+    !from?.id ||
+    String(ctx.chat.id) !== String(from.id)
+  ) {
+    throw new Error("Telegram identity validation failed.");
+  }
+
   await upsertUser({
     chatId: String(ctx.chat.id),
     userId: String(from.id),
@@ -2621,7 +2748,11 @@ function getCommandArgument(text, commandName) {
 async function isAdmin(ctx, config) {
   const user = await getUserByChatId(ctx.chat.id);
 
-  if (!user?.appointment) {
+  if (
+    !user?.appointment ||
+    !ctx.from?.id ||
+    String(user.userId) !== String(ctx.from.id)
+  ) {
     return false;
   }
 
@@ -2818,12 +2949,15 @@ async function refreshAdminCache(cache, config) {
     const label = { label: entry.appointment, appointment: entry.appointment };
     removeAppointmentCandidates.push(label);
     if (entry.boundChatId) {
-      deregisterCandidates.push(label);
+      const bindingIdentity =
+        `${entry.appointment}\u0000${String(entry.boundChatId)}`;
+      deregisterCandidates.push({ ...label, bindingIdentity });
       transferFromCandidates.push({
         label: entry.boundFullName
           ? `${entry.appointment} — ${entry.boundFullName}`
           : entry.appointment,
-        appointment: entry.appointment
+        appointment: entry.appointment,
+        bindingIdentity
       });
       if (isChiefAppointment(entry.appointment) && !adminAppointmentSet.has(entry.appointment.toUpperCase())) {
         chiefAdmins.push({ appointment: entry.appointment, source: "chief" });
@@ -3124,7 +3258,8 @@ async function renderRemoveAdminSubmenu(ctx, cache, page = 0) {
       page,
       "admin:pick:removeadmin",
       "admin:menu:removeadmin",
-      "admin:menu:admins"
+      "admin:menu:admins",
+      { itemTokenBuilder: fingerprintedSelectionToken }
     )
   );
 }
@@ -3184,7 +3319,11 @@ async function renderDeregisterSubmenu(ctx, cache, page = 0) {
       page,
       "admin:pick:deregister",
       "admin:menu:deregister",
-      "admin:main"
+      "admin:main",
+      {
+        itemTokenBuilder: (item, index) =>
+          fingerprintedSelectionToken(item, index, "bindingIdentity")
+      }
     )
   );
 }
@@ -3209,7 +3348,8 @@ async function renderRemoveAppointmentSubmenu(ctx, cache, page = 0) {
       page,
       "admin:pick:appointmentremove",
       "admin:menu:appointments:remove",
-      "admin:menu:roster"
+      "admin:menu:roster",
+      { itemTokenBuilder: fingerprintedSelectionToken }
     )
   );
 }
@@ -3237,13 +3377,22 @@ async function renderTransferFromSubmenu(ctx, cache, page = 0) {
       page,
       "admin:pick:transferfrom",
       "admin:menu:transfer",
-      "admin:menu:roster"
+      "admin:menu:roster",
+      {
+        itemTokenBuilder: (item, index) =>
+          fingerprintedSelectionToken(item, index, "bindingIdentity")
+      }
     )
   );
 }
 
-async function renderTransferToSubmenu(ctx, cache, fromIdx, page = 0) {
-  const from = cache.transferFromCandidates[fromIdx];
+async function renderTransferToSubmenu(ctx, cache, fromIdx, fromFingerprint, page = 0) {
+  const from = resolveFingerprintedSelection(
+    cache.transferFromCandidates,
+    fromIdx,
+    fromFingerprint,
+    "bindingIdentity"
+  );
   const candidates = cache.transferToCandidates;
 
   if (!from) {
@@ -3269,9 +3418,10 @@ async function renderTransferToSubmenu(ctx, cache, fromIdx, page = 0) {
     buildPagedSelectionMenu(
       candidates,
       page,
-      `admin:pick:transferto:${fromIdx}`,
-      `admin:menu:transferto:${fromIdx}`,
-      `admin:menu:transfer:0`
+      `admin:pick:transferto:${fromIdx}:${fromFingerprint}`,
+      `admin:menu:transferto:${fromIdx}:${fromFingerprint}`,
+      "admin:menu:transfer:0",
+      { itemTokenBuilder: fingerprintedSelectionToken }
     ),
     { parse_mode: "HTML" }
   );
@@ -3306,7 +3456,11 @@ async function renderAttendanceOptionRemovalMenu(ctx, config, page = 0) {
       page,
       "admin:pick:optionremove",
       "admin:options:remove",
-      "admin:menu:options"
+      "admin:menu:options",
+      {
+        itemTokenBuilder: (item, index) =>
+          fingerprintedSelectionToken(item, index, "option")
+      }
     )
   );
 }
@@ -3456,11 +3610,24 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       return;
     }
 
+    const broadcastStartedAt = Date.now();
+    const broadcastStartedAtIso = new Date(broadcastStartedAt).toISOString();
+    const broadcastContext = buildAttendancePromptBroadcastContext(config);
     const promptResults = await allSettledConcurrent(
-      users.map((user) => () => buildAndSendAttendancePrompt(bot, config, user, cache)),
+      users.map((user) => (signal) =>
+        buildAndSendAttendancePrompt(
+          bot,
+          config,
+          user,
+          cache,
+          broadcastContext,
+          signal
+        )
+      ),
       TELEGRAM_SEND_CONCURRENCY
     );
     const sent = promptResults.filter((r) => r.status === "fulfilled").length;
+    logAttendancePromptBroadcast("manual", broadcastStartedAt, promptResults);
 
     const promptedAt = new Date().toISOString();
     const patches = [];
@@ -3474,6 +3641,9 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
         } = promptResults[i].value;
         patches.push({
           chatId,
+          expectedAppointment: users[i].appointment,
+          notSubmittedAfter: broadcastStartedAtIso,
+          notPromptedAfter: broadcastStartedAtIso,
           patch: {
             awaitingAttendance,
             attendancePromptMessageIds,
@@ -3481,7 +3651,10 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
           }
         });
       } else {
-        logBotError("Failed to send prompt.", { chatId: users[i].chatId, error: promptResults[i].reason?.message });
+        logBotError("Failed to send prompt.", {
+          recipientIndex: i,
+          error: promptResults[i].reason?.message
+        });
       }
     }
 
@@ -3580,34 +3753,95 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
 // Sends the attendance prompt message to a pre-fetched user object and returns
 // the state patch to apply. Caller is responsible for writing the patch to disk
 // so that bulk sends can batch all writes into a single storage operation.
-async function buildAndSendAttendancePrompt(bot, config, user, cache) {
-  const today = new Date();
-  const dateLabel = formatAttendanceDateLabel(today, config.timezone);
-  const currentStatus = user?.appointment && cache
-    ? getCachedAttendanceStatus(cache, config, user.appointment, today)
-    : "";
-  const message = buildTodayAttendancePromptMessage(config, today, user?.appointment ?? null, cache);
-  const promptMessage = currentStatus
-    ? `Your attendance for ${dateLabel} is currently ${currentStatus}. Update it if needed.`
-    : `You have not updated your attendance for ${dateLabel}. ${message}`;
-  const sentMessage = await bot.telegram.sendMessage(
-    user.chatId,
-    promptMessage,
-    buildInlineAttendanceMenu(
-      config.attendanceOptions,
+function buildAttendancePromptBroadcastContext(config, date = new Date()) {
+  const dateLabel = formatAttendanceDateLabel(date, config.timezone);
+
+  return {
+    date,
+    dateLabel,
+    emptyStatusMessage:
+      `You have not updated your attendance for ${dateLabel}. ` +
+      `Select your attendance for ${dateLabel}.`,
+    replyMarkup: buildDatedAttendanceMenu(
+      config,
+      date,
       0,
       "home:pick:attendance",
       "home:attendance:page",
       "home:main"
     )
-  );
+  };
+}
+
+function logAttendancePromptBroadcast(source, startedAt, results) {
+  const latencies = results
+    .filter((result) => result.status === "fulfilled")
+    .map((result) => Number(result.value?.sendLatencyMs))
+    .filter(Number.isFinite)
+    .sort((left, right) => left - right);
+  const percentile = (ratio) => {
+    if (latencies.length === 0) {
+      return null;
+    }
+
+    return latencies[Math.min(
+      latencies.length - 1,
+      Math.ceil(latencies.length * ratio) - 1
+    )];
+  };
+
+  logBot("Attendance prompt broadcast completed.", {
+    source,
+    recipients: results.length,
+    sent: results.filter((result) => result.status === "fulfilled").length,
+    failed: results.filter((result) => result.status === "rejected").length,
+    durationMs: Date.now() - startedAt,
+    sendLatencyP50Ms: percentile(0.5),
+    sendLatencyP95Ms: percentile(0.95)
+  });
+}
+
+async function buildAndSendAttendancePrompt(
+  bot,
+  config,
+  user,
+  cache,
+  broadcastContext = null,
+  signal = null
+) {
+  const context = broadcastContext ?? buildAttendancePromptBroadcastContext(config);
+  const today = context.date;
+  const dateLabel = context.dateLabel;
+  const currentStatus = user?.appointment && cache
+    ? getCachedAttendanceStatus(cache, config, user.appointment, today)
+    : "";
+  const promptMessage = currentStatus
+    ? `Your attendance for ${dateLabel} is currently ${currentStatus}. Update it if needed.`
+    : context.emptyStatusMessage;
+  const sendStartedAt = Date.now();
+  const sentMessage = signal && typeof bot.telegram.callApi === "function"
+    ? await bot.telegram.callApi(
+      "sendMessage",
+      {
+        chat_id: user.chatId,
+        text: promptMessage,
+        ...context.replyMarkup
+      },
+      { signal }
+    )
+    : await bot.telegram.sendMessage(
+      user.chatId,
+      promptMessage,
+      context.replyMarkup
+    );
   return {
     chatId: user.chatId,
     awaitingAttendance: !currentStatus,
     attendancePromptMessageIds: appendAttendancePromptMessageId(
       user,
       getMessageId(sentMessage)
-    )
+    ),
+    sendLatencyMs: Date.now() - sendStartedAt
   };
 }
 
@@ -3637,7 +3871,11 @@ function hasUnfilledAttendance(cache, config, appointment, date = new Date()) {
 async function ensureUserBound(ctx, config) {
   const user = await getUserByChatId(ctx.chat.id);
 
-  if (user?.appointment) {
+  if (
+    user?.appointment &&
+    ctx.from?.id &&
+    String(user.userId) === String(ctx.from.id)
+  ) {
     return user;
   }
 
@@ -4382,14 +4620,18 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   const isReminderWorkingDayFn = deps.isReminderWorkingDayFn ?? isReminderWorkingDay;
   const listUsersFn = deps.listUsersFn ?? listUsers;
   const sendPromptToChatFn = deps.sendPromptToChatFn ?? sendPromptToChat;
+  const usesDefaultPromptBuilder =
+    !deps.buildAndSendAttendancePromptFn && !deps.sendPromptToChatFn;
   const buildAndSendAttendancePromptFn = deps.buildAndSendAttendancePromptFn ??
     (deps.sendPromptToChatFn
       ? async (targetBot, targetConfig, user, cache) => {
+          const sendStartedAt = Date.now();
           await sendPromptToChatFn(targetBot, targetConfig, user.chatId, cache);
           return {
             chatId: user.chatId,
             awaitingAttendance: true,
-            attendancePromptMessageIds: user.attendancePromptMessageIds ?? []
+            attendancePromptMessageIds: user.attendancePromptMessageIds ?? [],
+            sendLatencyMs: Date.now() - sendStartedAt
           };
         }
       : buildAndSendAttendancePrompt);
@@ -4567,10 +4809,24 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
           return;
         }
 
-        try {
-          await adminCache.syncManager.runCycle({ force: true, reason: "reminder" });
-        } catch (error) {
-          logBotWarn(`[Reminder] Sheet refresh failed before ${reminderTime} reminder — using cached data.`, { error: error.message });
+        const isFirstReminder = reminderTime === config.firstReminderTime;
+        const refreshPromise = Promise.resolve()
+          .then(() =>
+            adminCache.syncManager.runCycle({ force: true, reason: "reminder" })
+          )
+          .catch((error) => {
+            logBotWarn(
+              `[Reminder] Sheet refresh failed before ${reminderTime} reminder — using cached data.`,
+              { error: error.message }
+            );
+          });
+
+        // The first reminder always targets every bound user, so fresh Sheets
+        // data is not needed to choose recipients. Let synchronization continue
+        // in parallel. The second reminder must wait because it only targets
+        // people whose attendance is still unfilled.
+        if (!isFirstReminder) {
+          await refreshPromise;
         }
 
         const users = (await listUsersFn()).filter((user) => {
@@ -4578,16 +4834,35 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
             return false;
           }
 
-          if (reminderTime === config.firstReminderTime) {
+          if (isFirstReminder) {
             return true;
           }
 
           return hasUnfilledAttendance(adminCache, config, user.appointment, now);
         });
 
+        const broadcastStartedAt = Date.now();
+        const broadcastStartedAtIso = new Date(broadcastStartedAt).toISOString();
+        const broadcastContext = usesDefaultPromptBuilder
+          ? buildAttendancePromptBroadcastContext(config, now)
+          : null;
         const promptResults = await allSettledConcurrent(
-          users.map((user) => () => buildAndSendAttendancePromptFn(bot, config, user, adminCache)),
+          users.map((user) => (signal) =>
+            buildAndSendAttendancePromptFn(
+              bot,
+              config,
+              user,
+              adminCache,
+              broadcastContext,
+              signal
+            )
+          ),
           TELEGRAM_SEND_CONCURRENCY
+        );
+        logAttendancePromptBroadcast(
+          `reminder:${reminderTime}`,
+          broadcastStartedAt,
+          promptResults
         );
 
         const promptedAt = new Date().toISOString();
@@ -4602,6 +4877,9 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
             } = promptResults[i].value;
             patches.push({
               chatId,
+              expectedAppointment: users[i].appointment,
+              notSubmittedAfter: broadcastStartedAtIso,
+              notPromptedAfter: broadcastStartedAtIso,
               patch: {
                 awaitingAttendance,
                 attendancePromptMessageIds,
@@ -4609,7 +4887,10 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
               }
             });
           } else {
-            logBotError(`[Reminder] Failed to send ${reminderTime} prompt.`, { chatId: users[i].chatId, error: promptResults[i].reason?.message });
+            logBotError(`[Reminder] Failed to send ${reminderTime} prompt.`, {
+              recipientIndex: i,
+              error: promptResults[i].reason?.message
+            });
           }
         }
 
@@ -4621,6 +4902,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
 }
 
 export async function createAttendanceBot(config) {
+  await recoverStorageTransactions();
   const bot = new Telegraf(config.telegramBotToken, {
     telegram: {
       agent: ipv4HttpsAgent
@@ -4691,6 +4973,39 @@ export async function createAttendanceBot(config) {
       })
     })
   );
+
+  bot.use(async (ctx, next) => {
+    if (!isPrivateTelegramIdentity(ctx)) {
+      if (ctx.callbackQuery) {
+        await ctx.answerCbQuery(
+          "For privacy, use this bot in a direct message.",
+          { show_alert: true }
+        ).catch(() => {});
+      } else if (ctx.chat) {
+        await ctx.reply(
+          "For privacy, this bot only accepts commands in a direct message."
+        ).catch(() => {});
+      }
+      return;
+    }
+
+    const storedUser = await getUserByChatId(ctx.chat.id);
+
+    if (storedUser?.userId && String(storedUser.userId) !== String(ctx.from.id)) {
+      logBotWarn("Rejected Telegram identity mismatch.");
+
+      if (ctx.callbackQuery) {
+        await ctx.answerCbQuery("Identity verification failed.", {
+          show_alert: true
+        }).catch(() => {});
+      } else {
+        await ctx.reply("Identity verification failed.").catch(() => {});
+      }
+      return;
+    }
+
+    return next();
+  });
 
   bot.command("help", async (ctx) => {
     await sendHelp(ctx, config);
@@ -5027,11 +5342,9 @@ export async function createAttendanceBot(config) {
       }
 
       ctx.session.awaitingIssueReport = false;
-      const username = ctx.from?.username ? `@${ctx.from.username}` : ctx.from?.first_name ?? "Unknown";
       const titleText = description.length > 60 ? `${description.slice(0, 57)}…` : description;
       const issueTitle = `[User Report] ${titleText}`;
       const issueBody = [
-        `**Reported by:** ${username} (Telegram chat ID: ${ctx.chat.id})`,
         `**Date:** ${new Date().toISOString()}`,
         "",
         "**Description:**",
@@ -5180,10 +5493,10 @@ export async function createAttendanceBot(config) {
 
       const normalizedOption = String(message ?? "").trim().toUpperCase();
 
-      if (!normalizedOption) {
+      if (!normalizedOption || /^[=+\-@]/.test(normalizedOption)) {
         await sendOrUpdateAdminMessage(
           ctx,
-          "Attendance option cannot be empty. Send the new code to add it.",
+          "Attendance option must be non-empty and cannot begin with =, +, -, or @.",
           Markup.inlineKeyboard([
             [
               Markup.button.callback("🔙 Back", "admin:menu:options"),
@@ -5320,7 +5633,6 @@ export async function createAttendanceBot(config) {
     if (
       !action.startsWith("pick:attendance:") &&
       !action.startsWith("department:pickoption:") &&
-      action !== "pick:week:skip" &&
       !action.startsWith("pick:week:")
     ) {
       await ctx.answerCbQuery();
@@ -5673,8 +5985,19 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const page = Number(action.split(":")[2]);
-      const date = new Date();
+      const [, , isoDate, pageRaw] = action.split(":");
+      const date = parseIsoDate(isoDate);
+      const currentIsoDate = toIsoDateString(new Date(), config.timezone);
+
+      if (!date || isoDate !== currentIsoDate) {
+        await ctx.answerCbQuery("This attendance prompt has expired.", {
+          show_alert: true
+        });
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        return;
+      }
+
+      const page = Number(pageRaw);
       const label = formatAttendanceDateLabel(date, config.timezone);
       const existingStatus = getCachedAttendanceStatus(
         adminCache,
@@ -5689,8 +6012,9 @@ export async function createAttendanceBot(config) {
       await sendOrUpdateAdminMessage(
         ctx,
         message,
-        buildInlineAttendanceMenu(
-          config.attendanceOptions,
+        buildDatedAttendanceMenu(
+          config,
+          date,
           page,
           "home:pick:attendance",
           "home:attendance:page",
@@ -5707,11 +6031,21 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const picked = config.attendanceOptions[Number(action.split(":")[2])];
+      const [, , isoDate, optionIndexRaw, optionFingerprint] = action.split(":");
+      const todayIsoDate = toIsoDateString(new Date(), config.timezone);
+      const recordedAt = parseIsoDate(isoDate);
+      const picked = config.attendanceOptions[Number(optionIndexRaw)];
 
-      if (!picked) {
-        await ctx.answerCbQuery();
-        await askAttendance(ctx, config, user, adminCache);
+      if (
+        !recordedAt ||
+        isoDate !== todayIsoDate ||
+        !picked ||
+        attendanceStatusFingerprint(picked) !== optionFingerprint
+      ) {
+        await ctx.answerCbQuery("This attendance prompt has expired.", {
+          show_alert: true
+        });
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
         return;
       }
 
@@ -5719,7 +6053,6 @@ export async function createAttendanceBot(config) {
       // spinner and doesn't expire the query_id while we do async work below.
       await ctx.answerCbQuery("Attendance updated");
 
-      const recordedAt = new Date();
       await queueAttendanceSelection(
         adminCache,
         config,
@@ -5728,14 +6061,15 @@ export async function createAttendanceBot(config) {
         recordedAt,
         "daily"
       );
+      const submittedAt = new Date();
       const confirmationLines = [
-        `Attendance recorded as "${picked}" for ${user.appointment} for ${formatAttendanceDateLabel(recordedAt, config.timezone)} at ${formatMilitaryTime(recordedAt, config.timezone)} hrs.`,
+        `Attendance recorded as "${picked}" for ${user.appointment} for ${formatAttendanceDateLabel(recordedAt, config.timezone)} at ${formatMilitaryTime(submittedAt, config.timezone)} hrs.`,
         "Queued for Google Sheets sync.",
         "",
         `"${pickQuoteOrJoke()}"`
       ];
 
-      if (isAfterAttendanceReminderCutoff(recordedAt, config.timezone)) {
+      if (isAfterAttendanceReminderCutoff(submittedAt, config.timezone)) {
         confirmationLines.splice(
           1,
           0,
@@ -5753,7 +6087,7 @@ export async function createAttendanceBot(config) {
         updateUserByChatId(ctx.chat.id, {
           awaitingAttendance: false,
           attendancePromptMessageIds: [],
-          lastSubmittedAt: new Date().toISOString()
+          lastSubmittedAt: submittedAt.toISOString()
         }),
         sendOrUpdateAdminMessage(
           ctx,
@@ -5784,21 +6118,51 @@ export async function createAttendanceBot(config) {
         return;
       }
 
+      const [, , isoDate, pageRaw] = action.split(":");
+      const weeklyState = getWeeklyAttendanceState(ctx, user);
+      const dayIndex = weeklyState.dates.findIndex(
+        (value) => toIsoDateString(new Date(value), config.timezone) === isoDate
+      );
+
+      if (dayIndex < 0) {
+        await ctx.answerCbQuery("This weekly prompt has expired.", {
+          show_alert: true
+        });
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        return;
+      }
+
+      restoreWeeklyAttendanceSession(ctx, { ...weeklyState, index: dayIndex });
+      await updateUserByChatId(ctx.chat.id, { weeklyAttendanceIndex: dayIndex });
       await promptWeeklyAttendanceDay(
         ctx,
         config,
         user,
         adminCache,
-        Number(action.split(":")[2])
+        Number(pageRaw)
       );
       return;
     }
 
-    if (action === "week:overview") {
+    if (action.startsWith("week:overview:")) {
       triggerBackgroundSheetRefresh(adminCache, "home:week:overview");
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
+        return;
+      }
+
+      const weekId = action.split(":")[2];
+      const weeklyState = getWeeklyAttendanceState(ctx, user);
+      const currentWeekId = weeklyState.dates[0]
+        ? toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)
+        : "";
+
+      if (!weekId || weekId !== currentWeekId) {
+        await ctx.answerCbQuery("This weekly prompt has expired.", {
+          show_alert: true
+        });
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
         return;
       }
 
@@ -5815,8 +6179,20 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const dayIndex = Number(action.split(":")[2]);
+      const isoDate = action.split(":")[2];
       const weeklyState = getWeeklyAttendanceState(ctx, user);
+      const dayIndex = weeklyState.dates.findIndex(
+        (value) => toIsoDateString(new Date(value), config.timezone) === isoDate
+      );
+
+      if (dayIndex < 0) {
+        await ctx.answerCbQuery("This weekly prompt has expired.", {
+          show_alert: true
+        });
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        return;
+      }
+
       restoreWeeklyAttendanceSession(ctx, {
         ...weeklyState,
         index: dayIndex
@@ -5827,10 +6203,24 @@ export async function createAttendanceBot(config) {
       return;
     }
 
-    if (action === "week:submit") {
+    if (action.startsWith("week:submit:")) {
       const user = await ensureUserBound(ctx, config);
 
       if (!user) {
+        return;
+      }
+
+      const weekId = action.split(":")[2];
+      const weeklyState = getWeeklyAttendanceState(ctx, user);
+      const currentWeekId = weeklyState.dates[0]
+        ? toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)
+        : "";
+
+      if (!weekId || weekId !== currentWeekId) {
+        await ctx.answerCbQuery("This weekly prompt has expired.", {
+          show_alert: true
+        });
+        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
         return;
       }
 
@@ -5848,7 +6238,7 @@ export async function createAttendanceBot(config) {
       return;
     }
 
-    if (action === "pick:week:skip" || action.startsWith("pick:week:")) {
+    if (action.startsWith("pick:week:")) {
       triggerBackgroundSheetRefresh(adminCache, "home:pick:week");
       const user = await ensureUserBound(ctx, config);
 
@@ -5859,7 +6249,10 @@ export async function createAttendanceBot(config) {
       const storedUser = await getUserByChatId(ctx.chat.id);
       const weeklyState = getWeeklyAttendanceState(ctx, storedUser);
       const weeklyDates = weeklyState.dates;
-      const weeklyIndex = weeklyState.index;
+      const [, , requestedIsoDate, optionIndexRaw, optionFingerprint] = action.split(":");
+      const weeklyIndex = weeklyDates.findIndex(
+        (value) => toIsoDateString(new Date(value), config.timezone) === requestedIsoDate
+      );
       const weeklyEntries = weeklyState.entries;
       const dateValue = weeklyDates[weeklyIndex];
 
@@ -5890,12 +6283,17 @@ export async function createAttendanceBot(config) {
         getCachedAttendanceStatus(adminCache, config, user.appointment, date);
       let nextEntries = weeklyEntries;
 
-      if (action !== "pick:week:skip") {
-        const picked = config.attendanceOptions[Number(action.split(":")[2])];
+      if (optionIndexRaw !== "skip") {
+        const picked = config.attendanceOptions[Number(optionIndexRaw)];
 
-        if (!picked) {
-          await ctx.answerCbQuery();
-          await promptWeeklyAttendanceDay(ctx, config, user, adminCache);
+        if (
+          !picked ||
+          attendanceStatusFingerprint(picked) !== optionFingerprint
+        ) {
+          await ctx.answerCbQuery("This weekly prompt has expired.", {
+            show_alert: true
+          });
+          await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
           return;
         }
 
@@ -5914,10 +6312,12 @@ export async function createAttendanceBot(config) {
 
       restoreWeeklyAttendanceSession(ctx, {
         ...weeklyState,
+        index: weeklyIndex,
         entries: nextEntries
       });
 
       await updateUserByChatId(ctx.chat.id, {
+        weeklyAttendanceIndex: weeklyIndex,
         weeklyAttendanceEntries: nextEntries,
         lastSubmittedAt: new Date().toISOString()
       });
@@ -6138,11 +6538,19 @@ export async function createAttendanceBot(config) {
     }
 
     if (action.startsWith("menu:transferto:")) {
-      // Pagination within the "to" selection: format is menu:transferto:<fromIdx>:<page>
+      // Pagination within the "to" selection carries an immutable fingerprint
+      // for the source so a cache refresh cannot change the selected person.
       const parts = action.split(":");
       const fromIdx = Number(parts[2]);
-      const page = Number(parts[3] ?? 0);
-      await renderTransferToSubmenu(ctx, adminCache, fromIdx, page);
+      const fromFingerprint = parts[3];
+      const page = Number(parts[4] ?? 0);
+      await renderTransferToSubmenu(
+        ctx,
+        adminCache,
+        fromIdx,
+        fromFingerprint,
+        page
+      );
       return;
     }
 
@@ -6313,7 +6721,13 @@ export async function createAttendanceBot(config) {
 
     if (action.startsWith("pick:deregister:")) {
       const candidates = adminCache.deregisterCandidates;
-      const picked = candidates[Number(action.split(":")[2])];
+      const [, , indexRaw, fingerprint] = action.split(":");
+      const picked = resolveFingerprintedSelection(
+        candidates,
+        indexRaw,
+        fingerprint,
+        "bindingIdentity"
+      );
 
       if (!picked) {
         await renderDeregisterSubmenu(ctx, adminCache, 0);
@@ -6339,39 +6753,92 @@ export async function createAttendanceBot(config) {
 
     if (action.startsWith("pick:transferfrom:")) {
       // Admin selected the "from" user — now show the "to" slot list.
-      const fromIdx = Number(action.split(":")[2]);
-      const from = adminCache.transferFromCandidates[fromIdx];
+      const [, , fromIdxRaw, fromFingerprint] = action.split(":");
+      const fromIdx = Number(fromIdxRaw);
+      const from = resolveFingerprintedSelection(
+        adminCache.transferFromCandidates,
+        fromIdx,
+        fromFingerprint,
+        "bindingIdentity"
+      );
       if (!from) {
         await renderTransferFromSubmenu(ctx, adminCache, 0);
         return;
       }
-      await renderTransferToSubmenu(ctx, adminCache, fromIdx, 0);
+      await renderTransferToSubmenu(
+        ctx,
+        adminCache,
+        fromIdx,
+        fromFingerprint,
+        0
+      );
       return;
     }
 
     if (action.startsWith("pick:transferto:")) {
-      // Format: pick:transferto:<fromIdx>:<toIdx>
+      // Format: pick:transferto:<fromIdx>:<fromFingerprint>:<toIdx>:<toFingerprint>
       const parts = action.split(":");
       const fromIdx = Number(parts[2]);
-      const toIdx = Number(parts[3]);
-      const from = adminCache.transferFromCandidates[fromIdx];
-      const to = adminCache.transferToCandidates[toIdx];
+      const fromFingerprint = parts[3];
+      const toIdx = Number(parts[4]);
+      const toFingerprint = parts[5];
+      const from = resolveFingerprintedSelection(
+        adminCache.transferFromCandidates,
+        fromIdx,
+        fromFingerprint,
+        "bindingIdentity"
+      );
+      const to = resolveFingerprintedSelection(
+        adminCache.transferToCandidates,
+        toIdx,
+        toFingerprint
+      );
 
       if (!from || !to) {
         await renderTransferFromSubmenu(ctx, adminCache, 0);
         return;
       }
 
+      // Copy attendance first while retaining the source. Only move the local
+      // binding after every managed sheet passes conflict checks and confirms
+      // the copy. Clearing happens last, so every failure mode retains a copy.
+      const attendanceCopyResults = await transferAttendanceRows(
+        sheets,
+        config,
+        from.appointment,
+        to.appointment,
+        { phase: "copy" }
+      );
+      const attendanceCopyBlocked = attendanceCopyResults.some(
+        (entry) =>
+          entry.conflict ||
+          ["empty_sheet", "from_row_not_found", "to_row_not_found",
+            "transfer_aborted_due_to_conflict"].includes(entry.reason)
+      );
+
+      if (attendanceCopyBlocked) {
+        const reasons = [...new Set(
+          attendanceCopyResults
+            .filter((entry) => entry.reason)
+            .map((entry) => `${entry.title}: ${entry.reason}`)
+        )];
+        await sendOrUpdateAdminMessage(
+          ctx,
+          `Transfer stopped without changing the binding or deleting attendance.\n${reasons.join("\n")}`,
+          buildAppointmentManagementBackMenu()
+        );
+        return;
+      }
+
       const result = await transferAppointmentBinding(from.appointment, to.appointment);
 
       if (result.ok) {
-        // Move attendance data in month sheets immediately so the user doesn't
-        // need to run a manual Sync Roster to carry over existing entries.
         const attendanceResults = await transferAttendanceRows(
           sheets,
           config,
           result.fromAppointment,
-          result.toAppointment
+          result.toAppointment,
+          { phase: "clear" }
         );
         const sheetsMoved = attendanceResults.filter((r) => r.transferred).map((r) => r.title);
         const attendanceNote = sheetsMoved.length > 0
@@ -6408,7 +6875,12 @@ export async function createAttendanceBot(config) {
 
     if (action.startsWith("pick:appointmentremove:")) {
       const candidates = adminCache.removeAppointmentCandidates;
-      const picked = candidates[Number(action.split(":")[2])];
+      const [, , indexRaw, fingerprint] = action.split(":");
+      const picked = resolveFingerprintedSelection(
+        candidates,
+        indexRaw,
+        fingerprint
+      );
 
       if (!picked) {
         await renderRemoveAppointmentSubmenu(ctx, adminCache, 0);
@@ -6433,7 +6905,12 @@ export async function createAttendanceBot(config) {
 
     if (action.startsWith("pick:removeadmin:")) {
       const candidates = adminCache.removeAdminCandidates;
-      const picked = candidates[Number(action.split(":")[2])];
+      const [, , indexRaw, fingerprint] = action.split(":");
+      const picked = resolveFingerprintedSelection(
+        candidates,
+        indexRaw,
+        fingerprint
+      );
 
       if (!picked) {
         await renderRemoveAdminSubmenu(ctx, adminCache, 0);
@@ -6461,7 +6938,13 @@ export async function createAttendanceBot(config) {
     }
 
     if (action.startsWith("pick:optionremove:")) {
-      const option = config.attendanceOptions[Number(action.split(":")[2])];
+      const [, , indexRaw, fingerprint] = action.split(":");
+      const option = resolveFingerprintedSelection(
+        config.attendanceOptions.map((entry) => ({ option: entry })),
+        indexRaw,
+        fingerprint,
+        "option"
+      )?.option;
 
       if (!option) {
         await renderAttendanceOptionRemovalMenu(ctx, config, 0);
@@ -6508,6 +6991,8 @@ export const __testing = {
   buildInviteMessage,
   buildManageAdminsDescription,
   buildHomeMenuText,
+  buildDatedAttendanceMenu,
+  isPrivateTelegramIdentity,
   appendAttendancePromptMessageId,
   formatDepartmentViewMessage,
   buildSummaryMenu,

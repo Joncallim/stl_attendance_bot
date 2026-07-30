@@ -9,7 +9,8 @@ import {
   preloadAttendanceSnapshots,
   reconcilePendingAttendanceWithSheets,
   summarizeAttendanceOptionUsage,
-  syncOnboardingRoster
+  syncOnboardingRoster,
+  transferAttendanceRows
 } from "../src/googleSheets.js";
 
 function createFakeSheets(columnValues) {
@@ -440,6 +441,48 @@ test("monthly managed-row writes preserve rows below Remarks and stay batched", 
   assert.deepEqual(fake.calls.clear, []);
   assert.deepEqual(fake.calls.batchUpdate, []);
   assert.deepEqual(fake.calls.batchValueUpdate, []);
+});
+
+test("attendance transfer aborts every sheet before writing when a destination has data", async () => {
+  const timezone = "Asia/Singapore";
+  const dates = [
+    __testing.shiftMonth(new Date(), timezone, -1),
+    new Date(),
+    __testing.shiftMonth(new Date(), timezone, 1)
+  ];
+  const initialSheets = {};
+
+  dates.forEach((date, index) => {
+    const { title, month } = __testing.getMonthParts(date, timezone);
+    initialSheets[title] = {
+      sheetId: index + 1,
+      values: [
+        ["Appointment", `1 ${month}`, `2 ${month}`],
+        ["ALPHA", "PRESENT", "MC"],
+        ["BRAVO", index === 1 ? "WFH" : "", ""],
+        ["Remarks"]
+      ]
+    };
+  });
+
+  const fake = createInMemorySheets(initialSheets);
+  const results = await transferAttendanceRows(
+    fake.client,
+    {
+      spreadsheetId: "spreadsheet-id",
+      timezone,
+      rosterStopMarkers: ["Remarks"]
+    },
+    "ALPHA",
+    "BRAVO",
+    { phase: "copy" }
+  );
+
+  assert.ok(results.some((entry) => entry.reason === "destination_has_attendance"));
+  assert.equal(fake.calls.batchValueUpdates.length, 0);
+  for (const { title } of dates.map((date) => __testing.getMonthParts(date, timezone))) {
+    assert.equal(fake.getSheetValues(title)[1][1], "PRESENT");
+  }
 });
 
 test("managed monthly rows follow onboarding order while preserving existing row data", async () => {
