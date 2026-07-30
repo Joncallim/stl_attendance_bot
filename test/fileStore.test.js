@@ -6,6 +6,7 @@ import { appendFile, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import {
   appendJsonLine,
   readJsonLines,
+  removePrivateFile,
   writeJsonFile
 } from "../src/fileStore.js";
 
@@ -42,6 +43,20 @@ test("JSONL recovery keeps complete records around a truncated append", async ()
   });
 });
 
+test("strict JSONL reads refuse to discard malformed records", async () => {
+  await withTempDir(async (directory) => {
+    const filePath = path.join(directory, "queue.ndjson");
+    await appendJsonLine(filePath, { id: 1, status: "pending" });
+    await appendFile(filePath, "{\"id\":", "utf8");
+
+    await assert.rejects(
+      readJsonLines(filePath, { rejectMalformed: true }),
+      /refusing destructive rewrite/
+    );
+    assert.match(await readFile(filePath, "utf8"), /"id":$/);
+  });
+});
+
 test("JSONL checksum rejects a modified complete record", async () => {
   await withTempDir(async (directory) => {
     const filePath = path.join(directory, "queue.ndjson");
@@ -53,5 +68,16 @@ test("JSONL checksum rejects a modified complete record", async () => {
       readJsonLines(filePath),
       /checksum mismatch/
     );
+  });
+});
+
+test("private file removal deletes the file after syncing its directory", async () => {
+  await withTempDir(async (directory) => {
+    const filePath = path.join(directory, "storage-transaction.json");
+    await writeJsonFile(filePath, { id: "transaction-1" });
+
+    assert.equal(await removePrivateFile(filePath), true);
+    await assert.rejects(readFile(filePath, "utf8"), { code: "ENOENT" });
+    assert.equal(await removePrivateFile(filePath), false);
   });
 });

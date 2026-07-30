@@ -1,7 +1,11 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { unlink } from "node:fs/promises";
 import { getDataFile } from "./dataDir.js";
-import { readJsonFile, runSerialized, writeJsonFile } from "./fileStore.js";
+import {
+  readJsonFile,
+  removePrivateFile,
+  runSerialized,
+  writeJsonFile
+} from "./fileStore.js";
 
 const STORAGE_MUTEX_KEY = "storage";
 const ATTENDANCE_OPTION_SCHEMA_VERSION = 2;
@@ -240,11 +244,7 @@ async function recoverStorageTransaction() {
 
   await writeAppointmentRegistry(transaction.registry);
   await writeUsers(transaction.users);
-  await unlink(getStorageTransactionFile()).catch((error) => {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
-  });
+  await removePrivateFile(getStorageTransactionFile());
   logStorageSuccess("# Recovered interrupted storage transaction.", {
     transactionId: transaction.id,
     operation: transaction.operation
@@ -264,11 +264,7 @@ async function commitRegistryAndUsers(registry, users, operation) {
   await writeJsonFile(getStorageTransactionFile(), transaction);
   await writeAppointmentRegistry(registry);
   await writeUsers(users);
-  await unlink(getStorageTransactionFile()).catch((error) => {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
-  });
+  await removePrivateFile(getStorageTransactionFile());
 }
 
 function withStorageMutation(operation) {

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
-import { mkdtemp, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import {
   compactAttendanceQueue,
   enqueueAttendanceEvent,
@@ -198,6 +198,30 @@ test("compactAttendanceQueue preserves pending events and their records", async 
     const e2 = [...state.events.values()][0];
     assert.equal(e2.appointment, "E2");
     assert.equal(e2.queueStatus, "pending");
+  });
+});
+
+test("compactAttendanceQueue refuses to erase malformed queue bytes", async () => {
+  await withTempDataDir(async (tempDir) => {
+    await enqueueAttendanceEvent(CONFIG, makeEvent("SAFE", "PRESENT", 0));
+    await enqueueAttendanceEvent(CONFIG, makeEvent("DONE", "WFH", 1));
+    await flushAttendanceQueue(async (entries) => ({
+      writtenEventIds: entries
+        .filter((event) => event.appointment === "DONE")
+        .map((event) => event.id),
+      skippedEvents: [],
+      conflictedEvents: []
+    }));
+
+    const queueFile = path.join(tempDir, "attendance-queue.ndjson");
+    await appendFile(queueFile, "{\"kind\":\"attendance_enqueued\"", "utf8");
+    const before = await readFile(queueFile, "utf8");
+
+    await assert.rejects(
+      compactAttendanceQueue(),
+      /refusing destructive rewrite/
+    );
+    assert.equal(await readFile(queueFile, "utf8"), before);
   });
 });
 

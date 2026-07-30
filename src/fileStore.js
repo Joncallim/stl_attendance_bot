@@ -1,4 +1,4 @@
-import { chmod, mkdir, open, readFile, rename } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 
@@ -129,6 +129,27 @@ export async function writePrivateTextFile(filePath, content) {
   });
 }
 
+export async function removePrivateFile(filePath) {
+  return runSerialized(`file:${filePath}`, async () => {
+    await ensureParentDir(filePath);
+
+    try {
+      await unlink(filePath);
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        return false;
+      }
+
+      throw error;
+    }
+
+    // unlink() can return before the directory entry is durable. Sync the
+    // parent so a deleted transaction journal cannot reappear after a crash.
+    await syncDirectory(filePath);
+    return true;
+  });
+}
+
 export async function appendJsonLine(filePath, value) {
   return runSerialized(`file:${filePath}`, async () => {
     await ensureParentDir(filePath);
@@ -157,7 +178,7 @@ export async function writeJsonLines(filePath, values) {
   });
 }
 
-export async function readJsonLines(filePath) {
+export async function readJsonLines(filePath, { rejectMalformed = false } = {}) {
   await ensureParentDir(filePath);
 
   try {
@@ -173,8 +194,15 @@ export async function readJsonLines(filePath) {
         } catch (error) {
           // A process or host crash can leave only the last append truncated.
           // Keep the damaged bytes on disk for recovery and load every complete
-          // record before them. Corruption in the middle is not safe to skip.
+          // record around them. Destructive callers such as compaction must use
+          // rejectMalformed so these retained bytes cannot be rewritten away.
           if (error instanceof SyntaxError) {
+            if (rejectMalformed) {
+              throw new Error(
+                `Malformed JSONL record at line ${index + 1}; refusing destructive rewrite.`
+              );
+            }
+
             console.error(
               `[FileStore] Ignoring incomplete JSONL record at line ${index + 1}; bytes retained on disk.`
             );
