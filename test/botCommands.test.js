@@ -7,6 +7,118 @@ process.env.GOOGLE_SHEETS_SPREADSHEET_ID ??= "test-sheet";
 process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL ??= "bot@example.com";
 
 const { __testing } = await import("../src/bot.js");
+const {
+  __testing: priorityTesting,
+  getWorkPriorityStatus,
+  runWithBackgroundPriority,
+  runWithInteractivePriority
+} = await import("../src/workPriority.js");
+const { shouldDeferSnapshotRefresh } = await import("../src/broadcastActivity.js");
+
+test("interactive Sheet transactions take the next safe transaction boundary", async () => {
+  priorityTesting.reset();
+  priorityTesting.setQuietPeriodMs(0);
+  try {
+    const order = [];
+    let releaseBackground;
+    let backgroundStarted;
+    const backgroundStartedPromise = new Promise((resolve) => {
+      backgroundStarted = resolve;
+    });
+
+    const firstBackground = runWithBackgroundPriority(() =>
+      __testing.withSheetOperation(async () => {
+        order.push("background:start");
+        backgroundStarted();
+        await new Promise((resolve) => {
+          releaseBackground = resolve;
+        });
+        order.push("background:end");
+      })
+    );
+    await backgroundStartedPromise;
+
+    const queuedBackground = runWithBackgroundPriority(() =>
+      __testing.withSheetOperation(async () => {
+        order.push("background:queued");
+      })
+    );
+    const interactive = runWithInteractivePriority(() =>
+      __testing.withSheetOperation(async () => {
+        order.push("interactive");
+      })
+    );
+
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(getWorkPriorityStatus().backgroundSheetProgressRequired, true);
+    releaseBackground();
+    await Promise.all([firstBackground, queuedBackground, interactive]);
+
+    assert.deepEqual(order, [
+      "background:start",
+      "background:end",
+      "interactive",
+      "background:queued"
+    ]);
+    assert.equal(getWorkPriorityStatus().backgroundSheetProgressRequired, false);
+  } finally {
+    priorityTesting.reset();
+  }
+});
+
+test("daily attendance idempotency is scoped to one Telegram prompt", () => {
+  const first = __testing.buildDailyAttendanceIdempotencyKey(
+    "chat-1",
+    "prompt-1",
+    "2026-03-24",
+    "PRESENT"
+  );
+  const replay = __testing.buildDailyAttendanceIdempotencyKey(
+    "chat-1",
+    "prompt-1",
+    "2026-03-24",
+    "PRESENT"
+  );
+  const laterPrompt = __testing.buildDailyAttendanceIdempotencyKey(
+    "chat-1",
+    "prompt-2",
+    "2026-03-24",
+    "PRESENT"
+  );
+
+  assert.equal(first, replay);
+  assert.notEqual(first, laterPrompt);
+});
+
+test("attendance transfer conflict message explains the actionable sheet cells", () => {
+  const message = __testing.formatAttendanceTransferBlockedMessage(
+    [
+      {
+        title: "Jul 26",
+        reason: "destination_has_attendance",
+        conflictingDates: ["14 Jul", "15 Jul"]
+      },
+      { title: "Aug 26", reason: "transfer_aborted_due_to_conflict" }
+    ],
+    "Nav OJT4"
+  );
+
+  assert.match(message, /No binding or attendance was changed/);
+  assert.match(message, /Jul 26: Nav OJT4 already has different attendance on 14 Jul, 15 Jul/);
+  assert.match(message, /other months were left unchanged/);
+  assert.doesNotMatch(message, /destination_has_attendance|transfer_aborted_due_to_conflict/);
+});
+
+test("stale transfer destination message does not expose internal reason codes", () => {
+  const message = __testing.formatAppointmentTransferFailure(
+    { ok: false, reason: "to_already_bound" },
+    "Nav OJT4"
+  );
+
+  assert.match(message, /Transfer menu expired/);
+  assert.match(message, /Nav OJT4 is already bound/);
+  assert.doesNotMatch(message, /to_already_bound/);
+});
 
 function createCtx(text = "/command") {
   const replies = [];
@@ -190,6 +302,44 @@ test("daily attendance callbacks are bound to date and status content", () => {
   assert.notEqual(callbacks[0].split(":").at(-1), callbacks[1].split(":").at(-1));
 });
 
+test("daily attendance prompt ids distinguish new prompts and stay within Telegram limits", () => {
+  const config = {
+    attendanceOptions: ["PRESENT", "MC"],
+    timezone: "Asia/Singapore"
+  };
+  const menu = __testing.buildDatedAttendanceMenu(
+    config,
+    new Date("2026-07-30T04:00:00.000Z"),
+    0,
+    "home:pick:attendance",
+    "home:attendance:page",
+    "home:main",
+    [],
+    { promptId: "prompt01" }
+  );
+  const callbacks = menu.reply_markup.inline_keyboard
+    .flat()
+    .map((button) => button.callback_data)
+    .filter((value) => value?.startsWith("home:pick:attendance"));
+
+  assert.match(callbacks[0], /^home:pick:attendance:prompt01:2026-07-30:0:[A-Za-z0-9_-]{8}$/);
+  assert.ok(callbacks.every((value) => Buffer.byteLength(value, "utf8") <= 64));
+});
+
+test("stale interactions leave a visible explanation even after callback acknowledgement", async () => {
+  const calls = [];
+  const ctx = {
+    answerCbQuery: async () => { throw new Error("already answered"); },
+    editMessageText: async (message) => calls.push(["edit", message]),
+    editMessageReplyMarkup: async () => calls.push(["markup"]),
+    reply: async (message) => calls.push(["reply", message])
+  };
+
+  await __testing.rejectExpiredInteraction(ctx, "Expired. Nothing was changed.");
+
+  assert.deepEqual(calls, [["edit", "Expired. Nothing was changed."]]);
+});
+
 test("completed attendance removes old prompts and retires undeletable buttons", async () => {
   const deleted = [];
   const retired = [];
@@ -284,6 +434,30 @@ test("triggerBackgroundSheetRefresh skips duplicate refreshes while a cycle is r
 
   assert.equal(result, false);
   assert.deepEqual(runCycleCalls, []);
+});
+
+test("attendance queue threshold requests an explicit background flush", async () => {
+  const calls = [];
+  const cache = {
+    syncManager: {
+      runCycle: async (options) => { calls.push(options); }
+    }
+  };
+
+  const belowThreshold = await __testing.triggerAttendanceQueueThresholdFlush(cache, {
+    listPendingAttendanceEventsFn: async () => Array.from({ length: 24 }, () => ({}))
+  });
+  const atThreshold = await __testing.triggerAttendanceQueueThresholdFlush(cache, {
+    listPendingAttendanceEventsFn: async () => Array.from({ length: 25 }, () => ({}))
+  });
+
+  assert.equal(belowThreshold, false);
+  assert.equal(atThreshold, true);
+  assert.deepEqual(calls, [{
+    force: true,
+    flushQueue: true,
+    reason: "queue-threshold"
+  }]);
 });
 
 test("syncroster admin action refreshes sheets and reports current and next month", async () => {
@@ -835,6 +1009,7 @@ test("first scheduled reminder refreshes Sheets without delaying prompts", async
   const runCycleCalls = [];
   const prompts = [];
   let releaseReminderSync;
+  let reminderRefreshSawBroadcast = false;
   const reminderSync = new Promise((resolve) => {
     releaseReminderSync = resolve;
   });
@@ -853,6 +1028,7 @@ test("first scheduled reminder refreshes Sheets without delaying prompts", async
           runCycleCalls.push(options);
 
           if (options.reason === "reminder") {
+            reminderRefreshSawBroadcast = shouldDeferSnapshotRefresh();
             await reminderSync;
           }
         },
@@ -893,6 +1069,7 @@ test("first scheduled reminder refreshes Sheets without delaying prompts", async
     { force: true, reason: "reminder" }
   ]);
   assert.equal(reminderResult, "sent", "first reminder should not wait for Sheets refresh");
+  assert.equal(reminderRefreshSawBroadcast, true);
   assert.deepEqual(prompts, ["chat-1"]);
   releaseReminderSync();
   await new Promise((resolve) => setImmediate(resolve));
@@ -950,6 +1127,7 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
   const schedules = [];
   const prompts = [];
   let releaseReminderSync;
+  let reminderRefreshWasEssential = false;
   const reminderSync = new Promise((resolve) => {
     releaseReminderSync = resolve;
   });
@@ -983,6 +1161,7 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
       syncManager: {
         runCycle: async (options) => {
           if (options.reason === "reminder") {
+            reminderRefreshWasEssential = options.essentialSnapshotRefresh === true;
             await reminderSync;
           }
         },
@@ -1033,6 +1212,7 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
   }
 
   assert.deepEqual(prompts, ["chat-2"]);
+  assert.equal(reminderRefreshWasEssential, true);
 });
 
 test("queue status shows empty message when nothing is outstanding", async () => {

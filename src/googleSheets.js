@@ -1,10 +1,19 @@
+import { performance } from "node:perf_hooks";
 import { getDataFile } from "./dataDir.js";
+import {
+  isNonessentialSnapshotRefresh,
+  shouldDeferSnapshotRefresh
+} from "./broadcastActivity.js";
 import {
   readJsonFile as readJsonFileFromStore,
   writeJsonFile as writeJsonFileToStore
 } from "./fileStore.js";
 import { getSingaporePublicHolidaySet } from "./holidays.js";
 import { ipv4HttpsAgent } from "./network.js";
+import {
+  getCurrentWorkPriority,
+  getWorkPriorityStatus
+} from "./workPriority.js";
 
 const SHEET_CACHE_FILE = () => getDataFile("sheet-cache.json");
 // Cached copy of conditional format rule definitions fetched from ONBOARDING's C1 area.
@@ -44,10 +53,30 @@ const GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS = 5000;
 // ~60 req/min, staying safely within that limit. Values below ~1000 ms risk
 // silently exceeding the quota and triggering throttling that manifests as
 // 15-second hangs rather than explicit 429 errors.
-const GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS = 1000;
+function boundedIntegerEnv(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value)
+    ? Math.min(Math.max(value, min), max)
+    : fallback;
+}
+
+const GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS = boundedIntegerEnv(
+  "GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS",
+  1000,
+  1000,
+  60_000
+);
 // When ≥3 consecutive timeouts are detected, slow the inter-request gap further
 // to give the API time to recover before the next request is queued.
-const GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS = 3000;
+const GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS = Math.max(
+  GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS,
+  boundedIntegerEnv(
+    "GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS",
+    3000,
+    1000,
+    120_000
+  )
+);
 // Number of consecutive timeouts that triggers congestion mode.
 const GOOGLE_SHEETS_CONGESTION_THRESHOLD = 3;
 // Dark background applied to pre-join-date cells for appointments inserted mid-month.
@@ -65,25 +94,157 @@ let activeGoogleSheetsRequests = 0;
 // the inter-request delay is increased to GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS.
 let consecutiveTimeouts = 0;
 
-// Semaphore: serialise all outgoing Sheets API calls so only one is in-flight
-// at a time. Google Sheets throttles concurrent requests from the same service
-// account token, causing cascading timeouts when two requests run together.
-let sheetsSemaphorePromise = Promise.resolve();
+// A snapshot refresh must relinquish the outer logical Sheets operation when a
+// broadcast starts. Otherwise it can keep the priority semaphore unavailable
+// for an interactive command while it waits for the broadcast cooldown.
+export class SnapshotRefreshDeferredError extends Error {
+  constructor() {
+    super("Nonessential snapshot refresh deferred while a broadcast is active.");
+    this.name = "SnapshotRefreshDeferredError";
+  }
+}
+
+export function isSnapshotRefreshDeferredError(error) {
+  return error instanceof SnapshotRefreshDeferredError;
+}
+
+// Priority semaphore: one Sheets request remains in flight at a time, but
+// Telegram-triggered requests jump ahead of queued maintenance requests. A
+// request already accepted by Google is allowed to finish; background work
+// then pauses at this boundary until interactive work is idle.
+const interactiveSheetsQueue = [];
+const backgroundSheetsQueue = [];
+let sheetsSchedulerRunning = false;
+let nextSheetsRequestAt = 0;
+
+function sheetsDelay() {
+  return consecutiveTimeouts >= GOOGLE_SHEETS_CONGESTION_THRESHOLD
+    ? GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS
+    : GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS;
+}
+
+async function waitForBackgroundSheetTurn() {
+  while (true) {
+    if (interactiveSheetsQueue.length > 0) {
+      return false;
+    }
+
+    const status = getWorkPriorityStatus();
+    const now = performance.now();
+    if (
+      status.backgroundSheetProgressRequired ||
+      (
+        status.activeInteractiveWork === 0 &&
+        now >= status.interactiveQuietUntil
+      )
+    ) {
+      return true;
+    }
+
+    await new Promise((resolve) => setTimeout(
+      resolve,
+      Math.min(
+        25,
+        status.activeInteractiveWork > 0
+          ? 25
+          : Math.max(1, status.interactiveQuietUntil - now)
+      )
+    ));
+  }
+}
+
+async function drainSheetsQueue() {
+  if (sheetsSchedulerRunning) {
+    return;
+  }
+
+  sheetsSchedulerRunning = true;
+  try {
+    while (interactiveSheetsQueue.length > 0 || backgroundSheetsQueue.length > 0) {
+      let task = interactiveSheetsQueue.shift();
+
+      if (!task) {
+        if (!(await waitForBackgroundSheetTurn())) {
+          continue;
+        }
+        task = backgroundSheetsQueue.shift();
+      }
+
+      if (task.priority === "background") {
+        while (performance.now() < nextSheetsRequestAt) {
+          const status = getWorkPriorityStatus();
+          if (
+            interactiveSheetsQueue.length > 0 ||
+            (
+              status.activeInteractiveWork > 0 &&
+              !status.backgroundSheetProgressRequired
+            )
+          ) {
+            backgroundSheetsQueue.unshift(task);
+            task = null;
+            break;
+          }
+          await new Promise((resolve) => setTimeout(
+            resolve,
+            Math.max(1, Math.min(25, nextSheetsRequestAt - performance.now()))
+          ));
+        }
+        if (!task) {
+          continue;
+        }
+
+        if (!(await waitForBackgroundSheetTurn())) {
+          backgroundSheetsQueue.unshift(task);
+          continue;
+        }
+
+        if (task.nonessentialSnapshotRefresh && shouldDeferSnapshotRefresh()) {
+          task.reject(new SnapshotRefreshDeferredError());
+          continue;
+        }
+      } else {
+        const delayMs = Math.max(0, nextSheetsRequestAt - performance.now());
+        if (delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
+
+      try {
+        task.resolve(await task.fn());
+      } catch (error) {
+        task.reject(error);
+      } finally {
+        nextSheetsRequestAt = performance.now() + sheetsDelay();
+      }
+    }
+  } finally {
+    sheetsSchedulerRunning = false;
+    if (interactiveSheetsQueue.length > 0 || backgroundSheetsQueue.length > 0) {
+      void drainSheetsQueue();
+    }
+  }
+}
 
 function acquireSheetsSemaphore(fn) {
-  const next = sheetsSemaphorePromise.then(() => fn());
-  // Allow the queue to drain even if fn() rejects, then wait the inter-request
-  // delay so rapid bursts during startup don't trigger Google's token throttle.
-  // Use a longer delay when consecutive timeouts indicate API congestion.
-  sheetsSemaphorePromise = next
-    .catch(() => {})
-    .then(() => {
-      const delay = consecutiveTimeouts >= GOOGLE_SHEETS_CONGESTION_THRESHOLD
-        ? GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS
-        : GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS;
-      return new Promise((resolve) => setTimeout(resolve, delay));
-    });
-  return next;
+  const priority = getCurrentWorkPriority() === "interactive"
+    ? "interactive"
+    : "background";
+
+  return new Promise((resolve, reject) => {
+    const task = {
+      fn,
+      priority,
+      nonessentialSnapshotRefresh: isNonessentialSnapshotRefresh(),
+      resolve,
+      reject
+    };
+    if (priority === "interactive") {
+      interactiveSheetsQueue.push(task);
+    } else {
+      backgroundSheetsQueue.push(task);
+    }
+    void drainSheetsQueue();
+  });
 }
 
 function logSheetsSuccess(message, details = null) {
@@ -4211,8 +4372,8 @@ export async function transferAttendanceRows(
     const dateColIndices = [...dateColumnMap.values()].sort((a, b) => a - b);
 
     // Find the 1-based row numbers for fromAppointment and toAppointment.
-    let fromRowNumber = null;
-    let toRowNumber = null;
+    const fromRowNumbers = [];
+    const toRowNumbers = [];
 
     for (let i = 1; i < values.length; i += 1) {
       const raw = String(values[i]?.[0] ?? "").trim();
@@ -4220,14 +4381,16 @@ export async function transferAttendanceRows(
       if (isStopMarker(raw, config.rosterStopMarkers)) break;
 
       const normed = normalizeAppointmentIdentity(raw);
-      if (fromRowNumber === null && normed === normalizeAppointmentIdentity(fromAppointment)) {
-        fromRowNumber = i + 1; // sheet row number (1 = header)
+      if (normed === normalizeAppointmentIdentity(fromAppointment)) {
+        fromRowNumbers.push(i + 1); // sheet row number (1 = header)
       }
-      if (toRowNumber === null && normed === normalizeAppointmentIdentity(toAppointment)) {
-        toRowNumber = i + 1;
+      if (normed === normalizeAppointmentIdentity(toAppointment)) {
+        toRowNumbers.push(i + 1);
       }
-      if (fromRowNumber !== null && toRowNumber !== null) break;
     }
+
+    const fromRowNumber = fromRowNumbers[0] ?? null;
+    const toRowNumber = toRowNumbers[0] ?? null;
 
     if (fromRowNumber === null) {
       transferBlocked = true;
@@ -4237,6 +4400,17 @@ export async function transferAttendanceRows(
     if (toRowNumber === null) {
       transferBlocked = true;
       results.push({ title, skipped: true, reason: "to_row_not_found" });
+      continue;
+    }
+    if (fromRowNumbers.length !== 1 || toRowNumbers.length !== 1) {
+      transferBlocked = true;
+      results.push({
+        title,
+        skipped: true,
+        reason: "duplicate_appointment_row",
+        fromRowNumbers,
+        toRowNumbers
+      });
       continue;
     }
 
@@ -4259,7 +4433,10 @@ export async function transferAttendanceRows(
         skipped: true,
         conflict: true,
         reason: "destination_has_attendance",
-        conflictingColumns
+        conflictingColumns,
+        conflictingDates: conflictingColumns
+          .map((columnIndex) => String(header[columnIndex] ?? "").trim())
+          .filter(Boolean)
       });
       continue;
     }
@@ -4298,37 +4475,40 @@ export async function transferAttendanceRows(
     ];
   }
 
-  for (const { title, copyData, clearData } of plans) {
-    if (copyData.length > 0 && phase !== "clear") {
-      // Copy first. A timeout or crash can leave duplicate data, but can never
-      // erase the only copy. Re-running is idempotent when both rows match.
-      await runGoogleSheetsRequest(
-        `spreadsheets.values.batchUpdate:${title}:copyTransferAttendance`,
-        (signal) =>
-          sheets.spreadsheets.values.batchUpdate(
-            {
-              spreadsheetId: config.spreadsheetId,
-              requestBody: { valueInputOption: "RAW", data: copyData }
-            },
-            { signal }
-          )
-      );
-    }
+  // One batch per phase makes the preflight result apply to the whole transfer
+  // rather than allowing a later sheet to fail after earlier sheets changed.
+  const allCopyData = plans.flatMap((plan) => plan.copyData);
+  const allClearData = plans.flatMap((plan) => plan.clearData);
 
-    if (clearData.length > 0 && phase !== "copy") {
-      await runGoogleSheetsRequest(
-        `spreadsheets.values.batchUpdate:${title}:clearTransferredAttendance`,
-        (signal) =>
-          sheets.spreadsheets.values.batchUpdate(
-            {
-              spreadsheetId: config.spreadsheetId,
-              requestBody: { valueInputOption: "RAW", data: clearData }
-            },
-            { signal }
-          )
-      );
-    }
+  if (allCopyData.length > 0 && phase !== "clear") {
+    await runGoogleSheetsRequest(
+      "spreadsheets.values.batchUpdate:copyTransferAttendance",
+      (signal) =>
+        sheets.spreadsheets.values.batchUpdate(
+          {
+            spreadsheetId: config.spreadsheetId,
+            requestBody: { valueInputOption: "RAW", data: allCopyData }
+          },
+          { signal }
+        )
+    );
+  }
 
+  if (allClearData.length > 0 && phase !== "copy") {
+    await runGoogleSheetsRequest(
+      "spreadsheets.values.batchUpdate:clearTransferredAttendance",
+      (signal) =>
+        sheets.spreadsheets.values.batchUpdate(
+          {
+            spreadsheetId: config.spreadsheetId,
+            requestBody: { valueInputOption: "RAW", data: allClearData }
+          },
+          { signal }
+        )
+    );
+  }
+
+  for (const { title } of plans) {
     logSheetsSuccess(
       `[${title}] Attendance transfer ${phase}: ${fromAppointment} → ${toAppointment}.`
     );
@@ -4967,7 +5147,7 @@ export async function clearAllSheetProtections(sheets, spreadsheetId) {
     sheetsMeta = processEntry.data.sheets;
   } else {
     logSheetsSuccess("clearAllSheetProtections: cache empty — fetching live metadata.");
-    const result = await runGoogleSheetsRequestQueued(
+    const result = await runGoogleSheetsRequest(
       "spreadsheets.get:clearProtections",
       (signal) => sheets.spreadsheets.get({
         spreadsheetId,
@@ -4997,7 +5177,7 @@ export async function clearAllSheetProtections(sheets, spreadsheetId) {
     deleteProtectedRange: { protectedRangeId: p.protectedRangeId }
   }));
 
-  await runGoogleSheetsRequestQueued(
+  await runGoogleSheetsRequest(
     `spreadsheets.batchUpdate:clearAllProtections(${requests.length})`,
     (signal) => sheets.spreadsheets.batchUpdate({
       spreadsheetId,
@@ -5038,7 +5218,7 @@ export async function runStartupSheetCleanup(sheets, spreadsheetId) {
     console.log("[Startup] [Cleanup] Using cached sheet metadata.");
   } else {
     console.log("[Startup] [Cleanup] Cache empty — fetching sheet metadata.");
-    const response = await runGoogleSheetsRequestQueued(
+    const response = await runGoogleSheetsRequest(
       "spreadsheets.get:startupCleanup",
       (signal) => sheets.spreadsheets.get({
         spreadsheetId,
@@ -5064,7 +5244,7 @@ export async function runStartupSheetCleanup(sheets, spreadsheetId) {
     return `'${escapedTitle}'!A1:A${rowCount}`;
   });
 
-  const batchResult = await runGoogleSheetsRequestQueued(
+  const batchResult = await runGoogleSheetsRequest(
     "spreadsheets.values.batchGet:startupCleanup",
     (signal) => sheets.spreadsheets.values.batchGet({ spreadsheetId, ranges }, { signal })
   );
@@ -5103,7 +5283,7 @@ export async function runStartupSheetCleanup(sheets, spreadsheetId) {
   if (trimRequests.length === 0) {
     console.log("[Startup] [Cleanup] All sheets already compact — no rows to trim.");
   } else {
-    await runGoogleSheetsRequestQueued(
+    await runGoogleSheetsRequest(
       `spreadsheets.batchUpdate:startupCleanup:trimRows(${trimRequests.length})`,
       (signal) => sheets.spreadsheets.batchUpdate({
         spreadsheetId,

@@ -35,3 +35,65 @@ test("sync manager serializes overlapping cycles and tracks timestamps", async (
   assert.ok(status.lastMonthRefreshAt > 0);
   assert.ok(status.lastFiveMinuteReconcileAt > 0);
 });
+
+test("queue flushes are batched by interval", async () => {
+  let now = 1000;
+  let flushCount = 0;
+  const syncManager = createSyncManager({
+    flushQueue: async () => { flushCount += 1; },
+    flushQueueIntervalMs: 120_000,
+    refreshAdminCache: async () => {},
+    nowFn: () => now
+  });
+
+  await syncManager.runCycle();
+  now += 60_000;
+  await syncManager.runCycle();
+  assert.equal(flushCount, 1);
+
+  now += 60_000;
+  await syncManager.runCycle();
+  assert.equal(flushCount, 2);
+});
+
+test("queue depth threshold flushes before the interval", async () => {
+  let now = 1000;
+  let thresholdReached = false;
+  let flushCount = 0;
+  const syncManager = createSyncManager({
+    flushQueue: async () => { flushCount += 1; },
+    flushQueueIntervalMs: 120_000,
+    shouldFlushQueue: async () => thresholdReached,
+    refreshAdminCache: async () => {},
+    nowFn: () => now
+  });
+
+  await syncManager.runCycle();
+  now += 1000;
+  thresholdReached = true;
+  await syncManager.runCycle();
+
+  assert.equal(flushCount, 2);
+});
+
+test("failed flush attempts remain interval-limited", async () => {
+  let now = 1000;
+  let flushCount = 0;
+  const syncManager = createSyncManager({
+    flushQueue: async () => {
+      flushCount += 1;
+      throw new Error("Sheets unavailable");
+    },
+    flushQueueIntervalMs: 120_000,
+    refreshAdminCache: async () => {},
+    nowFn: () => now
+  });
+
+  await assert.rejects(syncManager.runCycle(), /Sheets unavailable/);
+  now += 1000;
+  await syncManager.runCycle();
+
+  assert.equal(flushCount, 1);
+  assert.equal(syncManager.getStatus().lastQueueFlushAttemptAt, 1000);
+  assert.equal(syncManager.getStatus().lastQueueFlushAt, 0);
+});

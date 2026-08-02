@@ -5,6 +5,29 @@ import { appendJsonLine, appendJsonLines, readJsonLines, runSerialized, writeJso
 const QUEUE_MUTEX_KEY = "attendance-queue";
 const QUEUE_FLUSH_MUTEX_KEY = "attendance-queue-flush";
 const ATTENDANCE_QUEUE_FILE = () => getDataFile("attendance-queue.ndjson");
+
+function boundedIntegerEnv(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value)
+    ? Math.min(Math.max(value, min), max)
+    : fallback;
+}
+
+// Batch routine attendance writes to reduce Sheets contention. The existing
+// post-submission sync trigger still starts an earlier flush when the eligible
+// queue reaches the threshold.
+export const ATTENDANCE_QUEUE_FLUSH_INTERVAL_MS = boundedIntegerEnv(
+  "ATTENDANCE_QUEUE_FLUSH_INTERVAL_MS",
+  120_000,
+  10_000,
+  15 * 60 * 1000
+);
+export const ATTENDANCE_QUEUE_FLUSH_THRESHOLD = boundedIntegerEnv(
+  "ATTENDANCE_QUEUE_FLUSH_THRESHOLD",
+  25,
+  1,
+  1000
+);
 // After this many consecutive flush failures an event is marked failed_permanent
 // and will no longer be retried. The retry delay formula caps at 15 minutes
 // (exponent clamped at 10, giving 2^10 ≈ 17 min → capped to 15 min). After the
@@ -26,6 +49,7 @@ function toEventDateString(date, timezone) {
 
 function createQueueState(records) {
   const events = new Map();
+  const eventIdByIdempotencyKey = new Map();
 
   for (const record of records) {
     if (record.kind === "attendance_enqueued") {
@@ -39,6 +63,9 @@ function createQueueState(records) {
         retryCount: 0,
         nextRetryAt: null
       });
+      if (record.event.idempotencyKey) {
+        eventIdByIdempotencyKey.set(record.event.idempotencyKey, record.event.id);
+      }
     }
 
     if (record.kind === "attendance_flushed") {
@@ -116,6 +143,7 @@ function createQueueState(records) {
 
   return {
     events,
+    eventIdByIdempotencyKey,
     records
   };
 }
@@ -156,9 +184,25 @@ export async function listPendingAttendanceEvents() {
   );
 }
 
+// Retry backoff controls remote-write scheduling, not what Telegram should
+// display. Keep every unresolved retryable response visible locally until it
+// reaches Sheets, so reminders and summaries do not regress during an outage.
+export async function listUnresolvedAttendanceEvents() {
+  const state = await loadAttendanceQueueState();
+  return [...state.events.values()].filter((event) =>
+    event.queueStatus === "pending" || event.queueStatus === "failed_retryable"
+  );
+}
+
 export async function enqueueAttendanceEvent(config, event) {
   return runSerialized(QUEUE_MUTEX_KEY, async () => {
     const state = await loadAttendanceQueueState();
+    const existingId = event.idempotencyKey
+      ? state.eventIdByIdempotencyKey.get(event.idempotencyKey)
+      : null;
+    if (existingId) {
+      return state.events.get(existingId);
+    }
     const nextEvent = {
       id: randomUUID(),
       type: "attendance_status",
@@ -171,7 +215,8 @@ export async function enqueueAttendanceEvent(config, event) {
       expectedPreviousValue: event.expectedPreviousValue ?? "",
       expectedAppointment: event.expectedAppointment ?? event.appointment,
       expectedDateLabel: event.expectedDateLabel ?? null,
-      baseCacheTimestamp: event.baseCacheTimestamp ?? null
+      baseCacheTimestamp: event.baseCacheTimestamp ?? null,
+      idempotencyKey: event.idempotencyKey ?? null
     };
 
     await appendJsonLine(ATTENDANCE_QUEUE_FILE(), {
@@ -192,6 +237,9 @@ export async function enqueueAttendanceEvent(config, event) {
       retryCount: 0,
       nextRetryAt: null
     });
+    if (nextEvent.idempotencyKey) {
+      state.eventIdByIdempotencyKey.set(nextEvent.idempotencyKey, nextEvent.id);
+    }
 
     return nextEvent;
   });
@@ -212,13 +260,39 @@ export async function enqueueAttendanceEvents(config, events) {
       expectedPreviousValue: event.expectedPreviousValue ?? "",
       expectedAppointment: event.expectedAppointment ?? event.appointment,
       expectedDateLabel: event.expectedDateLabel ?? null,
-      baseCacheTimestamp: event.baseCacheTimestamp ?? null
+      baseCacheTimestamp: event.baseCacheTimestamp ?? null,
+      idempotencyKey: event.idempotencyKey ?? null
     }));
 
-    const enqueueRecords = nextEvents.map((event) => ({ kind: "attendance_enqueued", event }));
-    await appendJsonLines(ATTENDANCE_QUEUE_FILE(), enqueueRecords);
-
+    const newEvents = [];
+    const returnedEvents = [];
+    const newEventByIdempotencyKey = new Map();
     for (const event of nextEvents) {
+      const existingId = event.idempotencyKey
+        ? state.eventIdByIdempotencyKey.get(event.idempotencyKey)
+        : null;
+      if (existingId) {
+        returnedEvents.push(state.events.get(existingId));
+      } else if (
+        event.idempotencyKey &&
+        newEventByIdempotencyKey.has(event.idempotencyKey)
+      ) {
+        returnedEvents.push(newEventByIdempotencyKey.get(event.idempotencyKey));
+      } else {
+        newEvents.push(event);
+        returnedEvents.push(event);
+        if (event.idempotencyKey) {
+          newEventByIdempotencyKey.set(event.idempotencyKey, event);
+        }
+      }
+    }
+
+    const enqueueRecords = newEvents.map((event) => ({ kind: "attendance_enqueued", event }));
+    if (enqueueRecords.length > 0) {
+      await appendJsonLines(ATTENDANCE_QUEUE_FILE(), enqueueRecords);
+    }
+
+    for (const event of newEvents) {
       state.records.push({ kind: "attendance_enqueued", event });
       state.events.set(event.id, {
         ...event,
@@ -230,9 +304,12 @@ export async function enqueueAttendanceEvents(config, events) {
         retryCount: 0,
         nextRetryAt: null
       });
+      if (event.idempotencyKey) {
+        state.eventIdByIdempotencyKey.set(event.idempotencyKey, event.id);
+      }
     }
 
-    return nextEvents;
+    return returnedEvents;
   });
 }
 

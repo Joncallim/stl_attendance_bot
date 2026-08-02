@@ -149,9 +149,10 @@ let registryCacheAt = 0;
 let registryCachedPath = null;
 const REGISTRY_CACHE_TTL_MS = 30_000;
 
-async function readAppointmentRegistry() {
+async function readAppointmentRegistry(options = {}) {
   const filePath = getAppointmentRegistryFile();
   if (
+    !options.fresh &&
     registryCache !== null &&
     filePath === registryCachedPath &&
     Date.now() - registryCacheAt < REGISTRY_CACHE_TTL_MS
@@ -209,6 +210,27 @@ function findAppointmentEntry(registry, appointment) {
     appointmentNameIndexCache.set(registry.appointments, index);
   }
   return index.get(normalizeAppointmentName(appointment)) ?? null;
+}
+
+export function getAppointmentBindingIdentity(entry) {
+  if (!entry?.boundChatId) {
+    return null;
+  }
+  return `${entry.appointment}\u0000${String(entry.boundChatId)}\u0000${entry.boundAt ?? ""}`;
+}
+
+export function getAppointmentStateIdentity(entry) {
+  if (!entry) {
+    return null;
+  }
+  return [
+    entry.appointment,
+    entry.active ? "active" : "inactive",
+    entry.boundChatId ?? "",
+    entry.boundAt ?? "",
+    entry.secretCode ?? "",
+    entry.removedByBotAt ?? ""
+  ].join("\u0000");
 }
 
 function normalizeAppointmentInput(value) {
@@ -270,6 +292,11 @@ async function commitRegistryAndUsers(registry, users, operation) {
 function withStorageMutation(operation) {
   return runSerialized(STORAGE_MUTEX_KEY, async () => {
     await recoverStorageTransaction();
+    // Mutation preconditions must be evaluated against disk, never against the
+    // 30-second process cache used for read-only menus.
+    usersCache = null;
+    usersByIdIndex = null;
+    registryCache = null;
     return operation();
   });
 }
@@ -792,13 +819,20 @@ export async function addAppointmentToRegistry(appointment) {
   });
 }
 
-export async function removeAppointmentFromRegistry(appointment) {
+export async function removeAppointmentFromRegistry(appointment, options = {}) {
   return withStorageMutation(async () => {
     const registry = await readAppointmentRegistry();
     const target = findAppointmentEntry(registry, appointment);
 
     if (!target || !target.active) {
       return { ok: false, reason: "appointment_not_found" };
+    }
+
+    if (
+      options.expectedStateIdentity &&
+      options.expectedStateIdentity !== getAppointmentStateIdentity(target)
+    ) {
+      return { ok: false, reason: "appointment_changed" };
     }
 
     const removedAt = new Date().toISOString();
@@ -936,7 +970,7 @@ export async function listAdminAppointments(defaultAdminAppointments) {
   return [...effectiveAdmins.values()];
 }
 
-export async function addAdminAppointment(appointment) {
+export async function addAdminAppointment(appointment, options = {}) {
   return withStorageMutation(async () => {
     const registry = await readAppointmentRegistry();
     const target = findAppointmentEntry(registry, appointment);
@@ -947,6 +981,13 @@ export async function addAdminAppointment(appointment) {
 
     if (!target.boundChatId) {
       return { ok: false, reason: "appointment_not_bound" };
+    }
+
+    if (
+      options.expectedBindingIdentity &&
+      options.expectedBindingIdentity !== getAppointmentBindingIdentity(target)
+    ) {
+      return { ok: false, reason: "binding_changed" };
     }
 
     const alreadyPresent = (registry.adminAppointments ?? []).some(
@@ -968,7 +1009,7 @@ export async function addAdminAppointment(appointment) {
   });
 }
 
-export async function removeAdminAppointment(appointment, defaultAdminAppointments) {
+export async function removeAdminAppointment(appointment, defaultAdminAppointments, options = {}) {
   return withStorageMutation(async () => {
     const registry = await readAppointmentRegistry();
     const target = findAppointmentEntry(registry, appointment);
@@ -980,6 +1021,13 @@ export async function removeAdminAppointment(appointment, defaultAdminAppointmen
       )
     ) {
       return { ok: false, reason: "default_admin" };
+    }
+
+    if (
+      options.expectedBindingIdentity &&
+      options.expectedBindingIdentity !== getAppointmentBindingIdentity(target)
+    ) {
+      return { ok: false, reason: "binding_changed" };
     }
 
     const before = registry.adminAppointments ?? [];
@@ -1000,8 +1048,7 @@ export async function removeAdminAppointment(appointment, defaultAdminAppointmen
   });
 }
 
-export async function deregisterAppointmentBinding(appointment) {
-  return withStorageMutation(async () => {
+async function deregisterAppointmentBindingLocked(appointment, options = {}) {
     const registry = await readAppointmentRegistry();
     const target = findAppointmentEntry(registry, appointment);
 
@@ -1011,6 +1058,13 @@ export async function deregisterAppointmentBinding(appointment) {
 
     if (!target.boundChatId) {
       return { ok: false, reason: "not_bound", appointment: target.appointment };
+    }
+
+    if (
+      options.expectedBindingIdentity &&
+      options.expectedBindingIdentity !== getAppointmentBindingIdentity(target)
+    ) {
+      return { ok: false, reason: "binding_changed", appointment: target.appointment };
     }
 
     const existingCodes = new Set(
@@ -1057,7 +1111,10 @@ export async function deregisterAppointmentBinding(appointment) {
       previousChatId: target.boundChatId,
       secretCode: rotatedSecretCode
     };
-  });
+}
+
+export async function deregisterAppointmentBinding(appointment, options = {}) {
+  return withStorageMutation(() => deregisterAppointmentBindingLocked(appointment, options));
 }
 
 /**
@@ -1071,10 +1128,19 @@ export async function deregisterAppointmentBinding(appointment) {
  *   - The `to` registry entry inherits all binding fields from `from`.
  *   - The `from` registry entry is cleared and issued a fresh secret code.
  *
+ * `options.prepare` runs after both bindings have been validated but before the
+ * registry is changed. It runs while the storage mutation lock is held so a
+ * destination cannot be claimed while an external attendance copy is in
+ * progress. Returning `{ ok: false, reason }` aborts the transfer unchanged.
+ *
  * Returns `{ ok, fromAppointment, toAppointment, chatId, username, fullName }` on
  * success or `{ ok: false, reason }` on failure.
  */
-export async function transferAppointmentBinding(fromAppointment, toAppointment) {
+export async function transferAppointmentBinding(
+  fromAppointment,
+  toAppointment,
+  options = {}
+) {
   return withStorageMutation(async () => {
     const registry = await readAppointmentRegistry();
     const fromEntry = findAppointmentEntry(registry, fromAppointment);
@@ -1091,6 +1157,33 @@ export async function transferAppointmentBinding(fromAppointment, toAppointment)
     }
     if (toEntry.boundChatId) {
       return { ok: false, reason: "to_already_bound" };
+    }
+
+    const currentFromBindingIdentity = getAppointmentBindingIdentity(fromEntry);
+
+    if (
+      options.expectedFromBindingIdentity &&
+      options.expectedFromBindingIdentity !== currentFromBindingIdentity
+    ) {
+      return { ok: false, reason: "from_binding_changed" };
+    }
+
+    let preparation = null;
+
+    if (typeof options.prepare === "function") {
+      preparation = await options.prepare({
+        fromAppointment: fromEntry.appointment,
+        toAppointment: toEntry.appointment,
+        chatId: fromEntry.boundChatId
+      });
+
+      if (preparation?.ok === false) {
+        return {
+          ok: false,
+          reason: preparation.reason || "transfer_preparation_failed",
+          preparation
+        };
+      }
     }
 
     const existingCodes = new Set(
@@ -1154,28 +1247,49 @@ export async function transferAppointmentBinding(fromAppointment, toAppointment)
       toAppointment: toEntry.appointment,
       chatId: fromEntry.boundChatId,
       username: fromEntry.boundUsername,
-      fullName: fromEntry.boundFullName
+      fullName: fromEntry.boundFullName,
+      preparation
     };
   });
 }
 
-export async function deregisterRequestorByChatId(chatId) {
-  const users = await readUsers();
-  const user = users.find((entry) => entry.chatId === String(chatId));
+export async function deregisterRequestorByChatId(chatId, options = {}) {
+  return withStorageMutation(async () => {
+    const registry = await readAppointmentRegistry();
+    const target = registry.appointments.find(
+      (entry) => entry.active && String(entry.boundChatId) === String(chatId)
+    );
 
-  if (!user?.appointment) {
-    return { ok: false, reason: "not_bound" };
-  }
+    if (!target) {
+      return { ok: false, reason: "not_bound" };
+    }
 
-  return deregisterAppointmentBinding(user.appointment);
+    if (
+      options.expectedBindingIdentity &&
+      options.expectedBindingIdentity !== getAppointmentBindingIdentity(target)
+    ) {
+      return { ok: false, reason: "binding_changed" };
+    }
+
+    return deregisterAppointmentBindingLocked(target.appointment, {
+      expectedBindingIdentity: getAppointmentBindingIdentity(target)
+    });
+  });
 }
 
-export async function getOnboardingInvite(appointment) {
-  const registry = await readAppointmentRegistry();
+export async function getOnboardingInvite(appointment, options = {}) {
+  const registry = await readAppointmentRegistry({ fresh: Boolean(options.expectedStateIdentity) });
   const target = findAppointmentEntry(registry, appointment);
 
   if (!target || !target.active) {
     return { ok: false, reason: "appointment_not_found" };
+  }
+
+  if (
+    options.expectedStateIdentity &&
+    options.expectedStateIdentity !== getAppointmentStateIdentity(target)
+  ) {
+    return { ok: false, reason: "appointment_changed" };
   }
 
   return {
