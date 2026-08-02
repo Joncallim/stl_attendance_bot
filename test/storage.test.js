@@ -9,16 +9,23 @@ import {
   bindAppointmentCode,
   computeRosterChecksum,
   deregisterAppointmentBinding,
+  getAppointmentBindingIdentity,
   getAppointmentRegistry,
+  getAppointmentStateIdentity,
   getOnboardingInvite,
   getUserByChatId,
   listAdminAppointments,
+  removeAdminAppointment,
   removeAppointmentFromRegistry,
   syncAppointmentRegistry,
   transferAppointmentBinding,
   updateUserByChatId,
   upsertUser
 } from "../src/storage.js";
+import {
+  beginAttendanceTransferJournal,
+  getAttendanceTransferJournal
+} from "../src/attendanceTransferJournal.js";
 
 async function withTempDataDir(run) {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "attendance-storage-"));
@@ -87,6 +94,61 @@ test("binding is serialized and deregistration clears binding and custom admin a
 
     const admins = await listAdminAppointments([]);
     assert.deepEqual(admins, []);
+  });
+});
+
+test("destructive registry mutations reject stale binding and state identities", async () => {
+  await withTempDataDir(async () => {
+    await syncAppointmentRegistry(["ALPHA", "BRAVO"]);
+    const invite = await getOnboardingInvite("ALPHA");
+    await bindAppointmentCode(invite.secretCode, {
+      chatId: "chat-alpha",
+      userId: "user-alpha",
+      username: "alpha",
+      fullName: "Alpha User"
+    });
+
+    let registry = await getAppointmentRegistry();
+    const alpha = registry.appointments.find((entry) => entry.appointment === "ALPHA");
+    const alphaBinding = getAppointmentBindingIdentity(alpha);
+    const bravo = registry.appointments.find((entry) => entry.appointment === "BRAVO");
+    const bravoState = getAppointmentStateIdentity(bravo);
+
+    const staleDeregister = await deregisterAppointmentBinding("ALPHA", {
+      expectedBindingIdentity: `${alphaBinding}:stale`
+    });
+    assert.equal(staleDeregister.reason, "binding_changed");
+
+    const staleAdmin = await addAdminAppointment("ALPHA", {
+      expectedBindingIdentity: `${alphaBinding}:stale`
+    });
+    assert.equal(staleAdmin.reason, "binding_changed");
+
+    const adminGrant = await addAdminAppointment("ALPHA", {
+      expectedBindingIdentity: alphaBinding
+    });
+    assert.equal(adminGrant.ok, true);
+    const staleAdminRemoval = await removeAdminAppointment("ALPHA", [], {
+      expectedBindingIdentity: `${alphaBinding}:stale`
+    });
+    assert.equal(staleAdminRemoval.reason, "binding_changed");
+    assert.equal((await listAdminAppointments([])).length, 1);
+
+    const bravoInvite = await getOnboardingInvite("BRAVO");
+    await bindAppointmentCode(bravoInvite.secretCode, {
+      chatId: "chat-bravo",
+      userId: "user-bravo",
+      username: "bravo",
+      fullName: "Bravo User"
+    });
+    const staleRemoval = await removeAppointmentFromRegistry("BRAVO", {
+      expectedStateIdentity: bravoState
+    });
+    assert.equal(staleRemoval.reason, "appointment_changed");
+
+    registry = await getAppointmentRegistry();
+    assert.equal(registry.appointments.find((entry) => entry.appointment === "ALPHA").boundChatId, "chat-alpha");
+    assert.equal(registry.appointments.find((entry) => entry.appointment === "BRAVO").active, true);
   });
 });
 
@@ -470,10 +532,35 @@ test("transferAppointmentBinding rejects invalid combinations", async () => {
       onboardingCompletedAt: new Date().toISOString()
     });
 
-    // Cannot transfer to an already-bound slot.
-    const toBound = await transferAppointmentBinding("ALPHA", "BRAVO");
+    // Cannot transfer to an already-bound slot, and must reject it before
+    // running an external attendance preparation callback.
+    let preparationCalled = false;
+    const toBound = await transferAppointmentBinding("ALPHA", "BRAVO", {
+      prepare: async () => {
+        preparationCalled = true;
+        return { ok: true };
+      }
+    });
     assert.equal(toBound.ok, false);
     assert.equal(toBound.reason, "to_already_bound");
+    assert.equal(preparationCalled, false);
+
+    // A stale source button cannot transfer a different user's replacement
+    // binding from the same appointment slot.
+    const sourceChanged = await transferAppointmentBinding("ALPHA", "CHARLIE", {
+      expectedFromBindingIdentity: "ALPHA\u0000stale-chat-id",
+      prepare: async () => {
+        preparationCalled = true;
+        await beginAttendanceTransferJournal("ALPHA", "CHARLIE", {
+          expectedFromBindingIdentity: "ALPHA\u0000stale-chat-id"
+        });
+        return { ok: true };
+      }
+    });
+    assert.equal(sourceChanged.ok, false);
+    assert.equal(sourceChanged.reason, "from_binding_changed");
+    assert.equal(preparationCalled, false);
+    assert.equal(await getAttendanceTransferJournal(), null);
 
     // Cannot transfer from an unbound slot.
     const fromUnbound = await transferAppointmentBinding("CHARLIE", "ALPHA");
@@ -489,5 +576,62 @@ test("transferAppointmentBinding rejects invalid combinations", async () => {
     const toMissing = await transferAppointmentBinding("ALPHA", "ECHO");
     assert.equal(toMissing.ok, false);
     assert.equal(toMissing.reason, "to_not_found");
+  });
+});
+
+test("transferAppointmentBinding holds the binding lock during preparation", async () => {
+  await withTempDataDir(async () => {
+    await syncAppointmentRegistry(["ALPHA", "BRAVO"]);
+    const alphaInvite = await getOnboardingInvite("ALPHA");
+    const bravoInvite = await getOnboardingInvite("BRAVO");
+
+    await upsertUser({
+      chatId: "chat-transfer",
+      userId: "user-transfer",
+      username: "alpha",
+      fullName: "Transfer User",
+      updatedAt: new Date().toISOString()
+    });
+    await bindAppointmentCode(alphaInvite.secretCode, {
+      chatId: "chat-transfer",
+      userId: "user-transfer",
+      username: "alpha",
+      fullName: "Transfer User"
+    });
+
+    let preparationStarted;
+    const preparationReady = new Promise((resolve) => {
+      preparationStarted = resolve;
+    });
+    let finishPreparation;
+    const preparationGate = new Promise((resolve) => {
+      finishPreparation = resolve;
+    });
+
+    const transferPromise = transferAppointmentBinding("ALPHA", "BRAVO", {
+      prepare: async () => {
+        preparationStarted();
+        await preparationGate;
+        return { ok: true };
+      }
+    });
+
+    await preparationReady;
+    const competingBindPromise = bindAppointmentCode(bravoInvite.secretCode, {
+      chatId: "chat-competing",
+      userId: "user-competing",
+      username: "bravo",
+      fullName: "Competing User"
+    });
+    finishPreparation();
+
+    const [transfer, competingBind] = await Promise.all([
+      transferPromise,
+      competingBindPromise
+    ]);
+
+    assert.equal(transfer.ok, true);
+    assert.equal(competingBind.ok, false);
+    assert.equal(competingBind.reason, "code_already_claimed");
   });
 });

@@ -120,6 +120,34 @@ test("second forced call during a forced cycle does not queue a redundant follow
   assert.equal(flushCount, 1, "duplicate forced calls should not spawn extra cycles");
 });
 
+test("an explicit threshold flush queues one follow-up during a forced cycle", async () => {
+  const calls = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const sm = createSyncManager({
+    flushQueue: async (options) => {
+      calls.push(options);
+      if (calls.length === 1) {
+        await firstGate;
+      }
+    },
+    refreshAdminCache: async () => {}
+  });
+
+  const first = sm.runCycle({ force: true, reason: "five-minute" });
+  const threshold = sm.runCycle({
+    force: true,
+    flushQueue: true,
+    reason: "queue-threshold"
+  });
+  releaseFirst();
+  await Promise.all([first, threshold]);
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].flushQueue, true);
+  assert.equal(calls[1].reason, "queue-threshold");
+});
+
 // ── Timestamp tracking ────────────────────────────────────────────────────────
 
 test("getStatus reports correct timestamps after a completed cycle", async () => {
@@ -134,6 +162,19 @@ test("getStatus reports correct timestamps after a completed cycle", async () =>
   assert.ok(status.lastQueueFlushAt >= before && status.lastQueueFlushAt <= after);
   assert.ok(status.lastFiveMinuteReconcileAt >= before);
   assert.ok(status.lastMonthRefreshAt >= before);
+});
+
+test("a deferred snapshot is not reported as a completed reconciliation", async () => {
+  const sm = createSyncManager({
+    refreshMonthSlices: async () => false,
+    refreshAdminCache: async () => {}
+  });
+
+  await sm.runCycle({ force: true, reason: "five-minute" });
+
+  const status = sm.getStatus();
+  assert.equal(status.lastMonthRefreshAt, 0);
+  assert.equal(status.lastFiveMinuteReconcileAt, 0);
 });
 
 test("getStatus cycleInProgress is true while a cycle is running", async () => {

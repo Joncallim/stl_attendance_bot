@@ -153,7 +153,7 @@ The bot expects `settings.yaml` at the repo root by default. Override the path w
 
 - Users submit one attendance value for today.
 - The bot records the choice durably first.
-- The write is then flushed to Sheets by the background sync loop.
+- The write is then flushed to Sheets in a background batch, normally within two minutes or sooner when 25 eligible entries accumulate.
 
 ### Weekly
 
@@ -186,6 +186,7 @@ The bot uses a local cache so Telegram screens stay fast and Google Sheets reads
 - the queue is persisted locally before sheet flush
 - cached month snapshots are used for summary and reminder checks
 - a 1-minute background loop refreshes cache opportunistically
+- nonessential snapshot reads defer during a prompt broadcast and for 30 seconds afterward
 - a 5-minute forced reconciliation pass repairs drift and pushes resolved changes back to Sheets
 
 Summary features include:
@@ -278,6 +279,7 @@ The bot stores local state in `./data`.
 - `data/settings.json`: attendance option overrides and usage data
 - `data/sheet-cache.json`: cached sheet snapshots and sync metadata
 - `data/attendance-queue.ndjson`: append-only queued attendance events
+- `data/attendance-button-cleanup.json`: restart-safe expiry jobs for attendance confirmation buttons
 - `data/logs/attendance-bot.log`: optional human-readable log file if `LOG_FILE_PATH` is set
 
 ## Installation
@@ -354,6 +356,14 @@ npm test
 - `BOT_TIMEZONE`
 - `FIRST_REMINDER_TIME`
 - `SECOND_REMINDER_TIME`
+- `TELEGRAM_BROADCAST_INTERVAL_MS`
+- `TELEGRAM_BROADCAST_CONCURRENCY`
+- `INTERACTIVE_PRIORITY_QUIET_MS`
+- `ATTENDANCE_QUEUE_FLUSH_INTERVAL_MS`
+- `ATTENDANCE_QUEUE_FLUSH_THRESHOLD`
+- `SNAPSHOT_REFRESH_POST_BROADCAST_DELAY_MS`
+- `GOOGLE_SHEETS_INTER_REQUEST_DELAY_MS`
+- `GOOGLE_SHEETS_INTER_REQUEST_DELAY_CONGESTED_MS`
 - `ONBOARDING_SHEET_TITLE`
 - `LOG_FILE_PATH`
 - `SETTINGS_FILE_PATH`
@@ -367,6 +377,20 @@ npm test
 - `SETTINGS_FILE_PATH` defaults to `./settings.yaml`.
 - `ROSTER_STOP_MARKERS` is still present in config, but the bot now uses `ONBOARDING` as the canonical roster source and does not rely on `Remarks`.
 - `GITHUB_TOKEN` is a GitHub Personal Access Token with `repo` scope. When set, users can submit bug reports from the bot via the "🐛 Report Issue" button. The button is hidden when this variable is not configured.
+
+### Responsiveness Tuning
+
+The defaults reserve Telegram and Sheets capacity for incoming user actions:
+
+- broadcasts launch every `100` ms with up to `12` concurrent requests, or about 10 messages/second
+- background launches pause while an update is handled and for `500` ms afterward
+- attendance is durable locally before acknowledgement, then flushed every `120000` ms or at `25` eligible queued entries
+- nonessential snapshots wait until `30000` ms after the latest broadcast
+- Sheets requests retain `1000` ms spacing and automatically use `3000` ms spacing after repeated timeouts
+
+At the default broadcast rate, 100 recipients take approximately 10 seconds and 300 take approximately 30 seconds. Sheets can trail Telegram by roughly one to two minutes during busy periods, while attendance taps remain immediately acknowledged and locally recoverable.
+
+Safety bounds clamp broadcast concurrency to 15 and Sheets spacing to at least one second. Tune the variables in `.env` and restart the process; no code change is required.
 
 ## Google Setup
 

@@ -12,6 +12,17 @@ import {
   syncOnboardingRoster,
   transferAttendanceRows
 } from "../src/googleSheets.js";
+import {
+  __testing as workPriorityTesting,
+  requireBackgroundSheetProgress,
+  runWithBackgroundPriority,
+  runWithInteractivePriority
+} from "../src/workPriority.js";
+import {
+  __testing as broadcastActivityTesting,
+  runAsNonessentialSnapshotRefresh,
+  runWithBroadcastActivity
+} from "../src/broadcastActivity.js";
 
 function createFakeSheets(columnValues) {
   const calls = {
@@ -478,11 +489,56 @@ test("attendance transfer aborts every sheet before writing when a destination h
     { phase: "copy" }
   );
 
-  assert.ok(results.some((entry) => entry.reason === "destination_has_attendance"));
+  const conflict = results.find((entry) => entry.reason === "destination_has_attendance");
+  assert.ok(conflict);
+  assert.deepEqual(conflict.conflictingDates, [`1 ${__testing.getMonthParts(dates[1], timezone).month}`]);
   assert.equal(fake.calls.batchValueUpdates.length, 0);
   for (const { title } of dates.map((date) => __testing.getMonthParts(date, timezone))) {
     assert.equal(fake.getSheetValues(title)[1][1], "PRESENT");
   }
+});
+
+test("attendance transfer blocks every month when an appointment row is duplicated", async () => {
+  const timezone = "Asia/Singapore";
+  const dates = [
+    __testing.shiftMonth(new Date(), timezone, -1),
+    new Date(),
+    __testing.shiftMonth(new Date(), timezone, 1)
+  ];
+  const initialSheets = {};
+
+  dates.forEach((date, index) => {
+    const { title, month } = __testing.getMonthParts(date, timezone);
+    initialSheets[title] = {
+      sheetId: index + 1,
+      values: [
+        ["Appointment", `1 ${month}`],
+        ["ALPHA", "PRESENT"],
+        ["ALPHA", ""],
+        ["BRAVO", ""],
+        ["Remarks"]
+      ]
+    };
+  });
+
+  const fake = createInMemorySheets(initialSheets);
+  const results = await transferAttendanceRows(
+    fake.client,
+    {
+      spreadsheetId: "spreadsheet-id",
+      timezone,
+      rosterStopMarkers: ["Remarks"]
+    },
+    "ALPHA",
+    "BRAVO",
+    { phase: "copy" }
+  );
+
+  assert.equal(
+    results.filter((entry) => entry.reason === "duplicate_appointment_row").length,
+    dates.length
+  );
+  assert.equal(fake.calls.batchValueUpdates.length, 0);
 });
 
 test("managed monthly rows follow onboarding order while preserving existing row data", async () => {
@@ -1276,6 +1332,113 @@ test("retry wrapper times out stalled requests instead of hanging forever", asyn
   // if a previous test left a pending inter-request delay, so allow 3s total —
   // the point is to confirm the timeout fires rather than the call hanging forever.
   assert.ok(Date.now() - startedAt < 3000);
+});
+
+test("interactive Sheets requests jump ahead of queued background maintenance", async () => {
+  workPriorityTesting.reset();
+  workPriorityTesting.setQuietPeriodMs(0);
+  const order = [];
+  let markFirstStarted;
+  let releaseFirst;
+  const firstStarted = new Promise((resolve) => { markFirstStarted = resolve; });
+  const firstCanFinish = new Promise((resolve) => { releaseFirst = resolve; });
+
+  const first = runWithBackgroundPriority(() => __testing.runGoogleSheetsRequest(
+    "priority-background-first",
+    async () => {
+      order.push("background-first");
+      markFirstStarted();
+      await firstCanFinish;
+    },
+    { maxAttempts: 1 }
+  ));
+  await firstStarted;
+
+  const second = runWithBackgroundPriority(() => __testing.runGoogleSheetsRequest(
+    "priority-background-second",
+    async () => {
+      order.push("background-second");
+    },
+    { maxAttempts: 1 }
+  ));
+  const interactive = runWithInteractivePriority(() => __testing.runGoogleSheetsRequest(
+    "priority-interactive",
+    async () => {
+      order.push("interactive");
+    },
+    { maxAttempts: 1 }
+  ));
+
+  releaseFirst();
+  await Promise.all([first, second, interactive]);
+  assert.deepEqual(order, ["background-first", "interactive", "background-second"]);
+});
+
+test("a background Sheet transaction can reach its safe handoff boundary", async () => {
+  workPriorityTesting.reset();
+  workPriorityTesting.setQuietPeriodMs(0);
+  let releaseInteractive;
+  const interactive = runWithInteractivePriority(() => new Promise((resolve) => {
+    releaseInteractive = resolve;
+  }));
+  const releaseProgressRequirement = requireBackgroundSheetProgress();
+  const background = runWithBackgroundPriority(async () => {
+    await __testing.runGoogleSheetsRequest(
+      "priority-background-safe-handoff",
+      async () => {},
+      { maxAttempts: 1 }
+    );
+  });
+
+  let timeoutId;
+  const completedWhileInputWasActive = await Promise.race([
+    background.then(() => true),
+    new Promise((resolve) => {
+      timeoutId = setTimeout(() => resolve(false), 2500);
+    })
+  ]);
+  clearTimeout(timeoutId);
+  releaseProgressRequirement();
+  releaseInteractive();
+  await Promise.all([interactive, background]);
+
+  assert.equal(completedWhileInputWasActive, true);
+});
+
+test("interactive Sheets work overtakes a snapshot deferred by a broadcast", async () => {
+  workPriorityTesting.reset();
+  workPriorityTesting.setQuietPeriodMs(0);
+  broadcastActivityTesting.reset();
+  broadcastActivityTesting.setPostBroadcastDelayMs(0);
+  const order = [];
+  let releaseBroadcast;
+  const broadcast = runWithBroadcastActivity(() => new Promise((resolve) => {
+    releaseBroadcast = resolve;
+  }));
+
+  const snapshot = runWithBackgroundPriority(() =>
+    runAsNonessentialSnapshotRefresh(() => __testing.runGoogleSheetsRequest(
+      "priority-deferred-snapshot",
+      async () => { order.push("snapshot"); },
+      { maxAttempts: 1 }
+    ))
+  );
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(order, []);
+
+    const interactive = runWithInteractivePriority(() => __testing.runGoogleSheetsRequest(
+      "priority-during-deferred-snapshot",
+      async () => { order.push("interactive"); },
+      { maxAttempts: 1 }
+    ));
+    await interactive;
+    assert.deepEqual(order, ["interactive"]);
+  } finally {
+    releaseBroadcast();
+    await Promise.allSettled([broadcast, snapshot]);
+  }
+  assert.deepEqual(order, ["interactive", "snapshot"]);
 });
 
 test("pending attendance overlays replace the snapshot value seen by the bot", async () => {

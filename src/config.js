@@ -401,6 +401,18 @@ const runtimeConfig = {
   onboardingAttendanceOptions: []
 };
 
+function validateReminderTime(value, name) {
+  if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value)) {
+    throw new Error(`${name} must use 24-hour HH:MM format.`);
+  }
+}
+
+validateReminderTime(runtimeConfig.firstReminderTime, "FIRST_REMINDER_TIME");
+validateReminderTime(runtimeConfig.secondReminderTime, "SECOND_REMINDER_TIME");
+if (runtimeConfig.firstReminderTime === runtimeConfig.secondReminderTime) {
+  throw new Error("FIRST_REMINDER_TIME and SECOND_REMINDER_TIME must be different.");
+}
+
 export function applyUnitSettings(config, unitSettings) {
   config.unit = unitSettings.unit;
   config.hierarchy = unitSettings.hierarchy;

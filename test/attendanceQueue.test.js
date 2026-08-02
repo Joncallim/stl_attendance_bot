@@ -4,12 +4,20 @@ import os from "node:os";
 import path from "node:path";
 import { mkdtemp, rm } from "node:fs/promises";
 import {
+  ATTENDANCE_QUEUE_FLUSH_INTERVAL_MS,
+  ATTENDANCE_QUEUE_FLUSH_THRESHOLD,
   enqueueAttendanceEvent,
+  enqueueAttendanceEvents,
   flushAttendanceQueue,
   getAttendanceQueueStatus,
   listPendingAttendanceEvents,
   loadAttendanceQueueState
 } from "../src/attendanceQueue.js";
+
+test("attendance queue batching defaults are two minutes and 25 entries", () => {
+  assert.equal(ATTENDANCE_QUEUE_FLUSH_INTERVAL_MS, 120_000);
+  assert.equal(ATTENDANCE_QUEUE_FLUSH_THRESHOLD, 25);
+});
 
 async function withTempDataDir(run) {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "attendance-queue-"));
@@ -53,6 +61,76 @@ test("attendance queue survives reload and flush coalesces last write wins", asy
 
     const pending = await listPendingAttendanceEvents();
     assert.equal(pending.length, 0);
+  });
+});
+
+test("attendance queue deduplicates a retried interaction idempotency key", async () => {
+  await withTempDataDir(async () => {
+    const config = { timezone: "Asia/Singapore" };
+    const event = {
+      appointment: "ALPHA",
+      status: "PRESENT",
+      date: new Date("2026-03-24T00:00:00.000Z"),
+      source: "department",
+      idempotencyKey: "department:menu-1:ALPHA:2026-03-24"
+    };
+
+    const [first, second] = await Promise.all([
+      enqueueAttendanceEvent(config, event),
+      enqueueAttendanceEvent(config, event)
+    ]);
+
+    assert.equal(first.id, second.id);
+    const state = await loadAttendanceQueueState();
+    assert.equal(state.events.size, 1);
+  });
+});
+
+test("attendance queue deduplicates repeated keys inside one batch", async () => {
+  await withTempDataDir(async () => {
+    const config = { timezone: "Asia/Singapore" };
+    const event = {
+      appointment: "ALPHA",
+      status: "PRESENT",
+      date: new Date("2026-03-24T00:00:00.000Z"),
+      source: "weekly",
+      idempotencyKey: "weekly:flow-1:ALPHA:2026-03-24"
+    };
+
+    const [first, second] = await enqueueAttendanceEvents(config, [event, event]);
+
+    assert.equal(first.id, second.id);
+    const state = await loadAttendanceQueueState();
+    assert.equal(state.events.size, 1);
+  });
+});
+
+test("weekly status edits after a restart use a new event and flush the replacement", async () => {
+  await withTempDataDir(async () => {
+    const config = { timezone: "Asia/Singapore" };
+    await enqueueAttendanceEvents(config, [{
+      appointment: "ALPHA",
+      status: "ABSENT",
+      date: new Date("2026-03-24T00:00:00.000Z"),
+      source: "weekly",
+      idempotencyKey: "weekly:flow-1:ALPHA:2026-03-24:absent-version"
+    }]);
+
+    // Simulate resuming the flow after a crash and changing the submitted
+    // selection before the original event reached Google Sheets.
+    await enqueueAttendanceEvents(config, [{
+      appointment: "ALPHA",
+      status: "PRESENT",
+      date: new Date("2026-03-24T00:00:00.000Z"),
+      source: "weekly",
+      idempotencyKey: "weekly:flow-1:ALPHA:2026-03-24:present-version"
+    }]);
+
+    assert.equal((await loadAttendanceQueueState()).events.size, 2);
+    const flushed = [];
+    await flushAttendanceQueue(async (entries) => flushed.push(...entries));
+
+    assert.deepEqual(flushed.map((entry) => entry.status), ["PRESENT"]);
   });
 });
 

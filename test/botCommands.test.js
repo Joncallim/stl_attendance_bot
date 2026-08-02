@@ -7,6 +7,326 @@ process.env.GOOGLE_SHEETS_SPREADSHEET_ID ??= "test-sheet";
 process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL ??= "bot@example.com";
 
 const { __testing } = await import("../src/bot.js");
+const {
+  __testing: priorityTesting,
+  getWorkPriorityStatus,
+  runWithBackgroundPriority,
+  runWithInteractivePriority
+} = await import("../src/workPriority.js");
+const { shouldDeferSnapshotRefresh } = await import("../src/broadcastActivity.js");
+
+test("interactive Sheet transactions take the next safe transaction boundary", async () => {
+  priorityTesting.reset();
+  priorityTesting.setQuietPeriodMs(0);
+  try {
+    const order = [];
+    let releaseBackground;
+    let backgroundStarted;
+    const backgroundStartedPromise = new Promise((resolve) => {
+      backgroundStarted = resolve;
+    });
+
+    const firstBackground = runWithBackgroundPriority(() =>
+      __testing.withSheetOperation(async () => {
+        order.push("background:start");
+        backgroundStarted();
+        await new Promise((resolve) => {
+          releaseBackground = resolve;
+        });
+        order.push("background:end");
+      })
+    );
+    await backgroundStartedPromise;
+
+    const queuedBackground = runWithBackgroundPriority(() =>
+      __testing.withSheetOperation(async () => {
+        order.push("background:queued");
+      })
+    );
+    const interactive = runWithInteractivePriority(() =>
+      __testing.withSheetOperation(async () => {
+        order.push("interactive");
+      })
+    );
+
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(getWorkPriorityStatus().backgroundSheetProgressRequired, true);
+    releaseBackground();
+    await Promise.all([firstBackground, queuedBackground, interactive]);
+
+    assert.deepEqual(order, [
+      "background:start",
+      "background:end",
+      "interactive",
+      "background:queued"
+    ]);
+    assert.equal(getWorkPriorityStatus().backgroundSheetProgressRequired, false);
+  } finally {
+    priorityTesting.reset();
+  }
+});
+
+test("daily attendance idempotency is scoped to one Telegram prompt", () => {
+  const first = __testing.buildDailyAttendanceIdempotencyKey(
+    "chat-1",
+    "prompt-1",
+    "2026-03-24",
+    "PRESENT"
+  );
+  const replay = __testing.buildDailyAttendanceIdempotencyKey(
+    "chat-1",
+    "prompt-1",
+    "2026-03-24",
+    "PRESENT"
+  );
+  const laterPrompt = __testing.buildDailyAttendanceIdempotencyKey(
+    "chat-1",
+    "prompt-2",
+    "2026-03-24",
+    "PRESENT"
+  );
+
+  assert.equal(first, replay);
+  assert.notEqual(first, laterPrompt);
+});
+
+test("attendance transfer conflict message explains the actionable sheet cells", () => {
+  const message = __testing.formatAttendanceTransferBlockedMessage(
+    [
+      {
+        title: "Jul 26",
+        reason: "destination_has_attendance",
+        conflictingDates: ["14 Jul", "15 Jul"]
+      },
+      { title: "Aug 26", reason: "transfer_aborted_due_to_conflict" }
+    ],
+    "Nav OJT4"
+  );
+
+  assert.match(message, /No binding or attendance was changed/);
+  assert.match(message, /Jul 26: Nav OJT4 already has different attendance on 14 Jul, 15 Jul/);
+  assert.match(message, /other months were left unchanged/);
+  assert.doesNotMatch(message, /destination_has_attendance|transfer_aborted_due_to_conflict/);
+});
+
+test("duplicate appointment rows block an attendance transfer before the binding moves", () => {
+  const results = [{
+    title: "Aug 26",
+    skipped: true,
+    reason: "duplicate_appointment_row",
+    fromRowNumbers: [2, 8],
+    toRowNumbers: [3]
+  }];
+
+  assert.equal(__testing.isAttendanceTransferBlocked(results), true);
+  assert.match(
+    __testing.formatAttendanceTransferBlockedMessage(results, "BRAVO"),
+    /appointment appears more than once/
+  );
+});
+
+test("live transfer cleanup retains its journal when any source clear is blocked", async () => {
+  const calls = [];
+  const result = await __testing.completeAttendanceTransferCleanup({
+    journal: { id: "journal-1", fromAppointment: "ALPHA", toAppointment: "BRAVO" },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async (_sheets, _config, _from, _to, options) => {
+      calls.push(options);
+      return [{ title: "Aug 26", skipped: true, reason: "duplicate_appointment_row" }];
+    },
+    updateJournalFn: async () => calls.push("update"),
+    clearJournalFn: async () => calls.push("clear")
+  });
+
+  assert.equal(result.cleaned, false);
+  assert.deepEqual(calls, [{ phase: "clear" }]);
+});
+
+test("restart recovery retains blocked and legacy partial transfer journals", async () => {
+  const calls = [];
+  const committed = await __testing.recoverAttendanceTransferJournal({
+    journal: {
+      id: "journal-committed",
+      phase: "binding_committed",
+      fromAppointment: "ALPHA",
+      toAppointment: "BRAVO"
+    },
+    registry: { appointments: [{ appointment: "ALPHA", boundChatId: null }, { appointment: "BRAVO", boundChatId: "chat-1" }] },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async () => [{ title: "Aug 26", conflict: true, reason: "destination_has_attendance" }],
+    updateJournalFn: async () => calls.push("update"),
+    clearJournalFn: async () => calls.push("clear")
+  });
+  const partial = await __testing.recoverAttendanceTransferJournal({
+    journal: {
+      id: "journal-partial",
+      phase: "copied",
+      fromAppointment: "ALPHA",
+      toAppointment: "BRAVO"
+    },
+    registry: { appointments: [] },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async () => {
+      throw new Error("partial journals must not replay automatically");
+    }
+  });
+
+  assert.equal(committed.reason, "cleanup_blocked");
+  assert.equal(partial.reason, "missing_binding_identity");
+  assert.deepEqual(calls, []);
+});
+
+test("restart recovery resumes a prepared transfer only with its persisted binding identity", async () => {
+  const source = {
+    appointment: "ALPHA",
+    boundChatId: "chat-1",
+    boundAt: "2026-03-24T00:00:00.000Z"
+  };
+  const expectedBindingIdentity = "ALPHA\u0000chat-1\u00002026-03-24T00:00:00.000Z";
+  const calls = [];
+  const result = await __testing.recoverAttendanceTransferJournal({
+    journal: {
+      id: "prepared-journal",
+      phase: "prepared",
+      fromAppointment: "ALPHA",
+      toAppointment: "BRAVO",
+      expectedFromBindingIdentity: expectedBindingIdentity
+    },
+    registry: { appointments: [source, { appointment: "BRAVO", boundChatId: null }] },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async (_sheets, _config, _from, _to, options) => {
+      calls.push(`sheet:${options.phase}`);
+      return [{ title: "Mar 26", transferred: true }];
+    },
+    transferAppointmentBindingFn: async (_from, _to, options) => {
+      calls.push(`binding:${options.expectedFromBindingIdentity}`);
+      assert.deepEqual(await options.prepare(), { ok: true });
+      return { ok: true };
+    },
+    updateJournalFn: async (_id, phase) => calls.push(`journal:${phase}`),
+    clearJournalFn: async () => calls.push("journal:clear")
+  });
+
+  assert.equal(result.recovered, true);
+  assert.deepEqual(calls, [
+    "sheet:copy",
+    "journal:copied",
+    `binding:${expectedBindingIdentity}`,
+    "journal:binding_committed",
+    "sheet:clear",
+    "journal:completed",
+    "journal:clear"
+  ]);
+});
+
+test("restart recovery resumes a copied transfer without replaying its remote copy", async () => {
+  const expectedBindingIdentity = "ALPHA\u0000chat-1\u00002026-03-24T00:00:00.000Z";
+  const calls = [];
+  const result = await __testing.recoverAttendanceTransferJournal({
+    journal: {
+      id: "copied-journal",
+      phase: "copied",
+      fromAppointment: "ALPHA",
+      toAppointment: "BRAVO",
+      expectedFromBindingIdentity: expectedBindingIdentity
+    },
+    registry: {
+      appointments: [
+        { appointment: "ALPHA", boundChatId: "chat-1", boundAt: "2026-03-24T00:00:00.000Z" },
+        { appointment: "BRAVO", boundChatId: null }
+      ]
+    },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async (_sheets, _config, _from, _to, options) => {
+      calls.push(`sheet:${options.phase}`);
+      assert.equal(options.phase, "clear");
+      return [{ title: "Mar 26", transferred: true }];
+    },
+    transferAppointmentBindingFn: async (_from, _to, options) => {
+      calls.push("binding");
+      assert.deepEqual(await options.prepare(), { ok: true });
+      return { ok: true };
+    },
+    updateJournalFn: async (_id, phase) => calls.push(`journal:${phase}`),
+    clearJournalFn: async () => calls.push("journal:clear")
+  });
+
+  assert.equal(result.recovered, true);
+  assert.deepEqual(calls, [
+    "binding",
+    "journal:binding_committed",
+    "sheet:clear",
+    "journal:completed",
+    "journal:clear"
+  ]);
+});
+
+test("restart recovery clears source attendance when binding committed before copied journal advanced", async () => {
+  const expectedBindingIdentity = "ALPHA\u0000chat-1\u00002026-03-24T00:00:00.000Z";
+  const calls = [];
+  const result = await __testing.recoverAttendanceTransferJournal({
+    journal: {
+      id: "copied-after-binding-journal",
+      phase: "copied",
+      fromAppointment: "ALPHA",
+      toAppointment: "BRAVO",
+      expectedFromBindingIdentity: expectedBindingIdentity
+    },
+    registry: {
+      appointments: [
+        { appointment: "ALPHA", boundChatId: null },
+        { appointment: "BRAVO", boundChatId: "chat-1", boundAt: "2026-03-24T00:00:00.000Z" }
+      ]
+    },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async (_sheets, _config, _from, _to, options) => {
+      calls.push(`sheet:${options.phase}`);
+      assert.equal(options.phase, "clear");
+      return [{ title: "Mar 26", transferred: true }];
+    },
+    transferAppointmentBindingFn: async () => {
+      throw new Error("already committed bindings must not be replayed");
+    },
+    updateJournalFn: async (_id, phase) => calls.push(`journal:${phase}`),
+    clearJournalFn: async () => calls.push("journal:clear")
+  });
+
+  assert.equal(result.recovered, true);
+  assert.deepEqual(calls, [
+    "journal:binding_committed",
+    "sheet:clear",
+    "journal:completed",
+    "journal:clear"
+  ]);
+});
+
+test("weekly retry keys supersede a prior status after crash recovery", () => {
+  const absent = __testing.buildWeeklyAttendanceIdempotencyKey(
+    "flow-1", "ALPHA", "2026-03-24", "ABSENT"
+  );
+  const present = __testing.buildWeeklyAttendanceIdempotencyKey(
+    "flow-1", "ALPHA", "2026-03-24", "PRESENT"
+  );
+
+  assert.notEqual(absent, present);
+});
+
+test("stale transfer destination message does not expose internal reason codes", () => {
+  const message = __testing.formatAppointmentTransferFailure(
+    { ok: false, reason: "to_already_bound" },
+    "Nav OJT4"
+  );
+
+  assert.match(message, /Transfer menu expired/);
+  assert.match(message, /Nav OJT4 is already bound/);
+  assert.doesNotMatch(message, /to_already_bound/);
+});
 
 function createCtx(text = "/command") {
   const replies = [];
@@ -137,7 +457,7 @@ test("invite command reports missing appointments", async () => {
 test("admin menu description includes the current pre-v1 version", () => {
   const description = __testing.buildAdminMenuDescription();
 
-  assert.match(description, /^Admin Menu \(v0\.9\.23\)/);
+  assert.match(description, /^Admin Menu \(v0\.9\.24\)/);
 });
 
 test("attendance prompt tracking is deduplicated and bounded", () => {
@@ -188,6 +508,44 @@ test("daily attendance callbacks are bound to date and status content", () => {
   assert.match(callbacks[0], /^home:pick:attendance:2026-07-30:0:[A-Za-z0-9_-]{8}$/);
   assert.match(callbacks[1], /^home:pick:attendance:2026-07-30:1:[A-Za-z0-9_-]{8}$/);
   assert.notEqual(callbacks[0].split(":").at(-1), callbacks[1].split(":").at(-1));
+});
+
+test("daily attendance prompt ids distinguish new prompts and stay within Telegram limits", () => {
+  const config = {
+    attendanceOptions: ["PRESENT", "MC"],
+    timezone: "Asia/Singapore"
+  };
+  const menu = __testing.buildDatedAttendanceMenu(
+    config,
+    new Date("2026-07-30T04:00:00.000Z"),
+    0,
+    "home:pick:attendance",
+    "home:attendance:page",
+    "home:main",
+    [],
+    { promptId: "prompt01" }
+  );
+  const callbacks = menu.reply_markup.inline_keyboard
+    .flat()
+    .map((button) => button.callback_data)
+    .filter((value) => value?.startsWith("home:pick:attendance"));
+
+  assert.match(callbacks[0], /^home:pick:attendance:prompt01:2026-07-30:0:[A-Za-z0-9_-]{8}$/);
+  assert.ok(callbacks.every((value) => Buffer.byteLength(value, "utf8") <= 64));
+});
+
+test("stale interactions leave a visible explanation even after callback acknowledgement", async () => {
+  const calls = [];
+  const ctx = {
+    answerCbQuery: async () => { throw new Error("already answered"); },
+    editMessageText: async (message) => calls.push(["edit", message]),
+    editMessageReplyMarkup: async () => calls.push(["markup"]),
+    reply: async (message) => calls.push(["reply", message])
+  };
+
+  await __testing.rejectExpiredInteraction(ctx, "Expired. Nothing was changed.");
+
+  assert.deepEqual(calls, [["edit", "Expired. Nothing was changed."]]);
 });
 
 test("completed attendance removes old prompts and retires undeletable buttons", async () => {
@@ -284,6 +642,30 @@ test("triggerBackgroundSheetRefresh skips duplicate refreshes while a cycle is r
 
   assert.equal(result, false);
   assert.deepEqual(runCycleCalls, []);
+});
+
+test("attendance queue threshold requests an explicit background flush", async () => {
+  const calls = [];
+  const cache = {
+    syncManager: {
+      runCycle: async (options) => { calls.push(options); }
+    }
+  };
+
+  const belowThreshold = await __testing.triggerAttendanceQueueThresholdFlush(cache, {
+    listPendingAttendanceEventsFn: async () => Array.from({ length: 24 }, () => ({}))
+  });
+  const atThreshold = await __testing.triggerAttendanceQueueThresholdFlush(cache, {
+    listPendingAttendanceEventsFn: async () => Array.from({ length: 25 }, () => ({}))
+  });
+
+  assert.equal(belowThreshold, false);
+  assert.equal(atThreshold, true);
+  assert.deepEqual(calls, [{
+    force: true,
+    flushQueue: true,
+    reason: "queue-threshold"
+  }]);
 });
 
 test("syncroster admin action refreshes sheets and reports current and next month", async () => {
@@ -775,6 +1157,7 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
   const intervals = [];
   const schedules = [];
   const runCycleCalls = [];
+  let cleanupCalls = 0;
 
   __testing.registerBackgroundSchedules({
     bot: {},
@@ -803,6 +1186,10 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
         return { stop() {} };
       },
       refreshAttendanceOptionUsageFn: async () => {},
+      cleanupExpiredAttendanceButtonsFn: async () => {
+        cleanupCalls += 1;
+        return { attempted: 0, removed: 0, retired: 0, retrying: 0 };
+      },
       runDailySheetMaintenanceFn: async () => {},
       runStartupSheetCleanupFn: async () => {}
     }
@@ -810,13 +1197,15 @@ test("background schedules keep both 1-minute and 5-minute reconciliation interv
 
   assert.deepEqual(
     intervals.map((entry) => entry.delay),
-    [60 * 1000, 5 * 60 * 1000]
+    [60 * 1000, 60 * 1000, 5 * 60 * 1000]
   );
   // First cron is 2 AM structural maintenance; second is 02:05 queue compaction.
   assert.equal(schedules[0].expression, "0 2 * * *");
   assert.equal(schedules[1].expression, "5 2 * * *");
   assert.ok(schedules.some((entry) => entry.expression === "0 7 * * *"));
   assert.ok(schedules.some((entry) => entry.expression === "0 8 * * *"));
+  await intervals[1].fn();
+  assert.equal(cleanupCalls, 1);
   // Startup cycle runs after cleanup (async) — drain microtasks before asserting.
   await new Promise((resolve) => setImmediate(resolve));
   // Startup cycle is now lightweight (force: false).
@@ -828,6 +1217,7 @@ test("first scheduled reminder refreshes Sheets without delaying prompts", async
   const runCycleCalls = [];
   const prompts = [];
   let releaseReminderSync;
+  let reminderRefreshSawBroadcast = false;
   const reminderSync = new Promise((resolve) => {
     releaseReminderSync = resolve;
   });
@@ -846,6 +1236,7 @@ test("first scheduled reminder refreshes Sheets without delaying prompts", async
           runCycleCalls.push(options);
 
           if (options.reason === "reminder") {
+            reminderRefreshSawBroadcast = shouldDeferSnapshotRefresh();
             await reminderSync;
           }
         },
@@ -886,6 +1277,7 @@ test("first scheduled reminder refreshes Sheets without delaying prompts", async
     { force: true, reason: "reminder" }
   ]);
   assert.equal(reminderResult, "sent", "first reminder should not wait for Sheets refresh");
+  assert.equal(reminderRefreshSawBroadcast, true);
   assert.deepEqual(prompts, ["chat-1"]);
   releaseReminderSync();
   await new Promise((resolve) => setImmediate(resolve));
@@ -943,6 +1335,7 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
   const schedules = [];
   const prompts = [];
   let releaseReminderSync;
+  let reminderRefreshWasEssential = false;
   const reminderSync = new Promise((resolve) => {
     releaseReminderSync = resolve;
   });
@@ -976,8 +1369,11 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
       syncManager: {
         runCycle: async (options) => {
           if (options.reason === "reminder") {
+            reminderRefreshWasEssential = options.essentialSnapshotRefresh === true;
             await reminderSync;
+            return { monthSlicesRefreshed: true };
           }
+          return { monthSlicesRefreshed: true };
         },
         setMaintenanceRunning: () => {}
       },
@@ -1026,6 +1422,52 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
   }
 
   assert.deepEqual(prompts, ["chat-2"]);
+  assert.equal(reminderRefreshWasEssential, true);
+});
+
+test("0800 reminder skips recipients when its essential refresh is deferred", async () => {
+  const schedules = [];
+  const prompts = [];
+
+  __testing.registerBackgroundSchedules({
+    bot: {},
+    sheets: {},
+    config: {
+      timezone: "Asia/Singapore",
+      firstReminderTime: "07:00",
+      secondReminderTime: "08:00"
+    },
+    adminCache: {
+      syncManager: {
+        runCycle: async (options) => options.reason === "reminder"
+          ? { monthSlicesRefreshed: false }
+          : { monthSlicesRefreshed: true },
+        setMaintenanceRunning: () => {}
+      },
+      sheetSnapshots: {
+        snapshots: new Map()
+      }
+    },
+    deps: {
+      setIntervalFn: () => 0,
+      setTimeoutFn: () => 0,
+      scheduleFn: (expression, fn) => {
+        schedules.push({ expression, fn });
+        return { stop() {} };
+      },
+      refreshAttendanceOptionUsageFn: async () => {},
+      runDailySheetMaintenanceFn: async () => {},
+      runStartupSheetCleanupFn: async () => {},
+      isReminderWorkingDayFn: async () => true,
+      listUsersFn: async () => [{ chatId: "chat-1", appointment: "ALPHA" }],
+      sendPromptToChatFn: async (_bot, _config, chatId) => prompts.push(chatId)
+    }
+  });
+
+  const reminderSchedule = schedules.find((entry) => entry.expression === "0 8 * * *");
+  await reminderSchedule.fn();
+
+  assert.deepEqual(prompts, []);
 });
 
 test("queue status shows empty message when nothing is outstanding", async () => {

@@ -7,9 +7,16 @@ import {
   TELEGRAM_SEND_INTERVAL_MS,
   TELEGRAM_SEND_CONCURRENCY
 } from "../src/concurrency.js";
+import {
+  __testing as workPriorityTesting,
+  runWithBackgroundPriority,
+  runWithInteractivePriority
+} from "../src/workPriority.js";
 
 test.beforeEach(() => {
   __testing.resetTelegramSendLimiter();
+  workPriorityTesting.reset();
+  workPriorityTesting.setQuietPeriodMs(0);
 });
 
 // ── Correctness ───────────────────────────────────────────────────────────────
@@ -171,6 +178,26 @@ test("overlapping broadcasts share one process-wide send rate", async () => {
       "overlapping batches must not reserve independent send slots"
     );
   }
+});
+
+test("broadcast sends yield while Telegram input is being handled", async () => {
+  let releaseInteractive;
+  const interactive = runWithInteractivePriority(() => new Promise((resolve) => {
+    releaseInteractive = resolve;
+  }));
+  let sendStarted = false;
+  const broadcast = runWithBackgroundPriority(() => allSettledConcurrent([
+    async () => {
+      sendStarted = true;
+    }
+  ], 1));
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(sendStarted, false);
+
+  releaseInteractive();
+  await Promise.all([interactive, broadcast]);
+  assert.equal(sendStarted, true);
 });
 
 test("Telegram 429 responses retry after the requested global pause", async () => {

@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import cron from "node-cron";
 import { Markup, Telegraf, session } from "telegraf";
 import { ipv4HttpsAgent } from "./network.js";
@@ -27,15 +27,19 @@ import {
   syncOnboardingRoster,
   summarizeStatuses,
   summarizeStatusesFromSnapshot,
+  isSnapshotRefreshDeferredError,
   transferAttendanceRows,
   writeAttendanceStatuses
 } from "./googleSheets.js";
 import {
+  ATTENDANCE_QUEUE_FLUSH_INTERVAL_MS,
+  ATTENDANCE_QUEUE_FLUSH_THRESHOLD,
   compactAttendanceQueue,
   enqueueAttendanceEvent,
   enqueueAttendanceEvents,
   getAttendanceQueueStatus,
   listPendingAttendanceEvents,
+  listUnresolvedAttendanceEvents,
   flushAttendanceQueue,
   resetConflictedQueueEntries
 } from "./attendanceQueue.js";
@@ -48,6 +52,8 @@ import {
   deregisterAppointmentBinding,
   deregisterRequestorByChatId,
   getAppointmentRegistry,
+  getAppointmentBindingIdentity,
+  getAppointmentStateIdentity,
   getSettings,
   getUserByChatId,
   getOnboardingInvite,
@@ -64,10 +70,35 @@ import {
   updateUserByChatId,
   upsertUser
 } from "./storage.js";
+import {
+  beginInteraction,
+  beginTextInput,
+  cancelInteractions,
+  consumeInteraction,
+  consumeTextInput,
+  getInteraction,
+  getTextInput
+} from "./telegramInteractions.js";
 import { createSyncManager } from "./syncManager.js";
-import { runSerialized, writePrivateTextFile } from "./fileStore.js";
+import { writePrivateTextFile } from "./fileStore.js";
+import {
+  beginAttendanceTransferJournal,
+  clearAttendanceTransferJournal,
+  getAttendanceTransferJournal,
+  updateAttendanceTransferJournal
+} from "./attendanceTransferJournal.js";
 import { applyStoredConfigOverrides } from "./config.js";
 import { allSettledConcurrent, TELEGRAM_SEND_CONCURRENCY, TELEGRAM_SEND_INTERVAL_MS } from "./concurrency.js";
+import {
+  runAsNonessentialSnapshotRefresh,
+  enqueueAttendancePromptBroadcast,
+  shouldDeferSnapshotRefresh
+} from "./broadcastActivity.js";
+import {
+  cancelAttendanceButtonCleanup,
+  cleanupExpiredAttendanceButtons,
+  scheduleAttendanceButtonCleanup
+} from "./messageCleanup.js";
 import {
   applyWeeklyAttendanceSelection,
   createWeeklyFlowState,
@@ -75,9 +106,16 @@ import {
   resolveWeeklyAttendanceEntries,
   upsertWeeklyAttendanceEntry
 } from "./weeklyFlow.js";
+import {
+  getCurrentWorkPriority,
+  requireBackgroundSheetProgress,
+  runWithBackgroundPriority,
+  runWithInteractivePriority,
+  waitForInteractiveIdle
+} from "./workPriority.js";
 
 const ONBOARDING_CODE_PROMPT = "Send the secret code assigned to your appointment.";
-export const BOT_VERSION = "v0.9.23";
+export const BOT_VERSION = "v0.9.24";
 
 function logBot(message, details = null) {
   const ts = new Date().toISOString();
@@ -98,11 +136,7 @@ function logBotError(message, details = null) {
 }
 
 const WEEK_SKIP_LABEL = "Skip Day";
-const SHEET_OPERATION_MUTEX_KEY = "sheet-operations";
 const MAX_TRACKED_ATTENDANCE_PROMPTS = 8;
-// Telegram allows ~30 messages/second per bot. Cap concurrent reminder sends
-// and enforce a minimum gap between successive send starts to stay safely
-// within quota and avoid silent 429 delivery failures.
 const DEPARTMENT_MEMBER_PAGE_SIZE = 6;
 const DEPARTMENT_WEEKDAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri"];
 const ATTENDANCE_OPTION_DISPLAY_ORDER = [
@@ -645,9 +679,9 @@ function buildHomeMenu(isAdminUser, timezone) {
   return Markup.inlineKeyboard(rows);
 }
 
-function buildSelfDeregisterMenu() {
+function buildSelfDeregisterMenu(interactionId) {
   return Markup.inlineKeyboard([
-    [Markup.button.callback("✅ Yes, Deregister Me", "home:deregister:confirm")],
+    [Markup.button.callback("✅ Yes, Deregister Me", `home:deregister:confirm:${interactionId}`)],
     [
       Markup.button.callback("🔙 Back", "home:main"),
       Markup.button.callback("❌ Close", "home:close")
@@ -748,6 +782,16 @@ function buildAppointmentManagementBackMenu() {
   ]);
 }
 
+function buildSyncPendingMenu(backTarget) {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("🔄 Sync Roster", "admin:syncroster")],
+    [
+      Markup.button.callback("🔙 Back", backTarget),
+      Markup.button.callback("❌ Close", "admin:close")
+    ]
+  ]);
+}
+
 function buildUnaccountedMenu(date, timezone, rows, backTarget, namespace) {
   return Markup.inlineKeyboard([
     ...rows,
@@ -831,6 +875,23 @@ function resolveFingerprintedSelection(items, indexRaw, fingerprint, identityFie
   return item;
 }
 
+function beginSelectionInteraction(ctx, kind, items, options = {}) {
+  const choices = Object.fromEntries(
+    items.map((item, index) => [String(index), item])
+  );
+  return beginInteraction(ctx, kind, choices, options);
+}
+
+async function rejectExpiredInteraction(ctx, message = "This menu is no longer current. Nothing was changed.") {
+  await ctx.answerCbQuery(message, { show_alert: true }).catch(() => {});
+  try {
+    await ctx.editMessageText(message, Markup.inlineKeyboard([]));
+  } catch {
+    await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+    await ctx.reply(message).catch(() => {});
+  }
+}
+
 function buildInlineAttendanceMenu(
   options,
   page,
@@ -888,6 +949,18 @@ function attendanceStatusFingerprint(status) {
     .slice(0, 8);
 }
 
+function newAttendancePromptId() {
+  return randomBytes(6).toString("base64url");
+}
+
+function buildDailyAttendanceIdempotencyKey(chatId, promptId, isoDate, status) {
+  return `daily:${chatId}:${promptId}:${isoDate}:${attendanceStatusFingerprint(status)}`;
+}
+
+function buildWeeklyAttendanceIdempotencyKey(flowId, appointment, isoDate, status) {
+  return `weekly:${flowId}:${appointment}:${isoDate}:${attendanceStatusFingerprint(status)}`;
+}
+
 function buildDatedAttendanceMenu(
   config,
   date,
@@ -895,15 +968,17 @@ function buildDatedAttendanceMenu(
   itemPrefix,
   pagePrefix,
   backTarget,
-  extraRows = []
+  extraRows = [],
+  menuOptions = {}
 ) {
   const isoDate = toIsoDateString(date, config.timezone);
+  const promptSuffix = menuOptions.promptId ? `:${menuOptions.promptId}` : "";
 
   return buildInlineAttendanceMenu(
     config.attendanceOptions,
     page,
-    `${itemPrefix}:${isoDate}`,
-    `${pagePrefix}:${isoDate}`,
+    `${itemPrefix}${promptSuffix}:${isoDate}`,
+    `${pagePrefix}${promptSuffix}:${isoDate}`,
     backTarget,
     extraRows,
     {
@@ -1002,6 +1077,32 @@ async function sendOrUpdateAdminMessage(ctx, text, replyMarkup, extraOptions = {
   }
 
   return ctx.reply(text, messageOptions);
+}
+
+async function sendBackgroundBotMessage(
+  bot,
+  chatId,
+  text,
+  replyMarkup,
+  extraOptions = {}
+) {
+  const [outcome] = await allSettledConcurrent([
+    (signal) => bot.telegram.callApi(
+      "sendMessage",
+      {
+        chat_id: chatId,
+        text,
+        ...(replyMarkup ?? {}),
+        ...extraOptions
+      },
+      { signal }
+    )
+  ], 1);
+
+  if (outcome.status === "rejected") {
+    throw outcome.reason;
+  }
+  return outcome.value;
 }
 
 function getMessageId(message) {
@@ -1491,7 +1592,7 @@ function buildDepartmentMenu(viewModel) {
       DEPARTMENT_WEEKDAY_LABELS.map((weekday, dayIndex) =>
         Markup.button.callback(
           `${member.rowNumber} ${weekday}`,
-          `home:department:edit:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}:${member.absoluteIndex}:${dayIndex}`
+          `home:department:edit:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}:${member.absoluteIndex}:${dayIndex}:${stableSelectionFingerprint(member.appointment)}`
         )
       )
     );
@@ -2133,8 +2234,66 @@ function createAdminCache() {
   };
 }
 
+const interactiveSheetOperations = [];
+const backgroundSheetOperations = [];
+let sheetOperationSchedulerRunning = false;
+let runningSheetOperationPriority = null;
+let releaseRequiredBackgroundSheetProgress = null;
+
+async function drainSheetOperations() {
+  if (sheetOperationSchedulerRunning) {
+    return;
+  }
+
+  sheetOperationSchedulerRunning = true;
+  try {
+    while (interactiveSheetOperations.length > 0 || backgroundSheetOperations.length > 0) {
+      const task = interactiveSheetOperations.shift() ?? backgroundSheetOperations.shift();
+      runningSheetOperationPriority = task.priority;
+
+      try {
+        const value = task.priority === "interactive"
+          ? await runWithInteractivePriority(task.operation)
+          : await runWithBackgroundPriority(task.operation);
+        task.resolve(value);
+      } catch (error) {
+        task.reject(error);
+      } finally {
+        if (task.priority === "background" && releaseRequiredBackgroundSheetProgress) {
+          releaseRequiredBackgroundSheetProgress();
+          releaseRequiredBackgroundSheetProgress = null;
+        }
+        runningSheetOperationPriority = null;
+      }
+    }
+  } finally {
+    sheetOperationSchedulerRunning = false;
+    if (interactiveSheetOperations.length > 0 || backgroundSheetOperations.length > 0) {
+      void drainSheetOperations();
+    }
+  }
+}
+
 function withSheetOperation(operation) {
-  return runSerialized(SHEET_OPERATION_MUTEX_KEY, operation);
+  const priority = getCurrentWorkPriority() === "interactive"
+    ? "interactive"
+    : "background";
+
+  return new Promise((resolve, reject) => {
+    const task = { operation, priority, resolve, reject };
+    if (priority === "interactive") {
+      interactiveSheetOperations.push(task);
+      if (
+        runningSheetOperationPriority === "background" &&
+        !releaseRequiredBackgroundSheetProgress
+      ) {
+        releaseRequiredBackgroundSheetProgress = requireBackgroundSheetProgress();
+      }
+    } else {
+      backgroundSheetOperations.push(task);
+    }
+    void drainSheetOperations();
+  });
 }
 
 function getTimezoneDateParts(date, timezone) {
@@ -2218,12 +2377,14 @@ async function clearWeeklyAttendanceState(ctx) {
   ctx.session.weeklyAttendanceIndex = 0;
   ctx.session.weeklyAttendanceResults = [];
   ctx.session.weeklyAttendanceEntries = [];
+  ctx.session.weeklyAttendanceFlowId = null;
   await updateUserByChatId(ctx.chat.id, {
     awaitingWeeklyAttendance: false,
     weeklyAttendanceDates: [],
     weeklyAttendanceIndex: 0,
     weeklyAttendanceResults: [],
-    weeklyAttendanceEntries: []
+    weeklyAttendanceEntries: [],
+    weeklyAttendanceFlowId: null
   });
 }
 
@@ -2232,7 +2393,7 @@ function getWeeklyAttendanceState(ctx, user) {
     Array.isArray(ctx.session.weeklyAttendanceDates) &&
     ctx.session.weeklyAttendanceDates.length > 0;
 
-  return {
+  const state = {
     dates: hasSessionFlow
       ? ctx.session.weeklyAttendanceDates
       : Array.isArray(user?.weeklyAttendanceDates)
@@ -2247,8 +2408,15 @@ function getWeeklyAttendanceState(ctx, user) {
           : [])
       : Array.isArray(user?.weeklyAttendanceEntries)
         ? user.weeklyAttendanceEntries
-        : []
+        : [],
+    flowId: hasSessionFlow
+      ? ctx.session.weeklyAttendanceFlowId
+      : user?.weeklyAttendanceFlowId ?? null
   };
+  if (!state.flowId) {
+    delete state.flowId;
+  }
+  return state;
 }
 
 function restoreWeeklyAttendanceSession(ctx, state) {
@@ -2256,6 +2424,7 @@ function restoreWeeklyAttendanceSession(ctx, state) {
   ctx.session.weeklyAttendanceDates = state.dates;
   ctx.session.weeklyAttendanceIndex = state.index;
   ctx.session.weeklyAttendanceEntries = state.entries;
+  ctx.session.weeklyAttendanceFlowId = state.flowId ?? null;
 }
 
 async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
@@ -2299,7 +2468,8 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
       stagedEntries,
       cache,
       config,
-      user
+      user,
+      weeklyState.flowId
     );
 
     await sendOrUpdateAdminMessage(
@@ -2321,6 +2491,12 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
       status: entry.status,
       date,
       source: "weekly",
+      idempotencyKey: buildWeeklyAttendanceIdempotencyKey(
+        weeklyState.flowId,
+        appointment,
+        entry.date,
+        entry.status
+      ),
       ...buildQueuedAttendanceEventMetadata(cache.sheetSnapshots, config, {
         appointment,
         status: entry.status,
@@ -2329,6 +2505,11 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
     };
   });
   await enqueueAttendanceEvents(config, queuedEntries);
+  runWithBackgroundPriority(() =>
+    triggerAttendanceQueueThresholdFlush(cache)
+  ).catch((error) => {
+    logBotError("Threshold attendance flush check failed.", { error: error.message });
+  });
 
   if (cache.sheetSnapshots) {
     cache.sheetSnapshots = applyAttendanceEntriesToSnapshotBundle(
@@ -2346,6 +2527,16 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
   });
 
   await clearWeeklyAttendanceState(ctx);
+  // A completed weekly flow can reuse an earlier confirmation message. Wait
+  // for any old cleanup edit to finish before installing the new keyboard.
+  await cancelAttendanceButtonCleanup(
+    ctx.chat.id,
+    getMessageId(ctx.callbackQuery?.message)
+  ).catch((error) => {
+    logBotError("Failed to cancel prior weekly confirmation button cleanup.", {
+      error: error.message
+    });
+  });
   const latestUser = await getUserByChatId(ctx.chat.id);
   const confirmationMessage = await sendOrUpdateAdminMessage(
     ctx,
@@ -2365,6 +2556,15 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
     getMessageId(ctx.callbackQuery?.message);
   await Promise.all([
     updateUserByChatId(ctx.chat.id, { weeklyPromptMessageIds: [] }),
+    scheduleAttendanceButtonCleanup(
+      ctx.chat.id,
+      currentMessageId,
+      new Date()
+    ).catch((error) => {
+      logBotError("Failed to schedule weekly confirmation button cleanup.", {
+        error: error.message
+      });
+    }),
     removeObsoleteAttendancePromptMessages(
       ctx.telegram,
       ctx.chat.id,
@@ -2461,20 +2661,34 @@ async function updateEnvSpreadsheetId(newSpreadsheetId, config) {
 }
 
 async function resetConversationState(ctx) {
+  cancelInteractions(ctx);
   ctx.session.awaitingAttendance = false;
   ctx.session.awaitingSecretCode = false;
   ctx.session.awaitingAttendanceOptionAdd = false;
   ctx.session.awaitingAppointmentAdd = false;
   ctx.session.awaitingIssueReport = false;
   ctx.session.awaitingSpreadsheetIdChange = false;
-  await clearWeeklyAttendanceState(ctx);
+  ctx.session.departmentEditTarget = null;
+  ctx.session.awaitingWeeklyAttendance = false;
+  ctx.session.weeklyAttendanceDates = [];
+  ctx.session.weeklyAttendanceIndex = 0;
+  ctx.session.weeklyAttendanceResults = [];
+  ctx.session.weeklyAttendanceEntries = [];
+  ctx.session.weeklyAttendanceFlowId = null;
   await updateUserByChatId(ctx.chat.id, {
     awaitingAttendance: false,
-    awaitingSecretCode: false
+    awaitingSecretCode: false,
+    awaitingWeeklyAttendance: false,
+    weeklyAttendanceDates: [],
+    weeklyAttendanceIndex: 0,
+    weeklyAttendanceResults: [],
+    weeklyAttendanceEntries: [],
+    weeklyAttendanceFlowId: null
   });
 }
 
 async function askForSecretCode(ctx, config) {
+  cancelInteractions(ctx);
   await clearWeeklyAttendanceState(ctx);
   ctx.session.awaitingSecretCode = true;
   await updateUserByChatId(ctx.chat.id, {
@@ -2484,13 +2698,16 @@ async function askForSecretCode(ctx, config) {
 }
 
 async function askAttendance(ctx, config, user = null, cache = null) {
+  cancelInteractions(ctx);
   ctx.session.awaitingAttendance = true;
   ctx.session.awaitingWeeklyAttendance = false;
   ctx.session.weeklyAttendanceDates = [];
   ctx.session.weeklyAttendanceIndex = 0;
   ctx.session.weeklyAttendanceResults = [];
   ctx.session.weeklyAttendanceEntries = [];
+  ctx.session.weeklyAttendanceFlowId = null;
   const date = new Date();
+  const promptId = newAttendancePromptId();
   const message = buildTodayAttendancePromptMessage(
     config,
     date,
@@ -2506,7 +2723,9 @@ async function askAttendance(ctx, config, user = null, cache = null) {
       0,
       "home:pick:attendance",
       "home:attendance:page",
-      "home:main"
+      "home:main",
+      [],
+      { promptId }
     )
   );
   const messageId = getMessageId(promptMessage) ??
@@ -2519,12 +2738,13 @@ async function askAttendance(ctx, config, user = null, cache = null) {
     weeklyAttendanceIndex: 0,
     weeklyAttendanceResults: [],
     weeklyAttendanceEntries: [],
+    weeklyAttendanceFlowId: null,
     promptedAt: new Date().toISOString(),
     attendancePromptMessageIds: appendAttendancePromptMessageId(user, messageId)
   });
 }
 
-function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config, user) {
+function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config, user, flowId = "expired") {
   const appointment = user?.appointment;
   const dayLines = weeklyDates.map((dateValue) => {
     const date = new Date(dateValue);
@@ -2556,7 +2776,7 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
     const staged = getStagedAttendanceStatus(weeklyEntries, dateValue, (v) => toIsoDateString(v, config.timezone));
     const cached = appointment ? getCachedAttendanceStatus(cache, config, appointment, date) : "";
     const status = staged || cached || "—";
-    return Markup.button.callback(`${shortLabel}: ${status}`, `home:week:day:${isoDate}`);
+    return Markup.button.callback(`${shortLabel}: ${status}`, `home:week:day:${flowId}:${isoDate}`);
   });
 
   const rows = [];
@@ -2568,7 +2788,7 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
   const weekId = weeklyDates[0]
     ? toIsoDateString(new Date(weeklyDates[0]), config.timezone)
     : "expired";
-  rows.push([Markup.button.callback("✅ Submit", `home:week:submit:${weekId}`)]);
+  rows.push([Markup.button.callback("✅ Submit", `home:week:submit:${flowId}:${weekId}`)]);
   rows.push([
     Markup.button.callback("🔙 Back", "home:main"),
     Markup.button.callback("❌ Close", "home:close")
@@ -2580,6 +2800,10 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
 async function showWeeklyAttendanceOverview(ctx, config, user, cache) {
   const weeklyState = getWeeklyAttendanceState(ctx, user);
 
+  if (weeklyState.dates.length > 0 && !weeklyState.flowId) {
+    weeklyState.flowId = randomBytes(8).toString("base64url");
+  }
+
   if (weeklyState.dates.length > 0) {
     restoreWeeklyAttendanceSession(ctx, weeklyState);
   }
@@ -2589,13 +2813,17 @@ async function showWeeklyAttendanceOverview(ctx, config, user, cache) {
     weeklyState.entries,
     cache,
     config,
-    user
+    user,
+    weeklyState.flowId
   );
   const promptMessage = await sendOrUpdateAdminMessage(ctx, message, keyboard);
   const messageId = getMessageId(promptMessage) ??
     getMessageId(ctx.callbackQuery?.message);
   const latestUser = await getUserByChatId(ctx.chat.id);
   await updateUserByChatId(ctx.chat.id, {
+    ...(weeklyState.dates.length > 0
+      ? { weeklyAttendanceFlowId: weeklyState.flowId }
+      : {}),
     weeklyPromptMessageIds: appendAttendancePromptMessageId(
       { attendancePromptMessageIds: latestUser?.weeklyPromptMessageIds },
       messageId
@@ -2640,10 +2868,10 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
       config,
       date,
       page,
-      "home:pick:week",
-      "home:week:page",
-      `home:week:overview:${toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)}`,
-      [[Markup.button.callback(WEEK_SKIP_LABEL, `home:pick:week:${isoDate}:skip`)]]
+      `home:pick:week:${weeklyState.flowId}`,
+      `home:week:page:${weeklyState.flowId}`,
+      `home:week:overview:${weeklyState.flowId}:${toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)}`,
+      [[Markup.button.callback(WEEK_SKIP_LABEL, `home:pick:week:${weeklyState.flowId}:${isoDate}:skip`)]]
     )
   );
   const messageId = getMessageId(promptMessage) ??
@@ -2691,6 +2919,7 @@ async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
 }
 
 async function startWeeklyAttendanceFlow(ctx, config, sheets, user, cache, weekOffset = 0) {
+  cancelInteractions(ctx);
   const weeklyState = createWeeklyFlowState(getWorkweekDates(config.timezone, weekOffset));
 
   ctx.session.awaitingAttendance = false;
@@ -2699,10 +2928,12 @@ async function startWeeklyAttendanceFlow(ctx, config, sheets, user, cache, weekO
   ctx.session.weeklyAttendanceIndex = weeklyState.weeklyAttendanceIndex;
   ctx.session.weeklyAttendanceResults = weeklyState.weeklyAttendanceResults;
   ctx.session.weeklyAttendanceEntries = weeklyState.weeklyAttendanceEntries;
+  ctx.session.weeklyAttendanceFlowId = randomBytes(8).toString("base64url");
 
   await updateUserByChatId(ctx.chat.id, {
     awaitingAttendance: false,
-    ...weeklyState
+    ...weeklyState,
+    weeklyAttendanceFlowId: ctx.session.weeklyAttendanceFlowId
   });
 
   await autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache);
@@ -2828,12 +3059,13 @@ async function renderDepartmentView(ctx, config, cache, viewer, options = {}) {
   return viewModel;
 }
 
-async function queueAttendanceSelection(cache, config, appointment, status, date, source) {
+async function queueAttendanceSelection(cache, config, appointment, status, date, source, idempotencyKey = null) {
   const queuedEntry = {
     appointment,
     status,
     date,
     source,
+    idempotencyKey,
     ...buildQueuedAttendanceEventMetadata(cache.sheetSnapshots, config, {
       appointment,
       status,
@@ -2842,6 +3074,11 @@ async function queueAttendanceSelection(cache, config, appointment, status, date
   };
 
   await enqueueAttendanceEvent(config, queuedEntry);
+  runWithBackgroundPriority(() =>
+    triggerAttendanceQueueThresholdFlush(cache)
+  ).catch((error) => {
+    logBotError("Threshold attendance flush check failed.", { error: error.message });
+  });
 
   if (cache.sheetSnapshots) {
     cache.sheetSnapshots = applyAttendanceEntriesToSnapshotBundle(
@@ -2854,6 +3091,28 @@ async function queueAttendanceSelection(cache, config, appointment, status, date
   }
 
   return queuedEntry;
+}
+
+async function triggerAttendanceQueueThresholdFlush(cache, deps = {}) {
+  const listPendingAttendanceEventsFn =
+    deps.listPendingAttendanceEventsFn ?? listPendingAttendanceEvents;
+  const pendingEvents = await listPendingAttendanceEventsFn();
+
+  if (pendingEvents.length < ATTENDANCE_QUEUE_FLUSH_THRESHOLD) {
+    return false;
+  }
+
+  const syncManager = cache?.syncManager;
+  if (!syncManager) {
+    return false;
+  }
+
+  await syncManager.runCycle({
+    force: true,
+    flushQueue: true,
+    reason: "queue-threshold"
+  });
+  return true;
 }
 
 function buildRegistrySheetReconciliationOptions(registry) {
@@ -2902,7 +3161,7 @@ async function syncRosterState(sheets, config) {
 
 async function preloadSheetSnapshots(sheets, config, cache, options = {}) {
   const snapshotBundle = await preloadAttendanceSnapshots(sheets, config, options);
-  const pendingEvents = await listPendingAttendanceEvents();
+  const pendingEvents = await listUnresolvedAttendanceEvents();
   const pendingEntries = pendingEvents.map((event) => ({
     appointment: event.appointment,
     status: event.status,
@@ -2946,39 +3205,71 @@ async function refreshAdminCache(cache, config) {
   for (const entry of registry.appointments) {
     if (!entry.active) continue;
     activeCodes.push(entry);
-    const label = { label: entry.appointment, appointment: entry.appointment };
+    const boundFullName = entry.boundFullName || null;
+    const boundChatId = entry.boundChatId || null;
+    const label = {
+      label: boundFullName
+        ? `${entry.appointment} — ${boundFullName}`
+        : entry.appointment,
+      appointment: entry.appointment,
+      stateIdentity: getAppointmentStateIdentity(entry),
+      boundFullName,
+      boundChatId
+    };
     removeAppointmentCandidates.push(label);
     if (entry.boundChatId) {
-      const bindingIdentity =
-        `${entry.appointment}\u0000${String(entry.boundChatId)}`;
+      const bindingIdentity = getAppointmentBindingIdentity(entry);
       deregisterCandidates.push({ ...label, bindingIdentity });
       transferFromCandidates.push({
-        label: entry.boundFullName
-          ? `${entry.appointment} — ${entry.boundFullName}`
+        label: boundFullName
+          ? `${entry.appointment} — ${boundFullName}`
           : entry.appointment,
         appointment: entry.appointment,
-        bindingIdentity
+        bindingIdentity,
+        boundFullName,
+        boundChatId
       });
       if (isChiefAppointment(entry.appointment) && !adminAppointmentSet.has(entry.appointment.toUpperCase())) {
         chiefAdmins.push({ appointment: entry.appointment, source: "chief" });
       }
     } else {
       pending.push(entry);
-      inviteCandidates.push(label);
+      inviteCandidates.push({ ...label, expectedStateIdentity: getAppointmentStateIdentity(entry) });
       transferToCandidates.push(label);
     }
   }
 
   const allAdmins = [...admins, ...chiefAdmins];
   const adminSet = new Set(allAdmins.map((e) => e.appointment.toUpperCase()));
+  const activeCodeByAppointment = new Map(
+    activeCodes.map((entry) => [entry.appointment.toUpperCase(), entry])
+  );
 
   // Chiefs are already admins — exclude them from the "add admin" list.
   const addAdminCandidates = activeCodes
     .filter((entry) => !adminSet.has(entry.appointment.toUpperCase()))
-    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
+    .map((entry) => ({
+      label: entry.boundFullName
+        ? `${entry.appointment} — ${entry.boundFullName}`
+        : entry.appointment,
+      appointment: entry.appointment,
+      bindingIdentity: getAppointmentBindingIdentity(entry),
+      boundFullName: entry.boundFullName || null,
+      boundChatId: entry.boundChatId || null
+    }));
   const removeAdminCandidates = allAdmins
     .filter((entry) => entry.source === "custom")
-    .map((entry) => ({ label: entry.appointment, appointment: entry.appointment }));
+    .map((entry) => {
+      const target = activeCodeByAppointment.get(entry.appointment.toUpperCase());
+      return {
+        label: target?.boundFullName
+          ? `${entry.appointment} — ${target.boundFullName}`
+          : entry.appointment,
+        appointment: entry.appointment,
+        bindingIdentity: getAppointmentBindingIdentity(target),
+        boundFullName: target?.boundFullName || null
+      };
+    });
 
   cache.activeCodes = activeCodes;
   cache.pending = pending;
@@ -3029,7 +3320,9 @@ async function ensureSheetReadiness(sheets, config, cache, options = {}) {
 
   if (!force) {
     if (!syncStatus.cycleInProgress) {
-      cache.syncManager.runCycle({ force: false, reason: "background" }).catch((error) => {
+      runWithBackgroundPriority(() =>
+        cache.syncManager.runCycle({ force: false, reason: "background" })
+      ).catch((error) => {
         logBotError("Background sync refresh failed.", { error: error.message });
       });
     }
@@ -3053,21 +3346,34 @@ function triggerBackgroundSheetRefresh(cache, reason = "background") {
     return false;
   }
 
-  syncManager.runCycle({ force: false, reason }).catch((error) => {
+  runWithBackgroundPriority(() =>
+    syncManager.runCycle({ force: false, reason })
+  ).catch((error) => {
     console.error("Background sync refresh failed:", error);
   });
   return true;
 }
 
 async function applyAttendanceOptionChange(sheets, config, cache, nextOptions) {
-  await withSheetOperation(async () => {
-    config.attendanceOptions = nextOptions;
+  return withSheetOperation(async () => {
     await setAttendanceOptions(nextOptions);
+    config.attendanceOptions = nextOptions;
     // syncRosterState → syncOnboardingRoster already handles prev/current/next months.
     // ensureNextMonthSheetExists is intentionally omitted — it would duplicate the sync.
-    await syncRosterState(sheets, config);
-    await refreshAdminCache(cache, config);
-    await preloadSheetSnapshots(sheets, config, cache, { force: true });
+    try {
+      await syncRosterState(sheets, config);
+      await refreshAdminCache(cache, config);
+      await preloadSheetSnapshots(sheets, config, cache, { force: true });
+      return { ok: true, syncPending: false };
+    } catch (error) {
+      cache.sheetSnapshots = null;
+      cache.summaryMemoVersion = null;
+      await refreshAdminCache(cache, config).catch(() => {});
+      logBotWarn("Attendance options were saved locally but Sheet sync is pending.", {
+        error: error.message
+      });
+      return { ok: true, syncPending: true };
+    }
   });
 }
 
@@ -3079,45 +3385,67 @@ async function addManagedAppointment(sheets, config, cache, appointment) {
       return registryResult;
     }
 
-    const sheetAppointments = await addAppointmentToSheets(
-      sheets,
-      config,
-      registryResult.appointment
-    );
-    const registry = await syncAppointmentRegistry(sheetAppointments);
-    await syncOnboardingCodeColumn(
-      sheets,
-      config,
-      registry.appointments.filter((entry) => entry.active)
-    );
-    await refreshAdminCache(cache, config);
-    await preloadSheetSnapshots(sheets, config, cache, { force: true });
-    return registryResult;
+    try {
+      const sheetAppointments = await addAppointmentToSheets(
+        sheets,
+        config,
+        registryResult.appointment
+      );
+      const registry = await syncAppointmentRegistry(sheetAppointments);
+      await syncOnboardingCodeColumn(
+        sheets,
+        config,
+        registry.appointments.filter((entry) => entry.active)
+      );
+      await refreshAdminCache(cache, config);
+      await preloadSheetSnapshots(sheets, config, cache, { force: true });
+      return { ...registryResult, syncPending: false };
+    } catch (error) {
+      cache.sheetSnapshots = null;
+      cache.summaryMemoVersion = null;
+      await refreshAdminCache(cache, config).catch(() => {});
+      logBotWarn("Appointment was added locally but Sheet sync is pending.", {
+        appointment: registryResult.appointment,
+        error: error.message
+      });
+      return { ...registryResult, syncPending: true };
+    }
   });
 }
 
-async function removeManagedAppointment(sheets, config, cache, appointment) {
+async function removeManagedAppointment(sheets, config, cache, appointment, options = {}) {
   return withSheetOperation(async () => {
-    const registryResult = await removeAppointmentFromRegistry(appointment);
+    const registryResult = await removeAppointmentFromRegistry(appointment, options);
 
     if (!registryResult.ok) {
       return registryResult;
     }
 
-    const sheetAppointments = await removeAppointmentFromSheets(
-      sheets,
-      config,
-      registryResult.appointment
-    );
-    const registry = await syncAppointmentRegistry(sheetAppointments);
-    await syncOnboardingCodeColumn(
-      sheets,
-      config,
-      registry.appointments.filter((entry) => entry.active)
-    );
-    await refreshAdminCache(cache, config);
-    await preloadSheetSnapshots(sheets, config, cache, { force: true });
-    return registryResult;
+    try {
+      const sheetAppointments = await removeAppointmentFromSheets(
+        sheets,
+        config,
+        registryResult.appointment
+      );
+      const registry = await syncAppointmentRegistry(sheetAppointments);
+      await syncOnboardingCodeColumn(
+        sheets,
+        config,
+        registry.appointments.filter((entry) => entry.active)
+      );
+      await refreshAdminCache(cache, config);
+      await preloadSheetSnapshots(sheets, config, cache, { force: true });
+      return { ...registryResult, syncPending: false };
+    } catch (error) {
+      cache.sheetSnapshots = null;
+      cache.summaryMemoVersion = null;
+      await refreshAdminCache(cache, config).catch(() => {});
+      logBotWarn("Appointment removal was saved locally but Sheet sync is pending.", {
+        appointment: registryResult.appointment,
+        error: error.message
+      });
+      return { ...registryResult, syncPending: true };
+    }
   });
 }
 
@@ -3161,8 +3489,10 @@ async function renderCodesSubmenu(ctx, cache) {
 
   const items = pending.map((entry) => ({
     label: entry.appointment,
-    appointment: entry.appointment
+    appointment: entry.appointment,
+    expectedStateIdentity: getAppointmentStateIdentity(entry)
   }));
+  const interaction = beginSelectionInteraction(ctx, "admin-code", items);
 
   await sendOrUpdateAdminMessage(
     ctx,
@@ -3172,7 +3502,8 @@ async function renderCodesSubmenu(ctx, cache) {
       0,
       "admin:pick:code",
       "admin:menu:codes",
-      "admin:main"
+      "admin:main",
+      { itemTokenBuilder: (_item, index) => `${interaction.id}:${index}` }
     )
   );
 }
@@ -3187,8 +3518,10 @@ async function renderCodesSubmenuPage(ctx, cache, page) {
 
   const items = pending.map((entry) => ({
     label: entry.appointment,
-    appointment: entry.appointment
+    appointment: entry.appointment,
+    expectedStateIdentity: getAppointmentStateIdentity(entry)
   }));
+  const interaction = beginSelectionInteraction(ctx, "admin-code", items);
 
   await sendOrUpdateAdminMessage(
     ctx,
@@ -3198,7 +3531,8 @@ async function renderCodesSubmenuPage(ctx, cache, page) {
       page,
       "admin:pick:code",
       "admin:menu:codes",
-      "admin:main"
+      "admin:main",
+      { itemTokenBuilder: (_item, index) => `${interaction.id}:${index}` }
     )
   );
 }
@@ -3220,6 +3554,7 @@ async function renderAddAdminSubmenu(ctx, cache, page = 0) {
     return;
   }
 
+  const interaction = beginSelectionInteraction(ctx, "admin-add-admin", candidates);
   await sendOrUpdateAdminMessage(
     ctx,
     "Select an appointment to grant admin access.",
@@ -3228,7 +3563,8 @@ async function renderAddAdminSubmenu(ctx, cache, page = 0) {
       page,
       "admin:pick:addadmin",
       "admin:menu:addadmin",
-      "admin:menu:admins"
+      "admin:menu:admins",
+      { itemTokenBuilder: (_item, index) => `${interaction.id}:${index}` }
     )
   );
 }
@@ -3250,6 +3586,7 @@ async function renderRemoveAdminSubmenu(ctx, cache, page = 0) {
     return;
   }
 
+  const interaction = beginSelectionInteraction(ctx, "admin-remove-admin", candidates);
   await sendOrUpdateAdminMessage(
     ctx,
     "Select a custom admin to remove.",
@@ -3259,7 +3596,7 @@ async function renderRemoveAdminSubmenu(ctx, cache, page = 0) {
       "admin:pick:removeadmin",
       "admin:menu:removeadmin",
       "admin:menu:admins",
-      { itemTokenBuilder: fingerprintedSelectionToken }
+      { itemTokenBuilder: (_item, index) => `${interaction.id}:${index}` }
     )
   );
 }
@@ -3281,6 +3618,7 @@ async function renderInviteSubmenu(ctx, cache, page = 0) {
     return;
   }
 
+  const interaction = beginSelectionInteraction(ctx, "admin-invite", candidates);
   await sendOrUpdateAdminMessage(
     ctx,
     buildInvitationAdminDescription(candidates.length),
@@ -3289,7 +3627,8 @@ async function renderInviteSubmenu(ctx, cache, page = 0) {
       page,
       "admin:pick:invite",
       "admin:menu:invite",
-      "admin:main"
+      "admin:main",
+      { itemTokenBuilder: (_item, index) => `${interaction.id}:${index}` }
     )
   );
 }
@@ -3311,6 +3650,7 @@ async function renderDeregisterSubmenu(ctx, cache, page = 0) {
     return;
   }
 
+  const interaction = beginSelectionInteraction(ctx, "admin-deregister", candidates);
   await sendOrUpdateAdminMessage(
     ctx,
     "Select a person to deregister. This removes their Telegram binding and rotates their registration code.",
@@ -3320,10 +3660,7 @@ async function renderDeregisterSubmenu(ctx, cache, page = 0) {
       "admin:pick:deregister",
       "admin:menu:deregister",
       "admin:main",
-      {
-        itemTokenBuilder: (item, index) =>
-          fingerprintedSelectionToken(item, index, "bindingIdentity")
-      }
+      { itemTokenBuilder: (_item, index) => `${interaction.id}:${index}` }
     )
   );
 }
@@ -3340,6 +3677,7 @@ async function renderRemoveAppointmentSubmenu(ctx, cache, page = 0) {
     return;
   }
 
+  const interaction = beginSelectionInteraction(ctx, "admin-remove-appointment", candidates);
   await sendOrUpdateAdminMessage(
     ctx,
     "Select an appointment to remove from the active roster.",
@@ -3349,7 +3687,7 @@ async function renderRemoveAppointmentSubmenu(ctx, cache, page = 0) {
       "admin:pick:appointmentremove",
       "admin:menu:appointments:remove",
       "admin:menu:roster",
-      { itemTokenBuilder: fingerprintedSelectionToken }
+      { itemTokenBuilder: (_item, index) => `${interaction.id}:${index}` }
     )
   );
 }
@@ -3425,6 +3763,92 @@ async function renderTransferToSubmenu(ctx, cache, fromIdx, fromFingerprint, pag
     ),
     { parse_mode: "HTML" }
   );
+}
+
+function isAttendanceTransferBlocked(results) {
+  return results.some(
+    (entry) =>
+      entry.conflict ||
+      entry.skipped ||
+      !entry.transferred
+  );
+}
+
+function isAttendanceTransferCleanupBlocked(results) {
+  return results.length === 0 || results.some(
+    (entry) => entry.conflict || entry.skipped || !entry.transferred
+  );
+}
+
+function formatAttendanceTransferBlockedMessage(results, toAppointment) {
+  const conflicts = results.filter(
+    (entry) => entry.reason === "destination_has_attendance"
+  );
+  const structuralFailures = results.filter((entry) =>
+    [
+      "empty_sheet",
+      "from_row_not_found",
+      "to_row_not_found",
+      "duplicate_appointment_row",
+      "no_date_columns"
+    ].includes(entry.reason)
+  );
+  const lines = [
+    "Transfer stopped safely. No binding or attendance was changed."
+  ];
+
+  for (const entry of conflicts) {
+    const dates = entry.conflictingDates?.length > 0
+      ? ` on ${entry.conflictingDates.join(", ")}`
+      : "";
+    lines.push(
+      `${entry.title}: ${toAppointment} already has different attendance${dates}.`
+    );
+  }
+
+  const structuralReasonMessages = {
+    empty_sheet: "the monthly sheet is empty",
+    from_row_not_found: "the source appointment row is missing",
+    to_row_not_found: "the destination appointment row is missing",
+    duplicate_appointment_row: "the appointment appears more than once",
+    no_date_columns: "the monthly sheet has no attendance date columns"
+  };
+
+  for (const entry of structuralFailures) {
+    lines.push(`${entry.title}: ${structuralReasonMessages[entry.reason]}.`);
+  }
+
+  lines.push(
+    "All managed months are transferred together, so the other months were left unchanged."
+  );
+
+  if (conflicts.length > 0) {
+    lines.push("Review the destination cells in Google Sheets, then retry the transfer.");
+  } else {
+    lines.push("Run Sync Roster to repair the monthly rows, then retry the transfer.");
+  }
+
+  return lines.join("\n");
+}
+
+function formatAppointmentTransferFailure(result, toAppointment) {
+  const messages = {
+    from_not_found: "The source appointment is no longer active.",
+    from_not_bound: "The source appointment is no longer bound to a user.",
+    from_binding_changed:
+      "The source binding changed after this transfer menu was opened.",
+    to_not_found: "The destination appointment is no longer active.",
+    to_already_bound:
+      `${toAppointment} is already bound to a user and cannot be used as the destination.`,
+    attendance_transfer_recovery_required:
+      "Another attendance transfer requires recovery before a new transfer can begin."
+  };
+
+  return [
+    "Transfer menu expired. No binding or attendance was changed.",
+    messages[result.reason] || "The selected appointments are no longer available for transfer.",
+    "Reopen Transfer and choose from the current list."
+  ].join("\n");
 }
 
 async function renderAttendanceOptionsMenu(ctx, config) {
@@ -3504,34 +3928,43 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
     // Telegraf kills any action/command handler Promise at 90s; awaiting would
     // cause every sync to appear as a failure even when it ultimately succeeds.
     // The sync sends its own completion message via ctx when it finishes.
-    handleSyncRosterAdminAction(ctx, config, {
+    runWithBackgroundPriority(() => handleSyncRosterAdminAction(ctx, config, {
       syncRosterState,
       refreshAdminCache,
       preloadSheetSnapshots,
       resetConflictedQueueEntries,
       sendOrUpdateAdminMessage,
+      sendCompletionMessage: (_ctx, message, replyMarkup, extraOptions) =>
+        sendBackgroundBotMessage(
+          bot,
+          ctx.chat.id,
+          message,
+          replyMarkup,
+          extraOptions
+        ),
       sheets,
       cache
-    }).catch((error) => {
+    })).catch((error) => {
       logBotError("[Admin] Roster sync error (unhandled).", { error: error.message });
     });
     return;
   }
 
   if (action === "clearprotections") {
-    // Fire-and-forget: may take several seconds if there are many protections.
-    handleClearProtectionsAdminAction(ctx, config, {
-      clearAllSheetProtections,
-      sendOrUpdateAdminMessage,
-      sheets
-    }).catch((error) => {
-      logBotError("[Admin] Clear protections error (unhandled).", { error: error.message });
-    });
+    const confirmation = beginInteraction(ctx, "clear-protections", { confirm: {} }, { ttlMs: 2 * 60 * 1000 });
+    await sendOrUpdateAdminMessage(
+      ctx,
+      "Clear protections from every managed sheet? This can expose attendance cells to accidental edits.",
+      Markup.inlineKeyboard([[
+        Markup.button.callback("✅ Clear Protections", `admin:confirm:clearprotections:${confirmation.id}`),
+        Markup.button.callback("↩️ Cancel", "admin:main")
+      ]])
+    );
     return;
   }
 
   if (action === "changespreadsheet") {
-    ctx.session.awaitingSpreadsheetIdChange = true;
+      beginTextInput(ctx, "spreadsheet", { ttlMs: 10 * 60 * 1000 });
     await sendOrUpdateAdminMessage(
       ctx,
       [
@@ -3553,7 +3986,7 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
   }
 
   if (action === "changespreadsheet:cancel") {
-    ctx.session.awaitingSpreadsheetIdChange = false;
+    cancelInteractions(ctx);
     await sendOrUpdateAdminMessage(ctx, buildRosterDescription(), buildAdminRosterMenu());
     return;
   }
@@ -3570,15 +4003,23 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
 
   if (action === "flushqueue") {
     // Fire-and-forget: flush can take tens of seconds; Telegraf 90 s limit would kill it.
-    handleFlushAttendanceAdminAction(ctx, config, {
+    runWithBackgroundPriority(() => handleFlushAttendanceAdminAction(ctx, config, {
       getAttendanceQueueStatus,
       flushAttendanceQueue,
       reconcilePendingAttendanceWithSheets,
       preloadSheetSnapshots,
       sendOrUpdateAdminMessage,
+      sendCompletionMessage: (_ctx, message, replyMarkup, extraOptions) =>
+        sendBackgroundBotMessage(
+          bot,
+          ctx.chat.id,
+          message,
+          replyMarkup,
+          extraOptions
+        ),
       sheets,
       cache
-    }).catch((error) => {
+    })).catch((error) => {
       logBotError("Background attendance flush error.", { error: error.message });
     });
     return;
@@ -3595,7 +4036,19 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
   }
 
   if (action === "promptall") {
-    await ensureSheetReadiness(sheets, config, cache);
+    const confirmation = beginInteraction(ctx, "prompt-all", { confirm: {} }, { ttlMs: 2 * 60 * 1000 });
+    await sendOrUpdateAdminMessage(
+      ctx,
+      "Send an attendance prompt to every currently bound user?",
+      Markup.inlineKeyboard([[
+        Markup.button.callback("✅ Prompt All", `admin:confirm:promptall:${confirmation.id}`),
+        Markup.button.callback("↩️ Cancel", "admin:main")
+      ]])
+    );
+    return;
+  }
+
+  if (action === "promptall:execute") {
     const users = (await listUsers()).filter((user) => user.appointment);
 
     if (users.length === 0) {
@@ -3610,64 +4063,81 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       return;
     }
 
-    const broadcastStartedAt = Date.now();
-    const broadcastStartedAtIso = new Date(broadcastStartedAt).toISOString();
-    const broadcastContext = buildAttendancePromptBroadcastContext(config);
-    const promptResults = await allSettledConcurrent(
-      users.map((user) => (signal) =>
-        buildAndSendAttendancePrompt(
-          bot,
-          config,
-          user,
-          cache,
-          broadcastContext,
-          signal
-        )
-      ),
-      TELEGRAM_SEND_CONCURRENCY
-    );
-    const sent = promptResults.filter((r) => r.status === "fulfilled").length;
-    logAttendancePromptBroadcast("manual", broadcastStartedAt, promptResults);
+      const initiatingChatId = ctx.chat.id;
+      const queuedPromptJob = enqueueAttendancePromptBroadcast(() =>
+      runWithBackgroundPriority(async () => {
+        const currentUsers = (await listUsers()).filter((user) => user.appointment);
+        const broadcastStartedAt = Date.now();
+        const broadcastStartedAtIso = new Date(broadcastStartedAt).toISOString();
+        const broadcastContext = buildAttendancePromptBroadcastContext(config);
+        // Warm-cache refreshes are nonessential for Prompt All and will defer
+        // while this broadcast is active. Local queue/cache data remains usable.
+        await ensureSheetReadiness(sheets, config, cache);
+        const promptResults = await allSettledConcurrent(
+          currentUsers.map((user) => (signal) =>
+            buildAndSendAttendancePrompt(
+              bot,
+              config,
+              user,
+              cache,
+              broadcastContext,
+              signal
+            )
+          ),
+          TELEGRAM_SEND_CONCURRENCY
+        );
+        const sent = promptResults.filter((result) => result.status === "fulfilled").length;
+        logAttendancePromptBroadcast("manual", broadcastStartedAt, promptResults);
 
-    const promptedAt = new Date().toISOString();
-    const patches = [];
-
-    for (let i = 0; i < promptResults.length; i++) {
-      if (promptResults[i].status === "fulfilled") {
-        const {
-          chatId,
-          awaitingAttendance,
-          attendancePromptMessageIds
-        } = promptResults[i].value;
-        patches.push({
-          chatId,
-          expectedAppointment: users[i].appointment,
-          notSubmittedAfter: broadcastStartedAtIso,
-          notPromptedAfter: broadcastStartedAtIso,
-          patch: {
-            awaitingAttendance,
-            attendancePromptMessageIds,
-            promptedAt
+        const promptedAt = new Date().toISOString();
+        const patches = [];
+        for (let index = 0; index < promptResults.length; index += 1) {
+          if (promptResults[index].status === "fulfilled") {
+            const result = promptResults[index].value;
+            patches.push({
+              chatId: result.chatId,
+              expectedAppointment: currentUsers[index].appointment,
+              notSubmittedAfter: broadcastStartedAtIso,
+              notPromptedAfter: broadcastStartedAtIso,
+              patch: {
+                awaitingAttendance: result.awaitingAttendance,
+                attendancePromptMessageIds: result.attendancePromptMessageIds,
+                promptedAt
+              }
+            });
+          } else {
+            logBotError("Failed to send prompt.", {
+              recipientIndex: index,
+              error: promptResults[index].reason?.message
+            });
           }
-        });
-      } else {
-        logBotError("Failed to send prompt.", {
-          recipientIndex: i,
-          error: promptResults[i].reason?.message
-        });
-      }
-    }
+        }
 
-    await batchUpdateUsersByChatId(patches);
+        await batchUpdateUsersByChatId(patches);
+        await sendBackgroundBotMessage(
+          bot,
+          initiatingChatId,
+          `Attendance prompt delivery complete: ${sent}/${currentUsers.length} sent.`,
+          Markup.inlineKeyboard([[
+            Markup.button.callback("🔙 Back", "admin:main"),
+            Markup.button.callback("❌ Close", "admin:close")
+          ]])
+        );
+      })
+    );
 
     await sendOrUpdateAdminMessage(
       ctx,
-      `Attendance prompt sent to ${sent} bound user(s).`,
+      `${queuedPromptJob.wasQueued ? "Queued" : "Sending"} attendance prompts to ${users.length} bound user(s) in the background. You can continue using the bot.`,
       Markup.inlineKeyboard([[
         Markup.button.callback("🔙 Back", "admin:main"),
         Markup.button.callback("❌ Close", "admin:close")
       ]])
     );
+
+    void queuedPromptJob.completion.catch((error) => {
+      logBotError("Background Prompt All failed.", { error: error.message });
+    });
     return;
   }
 
@@ -3755,10 +4225,12 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
 // so that bulk sends can batch all writes into a single storage operation.
 function buildAttendancePromptBroadcastContext(config, date = new Date()) {
   const dateLabel = formatAttendanceDateLabel(date, config.timezone);
+  const promptId = newAttendancePromptId();
 
   return {
     date,
     dateLabel,
+    promptId,
     emptyStatusMessage:
       `You have not updated your attendance for ${dateLabel}. ` +
       `Select your attendance for ${dateLabel}.`,
@@ -3768,7 +4240,9 @@ function buildAttendancePromptBroadcastContext(config, date = new Date()) {
       0,
       "home:pick:attendance",
       "home:attendance:page",
-      "home:main"
+      "home:main",
+      [],
+      { promptId }
     )
   };
 }
@@ -4289,6 +4763,7 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
     Markup.button.callback("🔙 Back", "admin:main"),
     Markup.button.callback("❌ Close", "admin:close")
   ]]);
+  const sendCompletionMessage = deps.sendCompletionMessage ?? deps.sendOrUpdateAdminMessage;
 
   if (rosterSyncInProgress) {
     await deps.sendOrUpdateAdminMessage(
@@ -4320,7 +4795,7 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
 
     if (roster.driftDetected) {
       logBot("[Admin] Roster sync: drift detected in ONBOARDING sheet — halted.");
-      await deps.sendOrUpdateAdminMessage(
+      await sendCompletionMessage(
         ctx,
         "⚠️ Roster sync halted: the ONBOARDING sheet has structural issues (blank rows, duplicate appointments, or an inline STOP marker). Please fix the ONBOARDING sheet and run Sync Roster again.",
         adminBackMenu
@@ -4382,10 +4857,10 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
       summaryLines.push(`\n⚠️ ${resetResult.resetCount} previously stuck attendance ${resetResult.resetCount === 1 ? "entry" : "entries"} re-queued for retry.`);
     }
 
-    await deps.sendOrUpdateAdminMessage(ctx, summaryLines.join("\n"), adminBackMenu);
+    await sendCompletionMessage(ctx, summaryLines.join("\n"), adminBackMenu);
   } catch (error) {
     logBotError("[Admin] Roster sync failed.", { error: error.message });
-    await deps.sendOrUpdateAdminMessage(
+    await sendCompletionMessage(
       ctx,
       `❌ Roster sync failed: ${error.message}`,
       adminBackMenu
@@ -4401,6 +4876,7 @@ async function handleClearProtectionsAdminAction(ctx, config, deps) {
     Markup.button.callback("🔙 Back", "admin:main"),
     Markup.button.callback("❌ Close", "admin:close")
   ]]);
+  const sendCompletionMessage = deps.sendCompletionMessage ?? deps.sendOrUpdateAdminMessage;
   logBot("[Admin] Clear all protections started.");
   await deps.sendOrUpdateAdminMessage(
     ctx,
@@ -4410,7 +4886,7 @@ async function handleClearProtectionsAdminAction(ctx, config, deps) {
   try {
     const { removedCount } = await deps.clearAllSheetProtections(deps.sheets, config.spreadsheetId);
     logBot("[Admin] Clear all protections complete.", { removedCount });
-    await deps.sendOrUpdateAdminMessage(
+    await sendCompletionMessage(
       ctx,
       removedCount === 0
         ? "✅ No protections found — the spreadsheet is already unprotected."
@@ -4419,7 +4895,7 @@ async function handleClearProtectionsAdminAction(ctx, config, deps) {
     );
   } catch (error) {
     logBotError("[Admin] Clear all protections failed.", { error: error.message });
-    await deps.sendOrUpdateAdminMessage(
+    await sendCompletionMessage(
       ctx,
       `❌ Failed to clear protections: ${error.message}`,
       adminBackMenu
@@ -4433,6 +4909,7 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
     Markup.button.callback("🔙 Back", "admin:main"),
     Markup.button.callback("❌ Close", "admin:close")
   ]]);
+  const sendCompletionMessage = deps.sendCompletionMessage ?? deps.sendOrUpdateAdminMessage;
   const status = await deps.getAttendanceQueueStatus();
 
   if (status.queueDepth === 0) {
@@ -4443,7 +4920,7 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
     if (status.permanentlyFailedCount > 0) {
       notes.push(`❌ ${status.permanentlyFailedCount} attendance ${status.permanentlyFailedCount === 1 ? "entry" : "entries"} permanently failed after exhausting retries and cannot be recovered automatically. Check the logs for details.`);
     }
-    await deps.sendOrUpdateAdminMessage(
+    await sendCompletionMessage(
       ctx,
       `✅ No pending attendance entries to push.${notes.length > 0 ? `\n\n${notes.join("\n\n")}` : ""}`,
       adminBackMenu
@@ -4496,10 +4973,10 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
       parts.push("✅ Queue flushed — no new data to write.");
     }
 
-    await deps.sendOrUpdateAdminMessage(ctx, parts.join("\n"), adminBackMenu);
+    await sendCompletionMessage(ctx, parts.join("\n"), adminBackMenu);
   } catch (error) {
     logBotError("[Admin] Attendance push failed.", { error: error.message });
-    await deps.sendOrUpdateAdminMessage(
+    await sendCompletionMessage(
       ctx,
       `❌ Push failed: ${error.message}\n\nThe queue will retry automatically in the background.`,
       adminBackMenu
@@ -4573,42 +5050,53 @@ async function handleQueueStatusAdminAction(ctx, deps) {
 
 async function handleOptionsResetAction(ctx, config, deps) {
   const timeoutMs = deps.timeoutMs ?? 8000;
+  const sendCompletionMessage = deps.sendCompletionMessage ?? deps.sendOrUpdateAdminMessage;
 
   await deps.sendOrUpdateAdminMessage(
     ctx,
     "Resetting attendance options and refreshing active sheets. This will stop early if Google Sheets is slow."
   );
 
+  await waitForInteractiveIdle();
+
+  await deps.resetAttendanceOptions();
+  config.attendanceOptions = [...config.onboardingAttendanceOptions];
+
   try {
     await withUiOperationTimeout(
       "Attendance option reset",
-      async () => {
-        await deps.resetAttendanceOptions();
-        config.attendanceOptions = [...config.onboardingAttendanceOptions];
+      async () => (deps.withSheetOperation ?? withSheetOperation)(async () => {
         // syncRosterState → syncOnboardingRoster covers prev/current/next months.
         // ensureNextMonthSheetExists omitted — it would trigger a duplicate full sync.
         await deps.syncRosterState(deps.sheets, config);
         await deps.refreshAdminCache(deps.adminCache, config);
         await deps.preloadSheetSnapshots(deps.sheets, config, deps.adminCache, { force: true });
-      },
+      }),
       timeoutMs
     );
 
-    await deps.sendOrUpdateAdminMessage(
+    await sendCompletionMessage(
       ctx,
       "Attendance options have been reset to the settings.yaml default list.",
       buildAttendanceOptionsMenu()
     );
   } catch (error) {
     if (error?.name === "UiOperationTimeoutError") {
-      await deps.sendOrUpdateAdminMessage(
+      await sendCompletionMessage(
         ctx,
-        "Attendance option reset is taking too long because Google Sheets is slow. Please try again later."
+        "Attendance options were reset locally. Google Sheets is still refreshing in the background; use Sync Roster later if needed.",
+        buildSyncPendingMenu("admin:menu:options")
       );
       return;
     }
-
-    throw error;
+    logBotWarn("Attendance options were reset locally but Sheet sync is pending.", {
+      error: error.message
+    });
+    await sendCompletionMessage(
+      ctx,
+      "Attendance options were reset locally, but Google Sheets sync is incomplete. Use Sync Roster to finish reconciliation.",
+      buildSyncPendingMenu("admin:menu:options")
+    );
   }
 }
 
@@ -4636,6 +5124,8 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         }
       : buildAndSendAttendancePrompt);
   const batchUpdateUsersByChatIdFn = deps.batchUpdateUsersByChatIdFn ?? batchUpdateUsersByChatId;
+  const cleanupExpiredAttendanceButtonsFn =
+    deps.cleanupExpiredAttendanceButtonsFn ?? cleanupExpiredAttendanceButtons;
   const runDailySheetMaintenanceFn = deps.runDailySheetMaintenanceFn ?? runDailySheetMaintenance;
   const runStartupSheetCleanupFn = deps.runStartupSheetCleanupFn ?? runStartupSheetCleanup;
 
@@ -4724,7 +5214,22 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
 
   setIntervalFn(async () => {
     try {
-      await adminCache.syncManager.runCycle({ force: true, reason: "five-minute" });
+      const result = await cleanupExpiredAttendanceButtonsFn(bot.telegram);
+
+      if (result.attempted > 0) {
+        logBot("Expired attendance confirmation buttons cleaned.", result);
+      }
+    } catch (error) {
+      logBotError("Attendance confirmation button cleanup failed.", {
+        error: error.message
+      });
+    }
+  }, 60 * 1000);
+
+  setIntervalFn(async () => {
+    let reconciliation;
+    try {
+      reconciliation = await adminCache.syncManager.runCycle({ force: true, reason: "five-minute" });
     } catch (error) {
       logBotError("Five-minute sheet reconciliation failed.", { error: error.message });
     }
@@ -4733,11 +5238,13 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
     // month sheets.  Throttled by SELF_HEAL_COOLDOWN_MS (1 hour) so healing
     // never triggers more than once per cooldown window regardless of how
     // many 5-minute cycles elapse while the divergence persists.
-    runSelfHealingCycle(sheets, config, adminCache).catch((error) => {
-      logBotError("[SelfHeal] Unhandled error in self-healing cycle.", {
-        error: error.message
+    if (reconciliation?.monthSlicesRefreshed) {
+      runSelfHealingCycle(sheets, config, adminCache).catch((error) => {
+        logBotError("[SelfHeal] Unhandled error in self-healing cycle.", {
+          error: error.message
+        });
       });
-    });
+    }
   }, 5 * 60 * 1000);
 
   // 2 AM SGT (18:00 UTC): full structural maintenance (sheet creation, row sync, layout, protections).
@@ -4810,23 +5317,41 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         }
 
         const isFirstReminder = reminderTime === config.firstReminderTime;
-        const refreshPromise = Promise.resolve()
-          .then(() =>
-            adminCache.syncManager.runCycle({ force: true, reason: "reminder" })
-          )
-          .catch((error) => {
+        const startReminderRefresh = async () => {
+          try {
+            const result = await adminCache.syncManager.runCycle({
+              force: true,
+              reason: "reminder",
+              ...(!isFirstReminder ? { essentialSnapshotRefresh: true } : {})
+            });
+            return {
+              fresh: result?.monthSlicesRefreshed === true,
+              deferred: result === null || result?.monthSlicesRefreshed === false,
+              failed: false
+            };
+          } catch (error) {
             logBotWarn(
-              `[Reminder] Sheet refresh failed before ${reminderTime} reminder — using cached data.`,
+              `[Reminder] Sheet refresh failed before ${reminderTime} reminder.`,
               { error: error.message }
             );
-          });
+            return { fresh: false, deferred: false, failed: true };
+          }
+        };
 
         // The first reminder always targets every bound user, so fresh Sheets
-        // data is not needed to choose recipients. Let synchronization continue
-        // in parallel. The second reminder must wait because it only targets
+        // data is not needed to choose recipients. Start the cycle after the
+        // broadcast activity flag is raised so its nonessential snapshot phase
+        // defers. The second reminder must refresh first because it only targets
         // people whose attendance is still unfilled.
         if (!isFirstReminder) {
-          await refreshPromise;
+          const refresh = await startReminderRefresh();
+          if (!refresh.fresh) {
+            logBotWarn(
+              `[Reminder] Skipping ${reminderTime} reminder because its essential attendance refresh was not fresh.`,
+              refresh
+            );
+            return;
+          }
         }
 
         const users = (await listUsersFn()).filter((user) => {
@@ -4846,7 +5371,7 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         const broadcastContext = usesDefaultPromptBuilder
           ? buildAttendancePromptBroadcastContext(config, now)
           : null;
-        const promptResults = await allSettledConcurrent(
+        const sendPrompts = () => allSettledConcurrent(
           users.map((user) => (signal) =>
             buildAndSendAttendancePromptFn(
               bot,
@@ -4859,6 +5384,15 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
           ),
           TELEGRAM_SEND_CONCURRENCY
         );
+        const promptJob = enqueueAttendancePromptBroadcast(() =>
+          runWithBackgroundPriority(async () => {
+            if (isFirstReminder) {
+              void startReminderRefresh();
+            }
+            return sendPrompts();
+          })
+        );
+        const promptResults = await promptJob.completion;
         logAttendancePromptBroadcast(
           `reminder:${reminderTime}`,
           broadcastStartedAt,
@@ -4901,6 +5435,176 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   }
 }
 
+async function recoverAttendanceTransferJournal({
+  journal,
+  registry,
+  sheets,
+  config,
+  transferAttendanceRowsFn = transferAttendanceRows,
+  transferAppointmentBindingFn = transferAppointmentBinding,
+  updateJournalFn = updateAttendanceTransferJournal,
+  clearJournalFn = clearAttendanceTransferJournal
+}) {
+  if (!journal) {
+    return { recovered: false, reason: "no_journal" };
+  }
+
+  if (journal.phase === "completed") {
+    await clearJournalFn(journal.id);
+    return { recovered: true, reason: "completed_journal_cleared" };
+  }
+
+  if (!["prepared", "copied", "binding_committed"].includes(journal.phase)) {
+    return { recovered: false, reason: "operator_recovery_required" };
+  }
+
+  const source = registry.appointments.find((entry) => entry.appointment === journal.fromAppointment);
+  const destination = registry.appointments.find((entry) => entry.appointment === journal.toAppointment);
+
+  if (journal.phase === "prepared" || journal.phase === "copied") {
+    const expectedBindingIdentity = journal.expectedFromBindingIdentity;
+    if (!expectedBindingIdentity) {
+      return { recovered: false, reason: "missing_binding_identity" };
+    }
+
+    // The registry commit can succeed just before the process advances the
+    // journal from copied to binding_committed. Recognize only the exact
+    // transferred identity; any other destination binding stays untouched.
+    if (
+      journal.phase === "copied" &&
+      !source?.boundChatId &&
+      hasTransferredAttendanceBindingIdentity(
+        expectedBindingIdentity,
+        destination
+      )
+    ) {
+      await updateJournalFn(journal.id, "binding_committed");
+      const cleanup = await completeAttendanceTransferCleanup({
+        journal,
+        sheets,
+        config,
+        transferAttendanceRowsFn,
+        updateJournalFn,
+        clearJournalFn
+      });
+      return cleanup.cleaned
+        ? {
+            recovered: true,
+            reason: "cleanup_completed",
+            cleanupResults: cleanup.attendanceResults
+          }
+        : {
+            recovered: false,
+            reason: "cleanup_blocked",
+            cleanupResults: cleanup.attendanceResults
+          };
+    }
+
+    if (
+      !source?.boundChatId ||
+      destination?.boundChatId ||
+      getAppointmentBindingIdentity(source) !== expectedBindingIdentity
+    ) {
+      return { recovered: false, reason: "binding_state_mismatch" };
+    }
+
+    if (journal.phase === "prepared") {
+      const copyResults = await transferAttendanceRowsFn(
+        sheets,
+        config,
+        journal.fromAppointment,
+        journal.toAppointment,
+        { phase: "copy" }
+      );
+      if (isAttendanceTransferBlocked(copyResults)) {
+        return { recovered: false, reason: "copy_blocked", copyResults };
+      }
+      await updateJournalFn(journal.id, "copied", {
+        copiedSheets: copyResults.filter((entry) => entry.transferred).map((entry) => entry.title)
+      });
+    }
+
+    const binding = await transferAppointmentBindingFn(
+      journal.fromAppointment,
+      journal.toAppointment,
+      {
+        expectedFromBindingIdentity: expectedBindingIdentity,
+        // Copy completion is durable in the journal before this point. Do not
+        // replay it while the storage lock is held; just revalidate and commit.
+        prepare: async () => ({ ok: true })
+      }
+    );
+    if (!binding.ok) {
+      return { recovered: false, reason: "binding_commit_blocked", binding };
+    }
+    await updateJournalFn(journal.id, "binding_committed");
+  }
+
+  if (source?.boundChatId || !destination?.boundChatId) {
+    // The committed phase is checked from the restart snapshot. The prepared
+    // and copied phases just committed the binding through storage above.
+    if (journal.phase === "binding_committed") {
+      return { recovered: false, reason: "binding_state_mismatch" };
+    }
+  }
+
+  const cleanup = await completeAttendanceTransferCleanup({
+    journal,
+    sheets,
+    config,
+    transferAttendanceRowsFn,
+    updateJournalFn,
+    clearJournalFn
+  });
+  if (!cleanup.cleaned) {
+    return {
+      recovered: false,
+      reason: "cleanup_blocked",
+      cleanupResults: cleanup.attendanceResults
+    };
+  }
+
+  return { recovered: true, reason: "cleanup_completed", cleanupResults: cleanup.attendanceResults };
+}
+
+function hasTransferredAttendanceBindingIdentity(expectedFromBindingIdentity, destination) {
+  if (!destination?.boundChatId || !expectedFromBindingIdentity) {
+    return false;
+  }
+
+  const [, ...bindingParts] = String(expectedFromBindingIdentity).split("\u0000");
+  if (bindingParts.length < 2) {
+    return false;
+  }
+
+  return getAppointmentBindingIdentity(destination) ===
+    `${destination.appointment}\u0000${bindingParts.join("\u0000")}`;
+}
+
+async function completeAttendanceTransferCleanup({
+  journal,
+  sheets,
+  config,
+  transferAttendanceRowsFn = transferAttendanceRows,
+  updateJournalFn = updateAttendanceTransferJournal,
+  clearJournalFn = clearAttendanceTransferJournal
+}) {
+  const attendanceResults = await transferAttendanceRowsFn(
+    sheets,
+    config,
+    journal.fromAppointment,
+    journal.toAppointment,
+    { phase: "clear" }
+  );
+  if (isAttendanceTransferCleanupBlocked(attendanceResults)) {
+    return { cleaned: false, attendanceResults };
+  }
+
+  await updateJournalFn(journal.id, "completed");
+  await clearJournalFn(journal.id);
+  return { cleaned: true, attendanceResults };
+}
+
 export async function createAttendanceBot(config) {
   await recoverStorageTransactions();
   const bot = new Telegraf(config.telegramBotToken, {
@@ -4909,6 +5613,38 @@ export async function createAttendanceBot(config) {
     }
   });
   const sheets = await createGoogleSheetsClient(config);
+  const pendingTransfer = await getAttendanceTransferJournal();
+  if (pendingTransfer) {
+    const registry = await getAppointmentRegistry();
+    try {
+      const recovery = await recoverAttendanceTransferJournal({
+        journal: pendingTransfer,
+        registry,
+        sheets,
+        config
+      });
+      if (recovery.recovered) {
+        logBot("Recovered interrupted attendance transfer cleanup.", {
+          fromAppointment: pendingTransfer.fromAppointment,
+          toAppointment: pendingTransfer.toAppointment
+        });
+      } else {
+        logBotWarn("Attendance transfer journal retained for safe operator recovery.", {
+          reason: recovery.reason,
+          phase: pendingTransfer.phase,
+          fromAppointment: pendingTransfer.fromAppointment,
+          toAppointment: pendingTransfer.toAppointment
+        });
+      }
+    } catch (error) {
+      logBotError("Attendance transfer recovery requires retry; journal retained.", {
+        error: error.message,
+        phase: pendingTransfer.phase,
+        fromAppointment: pendingTransfer.fromAppointment,
+        toAppointment: pendingTransfer.toAppointment
+      });
+    }
+  }
   const adminCache = createAdminCache();
   adminCache.syncManager = createSyncManager({
     // Do NOT pass force:true — that triggers a forced spreadsheets.get (metadata) on every
@@ -4920,6 +5656,9 @@ export async function createAttendanceBot(config) {
       withSheetOperation(async () =>
         flushAttendanceQueue((entries) => reconcilePendingAttendanceWithSheets(sheets, config, entries))
       ),
+    flushQueueIntervalMs: ATTENDANCE_QUEUE_FLUSH_INTERVAL_MS,
+    shouldFlushQueue: async () =>
+      (await listPendingAttendanceEvents()).length >= ATTENDANCE_QUEUE_FLUSH_THRESHOLD,
     // refreshOnboarding is intentionally a no-op in the hot-path cycle.
     // Onboarding data is read as part of refreshMonthSlices (via refreshMonthSlice →
     // refreshOnboardingSlice with TTL). Full structural roster sync runs once a day
@@ -4929,13 +5668,45 @@ export async function createAttendanceBot(config) {
     // passes force:true, propagating it would trigger a forced spreadsheets.get metadata
     // call (10–15 s, borderline timeout) on every reconciliation. The onboarding TTL (2 min)
     // and month-slice TTL (60 s) guarantee fresh data without an explicit force flag.
-    refreshMonthSlices: async (options = {}) => withSheetOperation(async () => {
-      await preloadSheetSnapshots(sheets, config, adminCache, {
-        structural: false,
-        normalizeAliases: options.reason === "five-minute"
+    refreshMonthSlices: async (options = {}) => {
+      const isEssential =
+        options.essentialSnapshotRefresh === true ||
+        options.reason === "foreground";
+      if (!isEssential && shouldDeferSnapshotRefresh()) {
+        logBot("Snapshot refresh deferred for broadcast headroom.", {
+          reason: options.reason ?? "background"
+        });
+        return false;
+      }
+
+      return withSheetOperation(async () => {
+        // Re-check after waiting for the logical Sheet transaction lock; a
+        // broadcast may have started while this refresh was queued.
+        if (!isEssential && shouldDeferSnapshotRefresh()) {
+          return false;
+        }
+        try {
+          const refreshSnapshots = () => preloadSheetSnapshots(sheets, config, adminCache, {
+            structural: false,
+            normalizeAliases: options.reason === "five-minute"
+          });
+          if (isEssential) {
+            await refreshSnapshots();
+          } else {
+            await runAsNonessentialSnapshotRefresh(refreshSnapshots);
+          }
+          return true;
+        } catch (error) {
+          if (!isEssential && isSnapshotRefreshDeferredError(error)) {
+            logBot("Snapshot refresh yielded after broadcast began.", {
+              reason: options.reason ?? "background"
+            });
+            return false;
+          }
+          throw error;
+        }
       });
-      return true;
-    }),
+    },
     refreshAdminCache: async () => {
       await refreshAdminCache(adminCache, config);
     }
@@ -4958,14 +5729,25 @@ export async function createAttendanceBot(config) {
       logBotError("Initial local snapshot hydrate failed.", { error: error.message });
     });
 
+  // Every incoming Telegram update outranks maintenance, synchronization, and
+  // broadcast work. Background schedulers yield at their next safe network
+  // boundary until this update is fully handled.
+  bot.use((_ctx, next) => runWithInteractivePriority(next));
+
   bot.use(
     session({
       defaultSession: () => ({
         awaitingAttendance: false,
         awaitingSecretCode: false,
         awaitingAppointmentAdd: false,
+        awaitingAttendanceOptionAdd: false,
+        awaitingIssueReport: false,
+        awaitingSpreadsheetIdChange: false,
         awaitingWeeklyAttendance: false,
         departmentEditTarget: null,
+        pendingInteraction: null,
+        pendingTextInput: null,
+        weeklyAttendanceFlowId: null,
         weeklyAttendanceDates: [],
         weeklyAttendanceIndex: 0,
         weeklyAttendanceResults: [],
@@ -5033,10 +5815,11 @@ export async function createAttendanceBot(config) {
 
   bot.start(async (ctx) => {
     await registerUser(ctx);
+    // /start is a deliberate escape hatch from any stale menu or text prompt.
+    await resetConversationState(ctx);
     const user = await getUserByChatId(ctx.chat.id);
 
     if (!user?.appointment || !user?.onboardingCompletedAt) {
-      await resetConversationState(ctx);
       await ctx.reply(
         [
           "Welcome. This bot records attendance into the monthly worksheet.",
@@ -5160,24 +5943,26 @@ export async function createAttendanceBot(config) {
 
   bot.command("deregister", async (ctx) => {
     await registerUser(ctx);
-    const result = await deregisterRequestorByChatId(ctx.chat.id);
+    const registry = await getAppointmentRegistry();
+    const target = registry.appointments.find(
+      (entry) => entry.active && String(entry.boundChatId) === String(ctx.chat.id)
+    );
 
-    if (!result.ok) {
-      const messages = {
-        not_bound: "You are not currently onboarded."
-      };
-      await ctx.reply(messages[result.reason] || "Unable to deregister your account.");
+    if (!target) {
+      await ctx.reply("You are not currently onboarded.");
       return;
     }
-
+    const interaction = beginInteraction(ctx, "self-deregister", {
+      confirm: { expectedBindingIdentity: getAppointmentBindingIdentity(target) }
+    }, { ttlMs: 2 * 60 * 1000 });
     await ctx.reply(
       [
-        `You have been deregistered from ${result.appointment}.`,
-        "Your previous registration code has been rotated.",
-        "You will need a fresh invitation code to onboard again."
-      ].join("\n")
+        `Deregister from ${target.appointment}?`,
+        "This removes your Telegram binding and rotates your registration code.",
+        "You will need a fresh invitation to onboard again."
+      ].join("\n"),
+      buildSelfDeregisterMenu(interaction.id)
     );
-    await refreshAdminCache(adminCache, config);
   });
 
   bot.command("admins", async (ctx) => {
@@ -5200,20 +5985,35 @@ export async function createAttendanceBot(config) {
       await renderAddAdminSubmenu(ctx, adminCache, 0);
       return;
     }
-
-    const result = await addAdminAppointment(appointment);
-
-    if (!result.ok) {
-      const messages = {
-        appointment_not_found: "Appointment not found in the active roster.",
-        appointment_not_bound: "That appointment is not currently onboarded and cannot be made an admin."
-      };
-      await ctx.reply(messages[result.reason] || "Unable to add that admin.");
+    const registry = await getAppointmentRegistry();
+    const target = registry.appointments.find(
+      (entry) => entry.active && entry.appointment.toUpperCase() === appointment.toUpperCase()
+    );
+    if (!target) {
+      await ctx.reply("Appointment not found in the active roster.");
       return;
     }
-
-    await ctx.reply(`${result.appointment} now has admin access.`);
-    await refreshAdminCache(adminCache, config);
+    if (!target.boundChatId) {
+      await ctx.reply("That appointment is not currently onboarded and cannot be made an admin.");
+      return;
+    }
+    const choice = {
+      appointment: target.appointment,
+      bindingIdentity: getAppointmentBindingIdentity(target),
+      boundFullName: target.boundFullName || null
+    };
+    const interaction = beginInteraction(ctx, "admin-add-admin-confirm", {
+      confirm: choice
+    }, { ttlMs: 2 * 60 * 1000 });
+    await ctx.reply(
+      choice.boundFullName
+        ? `Grant admin access to ${choice.appointment} (${choice.boundFullName})?`
+        : `Grant admin access to ${choice.appointment}?`,
+      Markup.inlineKeyboard([[
+        Markup.button.callback("✅ Grant Admin", `admin:confirm:addadmin:${interaction.id}`),
+        Markup.button.callback("↩️ Cancel", "admin:menu:admins")
+      ]])
+    );
   });
 
   bot.command("removeadmin", async (ctx) => {
@@ -5227,23 +6027,39 @@ export async function createAttendanceBot(config) {
       await renderRemoveAdminSubmenu(ctx, adminCache, 0);
       return;
     }
-
-    const result = await removeAdminAppointment(
-      appointment,
-      config.defaultAdminAppointments
+    const registry = await getAppointmentRegistry();
+    const target = registry.appointments.find(
+      (entry) => entry.active && entry.appointment.toUpperCase() === appointment.toUpperCase()
     );
-
-    if (!result.ok) {
-      const messages = {
-        default_admin: "That is a default admin appointment and cannot be removed.",
-        admin_not_found: "That appointment does not currently have custom admin access."
-      };
-      await ctx.reply(messages[result.reason] || "Unable to remove that admin.");
+    const isDefaultAdmin = config.defaultAdminAppointments.some(
+      (entry) => entry.toUpperCase() === appointment.toUpperCase()
+    );
+    const isCustomAdmin = (registry.adminAppointments ?? []).some(
+      (entry) => entry.toUpperCase() === appointment.toUpperCase()
+    );
+    if (isDefaultAdmin) {
+      await ctx.reply("That is a default admin appointment and cannot be removed.");
       return;
     }
-
-    await ctx.reply(`${result.appointment} no longer has custom admin access.`);
-    await refreshAdminCache(adminCache, config);
+    if (!target || !isCustomAdmin) {
+      await ctx.reply("That appointment does not currently have custom admin access.");
+      return;
+    }
+    const choice = {
+      appointment: target.appointment,
+      bindingIdentity: getAppointmentBindingIdentity(target),
+      boundFullName: target.boundFullName || null
+    };
+    const interaction = beginInteraction(ctx, "admin-remove-admin-confirm", {
+      confirm: choice
+    }, { ttlMs: 2 * 60 * 1000 });
+    await ctx.reply(
+      `Remove custom admin access from ${choice.appointment}${choice.boundFullName ? ` (${choice.boundFullName})` : ""}?`,
+      Markup.inlineKeyboard([[
+        Markup.button.callback("✅ Remove Admin", `admin:confirm:removeadmin:${interaction.id}`),
+        Markup.button.callback("↩️ Cancel", "admin:menu:admins")
+      ]])
+    );
   });
 
   bot.command("addappointment", async (ctx) => {
@@ -5254,7 +6070,7 @@ export async function createAttendanceBot(config) {
     const appointment = getCommandArgument(ctx.message.text, "addappointment");
 
     if (!appointment) {
-      ctx.session.awaitingAppointmentAdd = true;
+      beginTextInput(ctx, "appointment", { ttlMs: 10 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
         "Send the appointment name exactly as it should appear in the roster.",
@@ -5262,14 +6078,15 @@ export async function createAttendanceBot(config) {
       );
       return;
     }
-
-    const result = await addManagedAppointment(sheets, config, adminCache, appointment);
+    const interaction = beginInteraction(ctx, "appointment-add", {
+      confirm: { appointment }
+    }, { ttlMs: 2 * 60 * 1000 });
     await ctx.reply(
-      result.ok
-        ? `${result.appointment} has been added to the active roster. Secret code: ${result.secretCode}`
-        : result.reason === "appointment_exists"
-          ? `${result.appointment} is already in the active roster.`
-          : "Unable to add that appointment."
+      `Add ${appointment} to the active roster?`,
+      Markup.inlineKeyboard([[
+        Markup.button.callback("✅ Add Appointment", `admin:confirm:appointmentadd:${interaction.id}`),
+        Markup.button.callback("↩️ Cancel", "admin:menu:roster")
+      ]])
     );
   });
 
@@ -5285,12 +6102,31 @@ export async function createAttendanceBot(config) {
       await renderRemoveAppointmentSubmenu(ctx, adminCache, 0);
       return;
     }
-
-    const result = await removeManagedAppointment(sheets, config, adminCache, appointment);
+    const registry = await getAppointmentRegistry();
+    const target = registry.appointments.find(
+      (entry) => entry.active && entry.appointment.toUpperCase() === appointment.toUpperCase()
+    );
+    if (!target) {
+      await ctx.reply("Appointment not found in the active roster.");
+      return;
+    }
+    const choice = {
+      appointment: target.appointment,
+      stateIdentity: getAppointmentStateIdentity(target),
+      boundChatId: target.boundChatId || null,
+      boundFullName: target.boundFullName || null
+    };
+    const interaction = beginInteraction(ctx, "admin-remove-appointment-confirm", {
+      confirm: choice
+    }, { ttlMs: 2 * 60 * 1000 });
     await ctx.reply(
-      result.ok
-        ? `${result.appointment} has been removed from the active roster.`
-        : "Appointment not found in the active roster."
+      choice.boundChatId
+        ? `Remove ${choice.appointment}${choice.boundFullName ? ` (${choice.boundFullName})` : ""} from the active roster? Their Telegram binding will also be removed.`
+        : `Remove ${choice.appointment} from the active roster? This cannot be undone from Telegram.`,
+      Markup.inlineKeyboard([[
+        Markup.button.callback("✅ Remove Appointment", `admin:confirm:appointmentremove:${interaction.id}`),
+        Markup.button.callback("↩️ Cancel", "admin:menu:roster")
+      ]])
     );
   });
 
@@ -5319,10 +6155,10 @@ export async function createAttendanceBot(config) {
         }
       }
     }
-    const awaitingAttendanceOptionAdd = ctx.session.awaitingAttendanceOptionAdd === true;
-    const awaitingAppointmentAdd = ctx.session.awaitingAppointmentAdd === true;
-    const awaitingIssueReport = ctx.session.awaitingIssueReport === true;
-    const awaitingSpreadsheetIdChange = ctx.session.awaitingSpreadsheetIdChange === true;
+    const awaitingAttendanceOptionAdd = Boolean(getTextInput(ctx, "attendance-option"));
+    const awaitingAppointmentAdd = Boolean(getTextInput(ctx, "appointment"));
+    const awaitingIssueReport = Boolean(getTextInput(ctx, "issue"));
+    const awaitingSpreadsheetIdChange = Boolean(getTextInput(ctx, "spreadsheet"));
 
     if (awaitingIssueReport) {
       const description = message.trim();
@@ -5341,7 +6177,7 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      ctx.session.awaitingIssueReport = false;
+      consumeTextInput(ctx, "issue");
       const titleText = description.length > 60 ? `${description.slice(0, 57)}…` : description;
       const issueTitle = `[User Report] ${titleText}`;
       const issueBody = [
@@ -5390,11 +6226,10 @@ export async function createAttendanceBot(config) {
 
     if (awaitingSpreadsheetIdChange) {
       if (!(await requireAdmin(ctx, config))) {
-        ctx.session.awaitingSpreadsheetIdChange = false;
+        consumeTextInput(ctx, "spreadsheet");
         return;
       }
 
-      ctx.session.awaitingSpreadsheetIdChange = false;
       const newId = message.trim();
       const adminBackMenu = Markup.inlineKeyboard([[
         Markup.button.callback("🔙 Back", "admin:menu:roster"),
@@ -5415,43 +6250,59 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const previousId = config.spreadsheetId;
-      const updateResult = await updateEnvSpreadsheetId(newId, config);
-
-      if (!updateResult.ok) {
-        const detail = updateResult.reason === "env_file_not_found"
-          ? `The .env file was not found at the expected path (${updateResult.path}). Please update the spreadsheet ID manually in your .env file.`
-          : `Could not update the .env file: ${updateResult.reason}`;
-        await ctx.reply(`❌ ${detail}`, adminBackMenu);
+      // This is intentionally the only foreground Sheets preflight added by
+      // the hardening work: changing the target spreadsheet is rare and
+      // high-impact, while normal attendance stays entirely local/queued.
+      try {
+        const metadata = await sheets.spreadsheets.get({
+          spreadsheetId: newId,
+          fields: "sheets.properties.title"
+        });
+        const titles = (metadata.data?.sheets ?? []).map((sheet) => sheet.properties?.title);
+        if (!titles.includes(config.onboardingSheetTitle)) {
+          await ctx.reply(
+            `That spreadsheet is missing the required ${config.onboardingSheetTitle} sheet. The current spreadsheet remains active.`,
+            adminBackMenu
+          );
+          return;
+        }
+      } catch (error) {
+        logBotWarn("Spreadsheet change preflight failed.", { error: error.message });
+        await ctx.reply(
+          "I could not access that spreadsheet with the bot service account. The current spreadsheet remains active.",
+          adminBackMenu
+        );
         return;
       }
 
-      // Clear caches so the next operation reads from the new spreadsheet.
-      adminCache.sheetSnapshots = null;
-      adminCache.summaryMemoVersion = null;
-
-      // Trigger a background snapshot reload from the new spreadsheet.
-      preloadSheetSnapshots(sheets, config, adminCache, { force: true, structural: true }).catch(
-        (error) => logBotError("[SpreadsheetChange] Background reload failed.", { error: error.message })
-      );
-
+      consumeTextInput(ctx, "spreadsheet");
+      const previousId = config.spreadsheetId;
+      const confirmation = beginInteraction(ctx, "spreadsheet-change", {
+        confirm: { newId, previousId }
+      }, { ttlMs: 2 * 60 * 1000 });
       await ctx.reply(
         [
-          "✅ Spreadsheet ID updated successfully.",
+          "Confirm Target Spreadsheet Change",
           "",
           `Previous: <code>${escapeHtml(previousId)}</code>`,
           `New:      <code>${escapeHtml(newId)}</code>`,
           "",
-          "The bot is now loading data from the new spreadsheet. Run <b>Sync Roster</b> from the Admin Menu to ensure the roster is aligned."
+          "The current spreadsheet remains active until you confirm."
         ].join("\n"),
-        { parse_mode: "HTML", ...adminBackMenu }
+        {
+          parse_mode: "HTML",
+          ...Markup.inlineKeyboard([[
+            Markup.button.callback("✅ Confirm Change", `admin:confirm:spreadsheet:${confirmation.id}`),
+            Markup.button.callback("↩️ Cancel", "admin:menu:roster")
+          ], [Markup.button.callback("❌ Close", "admin:close")]])
+        }
       );
       return;
     }
 
     if (awaitingAppointmentAdd) {
       if (!(await requireAdmin(ctx, config))) {
-        ctx.session.awaitingAppointmentAdd = false;
+        consumeTextInput(ctx, "appointment");
         return;
       }
 
@@ -5466,28 +6317,25 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      ctx.session.awaitingAppointmentAdd = false;
-      const result = await addManagedAppointment(
-        sheets,
-        config,
-        adminCache,
-        normalizedAppointment
-      );
+      consumeTextInput(ctx, "appointment");
+      const confirmation = beginInteraction(ctx, "appointment-add", {
+        confirm: { appointment: normalizedAppointment }
+      }, { ttlMs: 2 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
-        result.ok
-          ? `${result.appointment} has been added to the active roster.\nSecret code: ${result.secretCode}`
-          : result.reason === "appointment_exists"
-            ? `${result.appointment} is already in the active roster.`
-            : "Unable to add that appointment.",
-        buildAppointmentManagementBackMenu()
+        `Add <b>${escapeHtml(normalizedAppointment)}</b> to the active roster?`,
+        Markup.inlineKeyboard([[
+          Markup.button.callback("✅ Add Appointment", `admin:confirm:appointmentadd:${confirmation.id}`),
+          Markup.button.callback("↩️ Cancel", "admin:menu:roster")
+        ]]),
+        { parse_mode: "HTML" }
       );
       return;
     }
 
     if (awaitingAttendanceOptionAdd) {
       if (!(await requireAdmin(ctx, config))) {
-        ctx.session.awaitingAttendanceOptionAdd = false;
+        consumeTextInput(ctx, "attendance-option");
         return;
       }
 
@@ -5508,7 +6356,7 @@ export async function createAttendanceBot(config) {
       }
 
       if (config.attendanceOptions.includes(normalizedOption)) {
-        ctx.session.awaitingAttendanceOptionAdd = false;
+        consumeTextInput(ctx, "attendance-option");
         await sendOrUpdateAdminMessage(
           ctx,
           `${normalizedOption} is already in the attendance option list.`,
@@ -5517,17 +6365,18 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      ctx.session.awaitingAttendanceOptionAdd = false;
-      await applyAttendanceOptionChange(
-        sheets,
-        config,
-        adminCache,
-        [...config.attendanceOptions, normalizedOption]
-      );
+      consumeTextInput(ctx, "attendance-option");
+      const confirmation = beginInteraction(ctx, "attendance-option-add", {
+        confirm: { option: normalizedOption, expectedOptions: [...config.attendanceOptions] }
+      }, { ttlMs: 2 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
-        `${normalizedOption} has been added to the attendance options.`,
-        buildAttendanceOptionsMenu()
+        `Add attendance option <b>${escapeHtml(normalizedOption)}</b>?`,
+        Markup.inlineKeyboard([[
+          Markup.button.callback("✅ Add Option", `admin:confirm:optionadd:${confirmation.id}`),
+          Markup.button.callback("↩️ Cancel", "admin:menu:options")
+        ]]),
+        { parse_mode: "HTML" }
       );
       return;
     }
@@ -5636,6 +6485,21 @@ export async function createAttendanceBot(config) {
       !action.startsWith("pick:week:")
     ) {
       await ctx.answerCbQuery();
+    }
+
+    // Successful attendance confirmations reuse the original Telegram message.
+    // If its Back/Close button is used, cancel the delayed cleanup before that
+    // message is repurposed so the sweeper cannot strip a newer menu's buttons.
+    if (action === "main" || action === "close") {
+      await resetConversationState(ctx);
+      await cancelAttendanceButtonCleanup(
+        ctx.chat.id,
+        getMessageId(ctx.callbackQuery?.message)
+      ).catch((error) => {
+        logBotError("Failed to cancel attendance confirmation button cleanup.", {
+          error: error.message
+        });
+      });
     }
 
     if (action === "main") {
@@ -5783,7 +6647,7 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const [, , departmentKey, weekOffsetRaw, pageRaw, absoluteIndexRaw, dayIndexRaw] = action.split(":");
+      const [, , departmentKey, weekOffsetRaw, pageRaw, absoluteIndexRaw, dayIndexRaw, memberFingerprint] = action.split(":");
       const isAdminUser = await isAdmin(ctx, config);
       const viewModel = buildDepartmentWorkweekViewModel(adminCache, config, user, {
         departmentKey,
@@ -5797,7 +6661,13 @@ export async function createAttendanceBot(config) {
       const dayIndex = Number(dayIndexRaw);
       const targetDate = viewModel.weekDates[dayIndex];
 
-      if (!viewModel.ok || !targetMember || !targetDate) {
+      if (
+        !viewModel.ok ||
+        !targetMember ||
+        !targetDate ||
+        stableSelectionFingerprint(targetMember.appointment) !== memberFingerprint
+      ) {
+        await rejectExpiredInteraction(ctx);
         await renderDepartmentView(ctx, config, adminCache, user, {
           departmentKey,
           weekOffset: Number(weekOffsetRaw ?? 0),
@@ -5807,13 +6677,22 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      ctx.session.departmentEditTarget = {
+      const target = {
         appointment: targetMember.appointment,
         date: targetDate.toISOString(),
         departmentKey: viewModel.departmentKey,
         weekOffset: viewModel.weekOffset,
         page: viewModel.page
       };
+      const interaction = beginInteraction(
+        ctx,
+        "department-attendance",
+        Object.fromEntries(config.attendanceOptions.map((option, index) => [String(index), {
+          option,
+          optionFingerprint: attendanceStatusFingerprint(option)
+        }])),
+        { ttlMs: 10 * 60 * 1000, payload: target }
+      );
       const currentStatus = getCachedAttendanceStatus(
         adminCache,
         config,
@@ -5832,8 +6711,13 @@ export async function createAttendanceBot(config) {
           config.attendanceOptions,
           0,
           "home:department:pickoption",
-          "home:department:pickpage",
-          `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}`
+          `home:department:pickpage:${interaction.id}`,
+          `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}`,
+          [],
+          {
+            itemTokenBuilder: (option, index) =>
+              `${interaction.id}:${index}:${attendanceStatusFingerprint(option)}`
+          }
         )
       );
       return;
@@ -5847,16 +6731,16 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const target = ctx.session.departmentEditTarget;
+      const [, , interactionId, pageRaw] = action.split(":");
+      const current = getInteraction(ctx, interactionId, "department-attendance");
+      const target = current?.payload;
 
       if (!target) {
-        await renderDepartmentView(ctx, config, adminCache, user, {
-          isAdminUser: await isAdmin(ctx, config)
-        });
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
-      const page = Number(action.split(":")[2] ?? 0);
+      const page = Number(pageRaw ?? 0);
       const targetDate = new Date(target.date);
       const currentStatus = getCachedAttendanceStatus(
         adminCache,
@@ -5876,8 +6760,12 @@ export async function createAttendanceBot(config) {
           config.attendanceOptions,
           page,
           "home:department:pickoption",
-          "home:department:pickpage",
+          `home:department:pickpage:${interactionId}`,
           `home:department:view:${target.departmentKey}:${target.weekOffset}:${target.page}`
+          , [], {
+            itemTokenBuilder: (option, index) =>
+              `${interactionId}:${index}:${attendanceStatusFingerprint(option)}`
+          }
         )
       );
       return;
@@ -5891,28 +6779,46 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const target = ctx.session.departmentEditTarget;
+      const [, , interactionId, optionIndexRaw, optionFingerprint] = action.split(":");
+      const resolved = getInteraction(
+        ctx,
+        interactionId,
+        "department-attendance",
+        optionIndexRaw
+      );
+      const target = resolved?.interaction.payload;
 
       if (!target) {
-        await renderDepartmentView(ctx, config, adminCache, user, {
-          isAdminUser: await isAdmin(ctx, config)
-        });
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
-      const picked = config.attendanceOptions[Number(action.split(":")[2])];
+      const picked = config.attendanceOptions[Number(optionIndexRaw)];
 
-      if (!picked) {
-        await renderDepartmentView(ctx, config, adminCache, user, {
-          departmentKey: target.departmentKey,
-          weekOffset: target.weekOffset,
-          page: target.page,
-          isAdminUser: await isAdmin(ctx, config)
-        });
+      if (
+        !picked ||
+        picked !== resolved.choice.option ||
+        attendanceStatusFingerprint(picked) !== optionFingerprint ||
+        resolved.choice.optionFingerprint !== optionFingerprint
+      ) {
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
-      await ctx.answerCbQuery("Attendance updated");
+      const isAdminUser = await isAdmin(ctx, config);
+      if (
+        !isAdminUser &&
+        getDepartmentKeyForAppointment(config, target.appointment) !==
+          getDepartmentKeyForAppointment(config, user.appointment)
+      ) {
+        await rejectExpiredInteraction(ctx, "Your access changed. Nothing was changed.");
+        return;
+      }
+
+      if (!consumeInteraction(ctx, interactionId, "department-attendance")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
 
       const targetDate = new Date(target.date);
       await queueAttendanceSelection(
@@ -5921,9 +6827,13 @@ export async function createAttendanceBot(config) {
         target.appointment,
         picked,
         targetDate,
-        "department"
+        "department",
+        `department:${interactionId}:${target.appointment}:${toIsoDateString(targetDate, config.timezone)}`
       );
-      ctx.session.departmentEditTarget = null;
+      // Only acknowledge success after the local, fsynced queue append has
+      // completed. Telegram may be ahead of Sheets, but it must never be ahead
+      // of the durable local source of truth.
+      await ctx.answerCbQuery("Attendance saved");
       await updateUserByChatId(ctx.chat.id, {
         awaitingAttendance: false,
         lastSubmittedAt: new Date().toISOString()
@@ -5953,7 +6863,7 @@ export async function createAttendanceBot(config) {
     }
 
     if (action === "reportissue") {
-      ctx.session.awaitingIssueReport = true;
+      beginTextInput(ctx, "issue", { ttlMs: 10 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
         [
@@ -5972,7 +6882,7 @@ export async function createAttendanceBot(config) {
     }
 
     if (action === "reportissue:cancel") {
-      ctx.session.awaitingIssueReport = false;
+      cancelInteractions(ctx);
       await renderHomeMenu(ctx, config, { cache: adminCache });
       return;
     }
@@ -5985,15 +6895,18 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const [, , isoDate, pageRaw] = action.split(":");
+      const parts = action.split(":");
+      const isLegacyPrompt = parts.length === 4;
+      const promptId = isLegacyPrompt
+        ? newAttendancePromptId()
+        : parts[2];
+      const isoDate = isLegacyPrompt ? parts[2] : parts[3];
+      const pageRaw = isLegacyPrompt ? parts[3] : parts[4];
       const date = parseIsoDate(isoDate);
       const currentIsoDate = toIsoDateString(new Date(), config.timezone);
 
       if (!date || isoDate !== currentIsoDate) {
-        await ctx.answerCbQuery("This attendance prompt has expired.", {
-          show_alert: true
-        });
-        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        await rejectExpiredInteraction(ctx, "This attendance prompt has expired. Nothing was changed.");
         return;
       }
 
@@ -6018,7 +6931,9 @@ export async function createAttendanceBot(config) {
           page,
           "home:pick:attendance",
           "home:attendance:page",
-          "home:main"
+          "home:main",
+          [],
+          { promptId }
         )
       );
       return;
@@ -6031,7 +6946,14 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const [, , isoDate, optionIndexRaw, optionFingerprint] = action.split(":");
+      const parts = action.split(":");
+      const isLegacyPrompt = parts.length === 5;
+      const promptId = isLegacyPrompt
+        ? `legacy-${getMessageId(ctx.callbackQuery?.message) ?? "unknown"}`
+        : parts[2];
+      const isoDate = isLegacyPrompt ? parts[2] : parts[3];
+      const optionIndexRaw = isLegacyPrompt ? parts[3] : parts[4];
+      const optionFingerprint = isLegacyPrompt ? parts[4] : parts[5];
       const todayIsoDate = toIsoDateString(new Date(), config.timezone);
       const recordedAt = parseIsoDate(isoDate);
       const picked = config.attendanceOptions[Number(optionIndexRaw)];
@@ -6042,16 +6964,9 @@ export async function createAttendanceBot(config) {
         !picked ||
         attendanceStatusFingerprint(picked) !== optionFingerprint
       ) {
-        await ctx.answerCbQuery("This attendance prompt has expired.", {
-          show_alert: true
-        });
-        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        await rejectExpiredInteraction(ctx, "This attendance prompt has expired. Nothing was changed.");
         return;
       }
-
-      // Answer the callback query immediately so Telegram removes the loading
-      // spinner and doesn't expire the query_id while we do async work below.
-      await ctx.answerCbQuery("Attendance updated");
 
       await queueAttendanceSelection(
         adminCache,
@@ -6059,8 +6974,17 @@ export async function createAttendanceBot(config) {
         user.appointment,
         picked,
         recordedAt,
-        "daily"
+        "daily",
+        buildDailyAttendanceIdempotencyKey(
+          ctx.chat.id,
+          promptId,
+          isoDate,
+          picked
+        )
       );
+      // The durable local append is normally fast; acknowledge only once it
+      // succeeds so a positive Telegram confirmation cannot be lost on restart.
+      await ctx.answerCbQuery("Attendance saved");
       const submittedAt = new Date();
       const confirmationLines = [
         `Attendance recorded as "${picked}" for ${user.appointment} for ${formatAttendanceDateLabel(recordedAt, config.timezone)} at ${formatMilitaryTime(submittedAt, config.timezone)} hrs.`,
@@ -6081,6 +7005,15 @@ export async function createAttendanceBot(config) {
       ctx.session.awaitingAttendance = false;
       const currentMessageId = getMessageId(ctx.callbackQuery?.message);
 
+      // Serialize against an expiring cleanup before changing this message's
+      // markup. The delayed cleanup is per-message serialized with this
+      // cancellation, so it cannot remove the freshly installed keyboard.
+      await cancelAttendanceButtonCleanup(ctx.chat.id, currentMessageId).catch((error) => {
+        logBotError("Failed to cancel prior attendance confirmation button cleanup.", {
+          error: error.message
+        });
+      });
+
       // The queue append above is already durable. Complete the user-visible
       // response, persist state, and clean older reminders concurrently.
       await Promise.all([
@@ -6088,6 +7021,15 @@ export async function createAttendanceBot(config) {
           awaitingAttendance: false,
           attendancePromptMessageIds: [],
           lastSubmittedAt: submittedAt.toISOString()
+        }),
+        scheduleAttendanceButtonCleanup(
+          ctx.chat.id,
+          currentMessageId,
+          submittedAt
+        ).catch((error) => {
+          logBotError("Failed to schedule attendance confirmation button cleanup.", {
+            error: error.message
+          });
         }),
         sendOrUpdateAdminMessage(
           ctx,
@@ -6118,17 +7060,18 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const [, , isoDate, pageRaw] = action.split(":");
+      const [, , flowId, isoDate, pageRaw] = action.split(":");
       const weeklyState = getWeeklyAttendanceState(ctx, user);
+      if (!flowId || flowId !== weeklyState.flowId) {
+        await rejectExpiredInteraction(ctx, "This weekly prompt has expired.");
+        return;
+      }
       const dayIndex = weeklyState.dates.findIndex(
         (value) => toIsoDateString(new Date(value), config.timezone) === isoDate
       );
 
       if (dayIndex < 0) {
-        await ctx.answerCbQuery("This weekly prompt has expired.", {
-          show_alert: true
-        });
-        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        await rejectExpiredInteraction(ctx, "This weekly prompt has expired. Nothing was changed.");
         return;
       }
 
@@ -6152,17 +7095,14 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const weekId = action.split(":")[2];
+      const [, , flowId, weekId] = action.split(":");
       const weeklyState = getWeeklyAttendanceState(ctx, user);
       const currentWeekId = weeklyState.dates[0]
         ? toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)
         : "";
 
-      if (!weekId || weekId !== currentWeekId) {
-        await ctx.answerCbQuery("This weekly prompt has expired.", {
-          show_alert: true
-        });
-        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+      if (!flowId || flowId !== weeklyState.flowId || !weekId || weekId !== currentWeekId) {
+        await rejectExpiredInteraction(ctx, "This weekly prompt has expired. Nothing was changed.");
         return;
       }
 
@@ -6179,17 +7119,18 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const isoDate = action.split(":")[2];
+      const [, , flowId, isoDate] = action.split(":");
       const weeklyState = getWeeklyAttendanceState(ctx, user);
+      if (!flowId || flowId !== weeklyState.flowId) {
+        await rejectExpiredInteraction(ctx, "This weekly prompt has expired.");
+        return;
+      }
       const dayIndex = weeklyState.dates.findIndex(
         (value) => toIsoDateString(new Date(value), config.timezone) === isoDate
       );
 
       if (dayIndex < 0) {
-        await ctx.answerCbQuery("This weekly prompt has expired.", {
-          show_alert: true
-        });
-        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+        await rejectExpiredInteraction(ctx, "This weekly prompt has expired. Nothing was changed.");
         return;
       }
 
@@ -6210,17 +7151,14 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      const weekId = action.split(":")[2];
+      const [, , flowId, weekId] = action.split(":");
       const weeklyState = getWeeklyAttendanceState(ctx, user);
       const currentWeekId = weeklyState.dates[0]
         ? toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)
         : "";
 
-      if (!weekId || weekId !== currentWeekId) {
-        await ctx.answerCbQuery("This weekly prompt has expired.", {
-          show_alert: true
-        });
-        await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+      if (!flowId || flowId !== weeklyState.flowId || !weekId || weekId !== currentWeekId) {
+        await rejectExpiredInteraction(ctx, "This weekly prompt has expired. Nothing was changed.");
         return;
       }
 
@@ -6249,7 +7187,11 @@ export async function createAttendanceBot(config) {
       const storedUser = await getUserByChatId(ctx.chat.id);
       const weeklyState = getWeeklyAttendanceState(ctx, storedUser);
       const weeklyDates = weeklyState.dates;
-      const [, , requestedIsoDate, optionIndexRaw, optionFingerprint] = action.split(":");
+      const [, , flowId, requestedIsoDate, optionIndexRaw, optionFingerprint] = action.split(":");
+      if (!flowId || flowId !== weeklyState.flowId) {
+        await rejectExpiredInteraction(ctx, "This weekly prompt has expired.");
+        return;
+      }
       const weeklyIndex = weeklyDates.findIndex(
         (value) => toIsoDateString(new Date(value), config.timezone) === requestedIsoDate
       );
@@ -6290,10 +7232,7 @@ export async function createAttendanceBot(config) {
           !picked ||
           attendanceStatusFingerprint(picked) !== optionFingerprint
         ) {
-          await ctx.answerCbQuery("This weekly prompt has expired.", {
-            show_alert: true
-          });
-          await ctx.editMessageReplyMarkup({ inline_keyboard: [] }).catch(() => {});
+          await rejectExpiredInteraction(ctx, "This weekly prompt has expired. Nothing was changed.");
           return;
         }
 
@@ -6327,6 +7266,17 @@ export async function createAttendanceBot(config) {
     }
 
     if (action === "deregister") {
+      const registry = await getAppointmentRegistry();
+      const target = registry.appointments.find(
+        (entry) => entry.active && String(entry.boundChatId) === String(ctx.chat.id)
+      );
+      if (!target) {
+        await sendOrUpdateAdminMessage(ctx, "You are not currently onboarded.", buildHomeMenu(false, config.timezone));
+        return;
+      }
+      const interaction = beginInteraction(ctx, "self-deregister", {
+        confirm: { expectedBindingIdentity: getAppointmentBindingIdentity(target) }
+      }, { ttlMs: 2 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
         [
@@ -6335,13 +7285,21 @@ export async function createAttendanceBot(config) {
           "Your registration code will be rotated.",
           "You will need a fresh invitation to onboard again."
         ].join("\n"),
-        buildSelfDeregisterMenu()
+        buildSelfDeregisterMenu(interaction.id)
       );
       return;
     }
 
-    if (action === "deregister:confirm") {
-      const result = await deregisterRequestorByChatId(ctx.chat.id);
+    if (action.startsWith("deregister:confirm:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "self-deregister", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "self-deregister")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const result = await deregisterRequestorByChatId(ctx.chat.id, {
+        expectedBindingIdentity: resolved.choice.expectedBindingIdentity
+      });
 
       if (!result.ok) {
         const messages = {
@@ -6375,6 +7333,11 @@ export async function createAttendanceBot(config) {
           ]
         ])
       );
+      return;
+    }
+
+    if (action === "deregister:confirm") {
+      await rejectExpiredInteraction(ctx);
       return;
     }
 
@@ -6479,26 +7442,25 @@ export async function createAttendanceBot(config) {
     }
 
     if (action === "main") {
+      await resetConversationState(ctx);
       await sendOrUpdateAdminMessage(ctx, buildAdminMenuDescription(), buildAdminMenu());
       return;
     }
 
     if (action === "close") {
+      await resetConversationState(ctx);
       await ctx.editMessageText("Admin menu closed.");
       return;
     }
 
     if (action === "menu:roster") {
+      cancelInteractions(ctx);
       await sendOrUpdateAdminMessage(ctx, buildRosterDescription(), buildAdminRosterMenu());
       return;
     }
 
     if (action === "menu:options") {
-      await renderAttendanceOptionsMenu(ctx, config);
-      return;
-    }
-
-    if (action === "menu:options") {
+      cancelInteractions(ctx);
       await renderAttendanceOptionsMenu(ctx, config);
       return;
     }
@@ -6516,7 +7478,7 @@ export async function createAttendanceBot(config) {
     }
 
     if (action === "appointments:add") {
-      ctx.session.awaitingAppointmentAdd = true;
+      beginTextInput(ctx, "appointment", { ttlMs: 10 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
         "Send the appointment name exactly as it should appear in the roster.",
@@ -6555,6 +7517,7 @@ export async function createAttendanceBot(config) {
     }
 
     if (action === "menu:admins") {
+      cancelInteractions(ctx);
       await sendOrUpdateAdminMessage(
         ctx,
         buildManageAdminsDescription(
@@ -6586,7 +7549,7 @@ export async function createAttendanceBot(config) {
     }
 
     if (action === "options:add") {
-      ctx.session.awaitingAttendanceOptionAdd = true;
+      beginTextInput(ctx, "attendance-option", { ttlMs: 10 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
         "Send the new attendance option code exactly as you want it to appear.",
@@ -6606,15 +7569,17 @@ export async function createAttendanceBot(config) {
     }
 
     if (action === "options:reset") {
-      await handleOptionsResetAction(ctx, config, {
-        resetAttendanceOptions,
-        syncRosterState,
-        refreshAdminCache,
-        preloadSheetSnapshots,
-        sendOrUpdateAdminMessage,
-        sheets,
-        adminCache
-      });
+      const confirmation = beginInteraction(ctx, "attendance-options-reset", {
+        confirm: { expectedOptions: [...config.attendanceOptions] }
+      }, { ttlMs: 2 * 60 * 1000 });
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "Reset all attendance options to the configured defaults? Existing sheet values are preserved, but future menus will change.",
+        Markup.inlineKeyboard([[
+          Markup.button.callback("✅ Reset Options", `admin:confirm:optionsreset:${confirmation.id}`),
+          Markup.button.callback("↩️ Cancel", "admin:menu:options")
+        ]])
+      );
       return;
     }
 
@@ -6650,17 +7615,326 @@ export async function createAttendanceBot(config) {
       return;
     }
 
+    if (action.startsWith("confirm:addadmin:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "admin-add-admin-confirm", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "admin-add-admin-confirm")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const result = await addAdminAppointment(resolved.choice.appointment, {
+        expectedBindingIdentity: resolved.choice.bindingIdentity
+      });
+      await sendOrUpdateAdminMessage(
+        ctx,
+        result.ok
+          ? `${result.appointment} now has admin access.`
+          : "That appointment changed before confirmation. Nothing was changed.",
+        buildAdminManageMenu()
+      );
+      await refreshAdminCache(adminCache, config);
+      return;
+    }
+
+    if (action.startsWith("confirm:removeadmin:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "admin-remove-admin-confirm", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "admin-remove-admin-confirm")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const result = await removeAdminAppointment(
+        resolved.choice.appointment,
+        config.defaultAdminAppointments,
+        { expectedBindingIdentity: resolved.choice.bindingIdentity }
+      );
+      await sendOrUpdateAdminMessage(
+        ctx,
+        result.ok
+          ? `${result.appointment} no longer has custom admin access.`
+          : "That admin assignment changed before confirmation. Nothing was changed.",
+        buildAdminManageMenu()
+      );
+      await refreshAdminCache(adminCache, config);
+      return;
+    }
+
+    if (action.startsWith("confirm:deregister:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "admin-deregister-confirm", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "admin-deregister-confirm")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const result = await deregisterAppointmentBinding(resolved.choice.appointment, {
+        expectedBindingIdentity: resolved.choice.bindingIdentity
+      });
+      await sendOrUpdateAdminMessage(
+        ctx,
+        result.ok
+          ? `Deregistered ${result.appointment}. The person will need to onboard again.`
+          : "That binding changed before confirmation. Nothing was changed.",
+        Markup.inlineKeyboard([[
+          Markup.button.callback("🔙 Back", "admin:menu:deregister:0"),
+          Markup.button.callback("❌ Close", "admin:close")
+        ]])
+      );
+      await refreshAdminCache(adminCache, config);
+      return;
+    }
+
+    if (action.startsWith("confirm:appointmentremove:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "admin-remove-appointment-confirm", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "admin-remove-appointment-confirm")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const result = await removeManagedAppointment(
+        sheets,
+        config,
+        adminCache,
+        resolved.choice.appointment,
+        { expectedStateIdentity: resolved.choice.stateIdentity }
+      );
+      await sendOrUpdateAdminMessage(
+        ctx,
+        result.ok
+          ? result.syncPending
+            ? `${result.appointment} was removed locally. Google Sheets sync is incomplete; use Sync Roster to finish reconciliation.`
+            : `${result.appointment} has been removed from the active roster.`
+          : "That appointment changed before confirmation. Nothing was changed.",
+        result.syncPending
+          ? buildSyncPendingMenu("admin:menu:roster")
+          : buildAppointmentManagementBackMenu()
+      );
+      return;
+    }
+
+    if (action.startsWith("confirm:spreadsheet:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "spreadsheet-change", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "spreadsheet-change")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      if (config.spreadsheetId !== resolved.choice.previousId) {
+        await rejectExpiredInteraction(ctx, "The target spreadsheet changed. Nothing was changed.");
+        return;
+      }
+      const updateResult = await updateEnvSpreadsheetId(resolved.choice.newId, config);
+      if (!updateResult.ok) {
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "Unable to update the spreadsheet setting. The previous spreadsheet remains active.",
+          buildAdminRosterMenu()
+        );
+        return;
+      }
+      adminCache.sheetSnapshots = null;
+      adminCache.summaryMemoVersion = null;
+      runWithBackgroundPriority(() =>
+        preloadSheetSnapshots(sheets, config, adminCache, { force: true, structural: true })
+      ).catch(
+        (error) => logBotError("[SpreadsheetChange] Background reload failed.", { error: error.message })
+      );
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "✅ Spreadsheet ID updated. The new spreadsheet is loading in the background.",
+        buildAdminRosterMenu()
+      );
+      return;
+    }
+
+    if (action.startsWith("confirm:appointmentadd:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "appointment-add", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "appointment-add")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const result = await addManagedAppointment(sheets, config, adminCache, resolved.choice.appointment);
+      await sendOrUpdateAdminMessage(
+        ctx,
+        result.ok
+          ? result.syncPending
+            ? `${result.appointment} was added locally.\nSecret code: ${result.secretCode}\nGoogle Sheets sync is incomplete; use Sync Roster to finish reconciliation.`
+            : `${result.appointment} has been added to the active roster.\nSecret code: ${result.secretCode}`
+          : result.reason === "appointment_exists"
+            ? `${result.appointment} is already in the active roster.`
+            : "Unable to add that appointment.",
+        result.syncPending
+          ? buildSyncPendingMenu("admin:menu:roster")
+          : buildAppointmentManagementBackMenu()
+      );
+      return;
+    }
+
+    if (action.startsWith("confirm:optionadd:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "attendance-option-add", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "attendance-option-add")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const { option, expectedOptions } = resolved.choice;
+      if (
+        expectedOptions.length !== config.attendanceOptions.length ||
+        expectedOptions.some((entry, index) => entry !== config.attendanceOptions[index]) ||
+        config.attendanceOptions.includes(option)
+      ) {
+        await rejectExpiredInteraction(ctx, "Attendance options changed. Nothing was changed.");
+        return;
+      }
+      const result = await applyAttendanceOptionChange(
+        sheets,
+        config,
+        adminCache,
+        [...config.attendanceOptions, option]
+      );
+      await sendOrUpdateAdminMessage(
+        ctx,
+        result.syncPending
+          ? `${option} was added locally. Google Sheets sync is incomplete; use Sync Roster to finish reconciliation.`
+          : `${option} has been added to the attendance options.`,
+        result.syncPending
+          ? buildSyncPendingMenu("admin:menu:options")
+          : buildAttendanceOptionsMenu()
+      );
+      return;
+    }
+
+    if (action.startsWith("confirm:optionremove:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "attendance-option-remove", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "attendance-option-remove")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const { option, expectedOptions } = resolved.choice;
+      if (
+        !Array.isArray(expectedOptions) ||
+        expectedOptions.length !== config.attendanceOptions.length ||
+        expectedOptions.some((entry, index) => entry !== config.attendanceOptions[index]) ||
+        !config.attendanceOptions.includes(option)
+      ) {
+        await rejectExpiredInteraction(ctx, "Attendance options changed. Nothing was changed.");
+        return;
+      }
+      if (config.attendanceOptions.length === 1) {
+        await rejectExpiredInteraction(ctx, "At least one attendance option must remain. Nothing was changed.");
+        return;
+      }
+      const result = await applyAttendanceOptionChange(
+        sheets,
+        config,
+        adminCache,
+        config.attendanceOptions.filter((entry) => entry !== option)
+      );
+      await sendOrUpdateAdminMessage(
+        ctx,
+        result.syncPending
+          ? `${option} was removed locally. Google Sheets sync is incomplete; use Sync Roster to finish reconciliation.`
+          : `${option} has been removed from the attendance options.`,
+        result.syncPending
+          ? buildSyncPendingMenu("admin:menu:options")
+          : buildAttendanceOptionsMenu()
+      );
+      return;
+    }
+
+    if (action.startsWith("confirm:optionsreset:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "attendance-options-reset", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "attendance-options-reset")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const { expectedOptions } = resolved.choice;
+      if (
+        !Array.isArray(expectedOptions) ||
+        expectedOptions.length !== config.attendanceOptions.length ||
+        expectedOptions.some((entry, index) => entry !== config.attendanceOptions[index])
+      ) {
+        await rejectExpiredInteraction(ctx, "Attendance options changed. Nothing was changed.");
+        return;
+      }
+      runWithBackgroundPriority(() => handleOptionsResetAction(ctx, config, {
+        resetAttendanceOptions,
+        syncRosterState,
+        refreshAdminCache,
+        preloadSheetSnapshots,
+        sendOrUpdateAdminMessage,
+        sendCompletionMessage: (_ctx, message, replyMarkup, extraOptions) =>
+          sendBackgroundBotMessage(
+            bot,
+            ctx.chat.id,
+            message,
+            replyMarkup,
+            extraOptions
+          ),
+        sheets,
+        adminCache
+      })).catch((error) => {
+        logBotError("[Admin] Attendance option reset failed.", { error: error.message });
+      });
+      return;
+    }
+
+    if (action.startsWith("confirm:clearprotections:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "clear-protections", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "clear-protections")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      runWithBackgroundPriority(() => handleClearProtectionsAdminAction(ctx, config, {
+        clearAllSheetProtections,
+        sendOrUpdateAdminMessage,
+        sendCompletionMessage: (_ctx, message, replyMarkup, extraOptions) =>
+          sendBackgroundBotMessage(
+            bot,
+            ctx.chat.id,
+            message,
+            replyMarkup,
+            extraOptions
+          ),
+        sheets
+      })).catch((error) => {
+        logBotError("[Admin] Clear protections error (unhandled).", { error: error.message });
+      });
+      return;
+    }
+
+    if (action.startsWith("confirm:promptall:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "prompt-all", "confirm");
+      if (!resolved || !consumeInteraction(ctx, interactionId, "prompt-all")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      await runAdminAction("promptall:execute", ctx, bot, sheets, config, adminCache);
+      return;
+    }
+
     if (action.startsWith("pick:code:")) {
       await ensureSheetReadiness(sheets, config, adminCache);
-      const pending = adminCache.pending;
-      const picked = pending[Number(action.split(":")[2])];
+      const [, , interactionId, choiceId] = action.split(":");
+      const resolved = getInteraction(ctx, interactionId, "admin-code", choiceId);
+      const picked = resolved?.choice;
 
       if (!picked) {
-        await renderCodesSubmenu(ctx, adminCache);
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
-      const invite = await getOnboardingInvite(picked.appointment);
+      const invite = await getOnboardingInvite(picked.appointment, {
+        expectedStateIdentity: picked.expectedStateIdentity
+      });
+      if (!invite.ok) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
       await sendOrUpdateAdminMessage(
         ctx,
         buildInviteMessage(invite, bot, { html: true }),
@@ -6672,15 +7946,22 @@ export async function createAttendanceBot(config) {
 
     if (action.startsWith("pick:invite:")) {
       await ensureSheetReadiness(sheets, config, adminCache);
-      const candidates = adminCache.inviteCandidates;
-      const picked = candidates[Number(action.split(":")[2])];
+      const [, , interactionId, choiceId] = action.split(":");
+      const resolved = getInteraction(ctx, interactionId, "admin-invite", choiceId);
+      const picked = resolved?.choice;
 
       if (!picked) {
-        await renderInviteSubmenu(ctx, adminCache, 0);
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
-      const invite = await getOnboardingInvite(picked.appointment);
+      const invite = await getOnboardingInvite(picked.appointment, {
+        expectedStateIdentity: picked.expectedStateIdentity
+      });
+      if (!invite.ok) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
       await sendOrUpdateAdminMessage(
         ctx,
         buildInviteMessage(invite, bot, { html: true }),
@@ -6692,62 +7973,62 @@ export async function createAttendanceBot(config) {
 
     if (action.startsWith("pick:addadmin:")) {
       await ensureSheetReadiness(sheets, config, adminCache);
-      const candidates = adminCache.addAdminCandidates;
-      const picked = candidates[Number(action.split(":")[2])];
+      const [, , interactionId, choiceId] = action.split(":");
+      const resolved = getInteraction(ctx, interactionId, "admin-add-admin", choiceId);
+      const picked = resolved?.choice;
 
       if (!picked) {
-        await renderAddAdminSubmenu(ctx, adminCache, 0);
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
-      const result = await addAdminAppointment(picked.appointment);
+      if (!consumeInteraction(ctx, interactionId, "admin-add-admin")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const confirmation = beginInteraction(ctx, "admin-add-admin-confirm", { confirm: picked }, { ttlMs: 2 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
-        result.ok
-          ? `${result.appointment} now has admin access.`
-          : result.reason === "appointment_not_bound"
-            ? "That appointment is not currently onboarded and cannot be made an admin."
-            : "Appointment not found in the active roster.",
+        picked.boundFullName
+          ? `Grant admin access to ${picked.appointment} (${picked.boundFullName})?`
+          : `Grant admin access to ${picked.appointment}?`,
         Markup.inlineKeyboard([
           [
-            Markup.button.callback("🔙 Back", "admin:menu:admins"),
+            Markup.button.callback("✅ Grant Admin", `admin:confirm:addadmin:${confirmation.id}`),
+            Markup.button.callback("↩️ Cancel", "admin:menu:admins"),
             Markup.button.callback("❌ Close", "admin:close")
           ]
         ])
       );
-      await refreshAdminCache(adminCache, config);
       return;
     }
 
     if (action.startsWith("pick:deregister:")) {
-      const candidates = adminCache.deregisterCandidates;
-      const [, , indexRaw, fingerprint] = action.split(":");
-      const picked = resolveFingerprintedSelection(
-        candidates,
-        indexRaw,
-        fingerprint,
-        "bindingIdentity"
-      );
+      const [, , interactionId, choiceId] = action.split(":");
+      const resolved = getInteraction(ctx, interactionId, "admin-deregister", choiceId);
+      const picked = resolved?.choice;
 
       if (!picked) {
-        await renderDeregisterSubmenu(ctx, adminCache, 0);
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
-      const result = await deregisterAppointmentBinding(picked.appointment);
+      if (!consumeInteraction(ctx, interactionId, "admin-deregister")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const confirmation = beginInteraction(ctx, "admin-deregister-confirm", { confirm: picked }, { ttlMs: 2 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
-        result.ok
-          ? `Deregistered ${result.appointment}. The person will need to onboard again.`
-          : "Unable to deregister that account.",
+        `Deregister ${picked.appointment}${picked.boundFullName ? ` (${picked.boundFullName})` : ""}? Their Telegram binding will be removed and their registration code rotated.`,
         Markup.inlineKeyboard([
           [
-            Markup.button.callback("🔙 Back", "admin:menu:deregister:0"),
+            Markup.button.callback("✅ Deregister", `admin:confirm:deregister:${confirmation.id}`),
+            Markup.button.callback("↩️ Cancel", "admin:menu:deregister:0"),
             Markup.button.callback("❌ Close", "admin:close")
           ]
         ])
       );
-      await refreshAdminCache(adminCache, config);
       return;
     }
 
@@ -6799,48 +8080,92 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      // Copy attendance first while retaining the source. Only move the local
-      // binding after every managed sheet passes conflict checks and confirms
-      // the copy. Clearing happens last, so every failure mode retains a copy.
-      const attendanceCopyResults = await transferAttendanceRows(
-        sheets,
-        config,
+      // Validate the binding and create the recovery journal inside the same
+      // storage-serialized preparation step. A stale callback therefore cannot
+      // leave a prepared journal behind before its binding is proven current.
+      let transferJournal;
+      let remoteMutationOccurred = false;
+      let result;
+      try {
+        result = await transferAppointmentBinding(
         from.appointment,
         to.appointment,
-        { phase: "copy" }
-      );
-      const attendanceCopyBlocked = attendanceCopyResults.some(
-        (entry) =>
-          entry.conflict ||
-          ["empty_sheet", "from_row_not_found", "to_row_not_found",
-            "transfer_aborted_due_to_conflict"].includes(entry.reason)
-      );
+        {
+          expectedFromBindingIdentity: from.bindingIdentity,
+          prepare: async ({ fromAppointment, toAppointment, bindingIdentity }) => {
+            try {
+              transferJournal = await beginAttendanceTransferJournal(
+                fromAppointment,
+                toAppointment,
+                { expectedFromBindingIdentity: bindingIdentity }
+              );
+            } catch (error) {
+              logBotWarn("Rejected transfer while recovery journal is retained.", {
+                fromAppointment,
+                toAppointment,
+                error: error.message
+              });
+              return { ok: false, reason: "attendance_transfer_recovery_required" };
+            }
+            const attendanceResults = await transferAttendanceRows(
+              sheets,
+              config,
+              fromAppointment,
+              toAppointment,
+              { phase: "copy" }
+            );
 
-      if (attendanceCopyBlocked) {
-        const reasons = [...new Set(
-          attendanceCopyResults
-            .filter((entry) => entry.reason)
-            .map((entry) => `${entry.title}: ${entry.reason}`)
-        )];
-        await sendOrUpdateAdminMessage(
-          ctx,
-          `Transfer stopped without changing the binding or deleting attendance.\n${reasons.join("\n")}`,
-          buildAppointmentManagementBackMenu()
+            if (isAttendanceTransferBlocked(attendanceResults)) {
+              return {
+                ok: false,
+                reason: "attendance_transfer_blocked",
+                attendanceResults
+              };
+            }
+            remoteMutationOccurred = attendanceResults.some((entry) => entry.transferred);
+            await updateAttendanceTransferJournal(transferJournal.id, "copied", {
+              copiedSheets: attendanceResults.filter((entry) => entry.transferred).map((entry) => entry.title)
+            });
+            return { ok: true, attendanceResults };
+          }
+        }
         );
-        return;
+      } catch (error) {
+        logBotError("Attendance transfer interrupted; recovery journal retained.", {
+          fromAppointment: from.appointment,
+          toAppointment: to.appointment,
+          error: error.message
+        });
+        throw error;
       }
 
-      const result = await transferAppointmentBinding(from.appointment, to.appointment);
-
       if (result.ok) {
-        const attendanceResults = await transferAttendanceRows(
+        await updateAttendanceTransferJournal(transferJournal.id, "binding_committed");
+        const cleanup = await completeAttendanceTransferCleanup({
+          journal: transferJournal,
           sheets,
-          config,
-          result.fromAppointment,
-          result.toAppointment,
-          { phase: "clear" }
-        );
-        const sheetsMoved = attendanceResults.filter((r) => r.transferred).map((r) => r.title);
+          config
+        });
+        if (!cleanup.cleaned) {
+          logBotError("Attendance transfer binding committed but source cleanup is blocked; journal retained.", {
+            fromAppointment: result.fromAppointment,
+            toAppointment: result.toAppointment,
+            attendanceResults: cleanup.attendanceResults
+          });
+          await sendOrUpdateAdminMessage(
+            ctx,
+            `⚠️ Transferred <b>${result.fromAppointment}</b> → <b>${result.toAppointment}</b>, but source attendance cleanup is blocked. Recovery is required; the transfer journal has been retained.`,
+            Markup.inlineKeyboard([[
+              Markup.button.callback("🔙 Back", "admin:menu:roster")
+            ], [
+              Markup.button.callback("❌ Close", "admin:close")
+            ]]),
+            { parse_mode: "HTML" }
+          );
+          await refreshAdminCache(adminCache, config);
+          return;
+        }
+        const sheetsMoved = cleanup.attendanceResults.filter((r) => r.transferred).map((r) => r.title);
         const attendanceNote = sheetsMoved.length > 0
           ? `\nAttendance carried over from: ${sheetsMoved.join(", ")}.`
           : "";
@@ -6857,15 +8182,26 @@ export async function createAttendanceBot(config) {
           { parse_mode: "HTML" }
         );
       } else {
+        // Only this invocation's untouched prepared journal is safe to remove.
+        // A copied or committed journal may represent a crash after a remote
+        // Sheets mutation and must remain available for recovery.
+        if (transferJournal && !remoteMutationOccurred) {
+          await clearAttendanceTransferJournal(transferJournal.id);
+        }
+        const message = result.reason === "attendance_transfer_blocked"
+          ? formatAttendanceTransferBlockedMessage(
+              result.preparation?.attendanceResults ?? [],
+              to.appointment
+            )
+          : formatAppointmentTransferFailure(result, to.appointment);
         await sendOrUpdateAdminMessage(
           ctx,
-          `Unable to transfer: ${result.reason}.`,
+          message,
           Markup.inlineKeyboard([[
             Markup.button.callback("🔙 Back", "admin:menu:roster")
           ], [
             Markup.button.callback("❌ Close", "admin:close")
-          ]]),
-          { parse_mode: "HTML" }
+          ]])
         );
       }
 
@@ -6874,66 +8210,62 @@ export async function createAttendanceBot(config) {
     }
 
     if (action.startsWith("pick:appointmentremove:")) {
-      const candidates = adminCache.removeAppointmentCandidates;
-      const [, , indexRaw, fingerprint] = action.split(":");
-      const picked = resolveFingerprintedSelection(
-        candidates,
-        indexRaw,
-        fingerprint
-      );
+      const [, , interactionId, choiceId] = action.split(":");
+      const resolved = getInteraction(ctx, interactionId, "admin-remove-appointment", choiceId);
+      const picked = resolved?.choice;
 
       if (!picked) {
-        await renderRemoveAppointmentSubmenu(ctx, adminCache, 0);
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
-      const result = await removeManagedAppointment(
-        sheets,
-        config,
-        adminCache,
-        picked.appointment
-      );
+      if (!consumeInteraction(ctx, interactionId, "admin-remove-appointment")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const confirmation = beginInteraction(ctx, "admin-remove-appointment-confirm", { confirm: picked }, { ttlMs: 2 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
-        result.ok
-          ? `${result.appointment} has been removed from the active roster.`
-          : "Appointment not found in the active roster.",
-        buildAppointmentManagementBackMenu()
+        picked.boundChatId
+          ? `Remove ${picked.appointment}${picked.boundFullName ? ` (${picked.boundFullName})` : ""} from the active roster? Their current Telegram binding will also be removed.`
+          : `Remove ${picked.appointment} from the active roster? This cannot be undone from Telegram.`,
+        Markup.inlineKeyboard([[
+          Markup.button.callback("✅ Remove Appointment", `admin:confirm:appointmentremove:${confirmation.id}`),
+          Markup.button.callback("↩️ Cancel", "admin:menu:roster")
+        ], [Markup.button.callback("❌ Close", "admin:close")]])
       );
       return;
     }
 
     if (action.startsWith("pick:removeadmin:")) {
-      const candidates = adminCache.removeAdminCandidates;
-      const [, , indexRaw, fingerprint] = action.split(":");
-      const picked = resolveFingerprintedSelection(
-        candidates,
-        indexRaw,
-        fingerprint
-      );
+      const [, , interactionId, choiceId] = action.split(":");
+      const resolved = getInteraction(ctx, interactionId, "admin-remove-admin", choiceId);
+      const picked = resolved?.choice;
 
       if (!picked) {
-        await renderRemoveAdminSubmenu(ctx, adminCache, 0);
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
-      const result = await removeAdminAppointment(
-        picked.appointment,
-        config.defaultAdminAppointments
+      if (!consumeInteraction(ctx, interactionId, "admin-remove-admin")) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      const confirmation = beginInteraction(
+        ctx,
+        "admin-remove-admin-confirm",
+        { confirm: picked },
+        { ttlMs: 2 * 60 * 1000 }
       );
       await sendOrUpdateAdminMessage(
         ctx,
-        result.ok
-          ? `${result.appointment} no longer has custom admin access.`
-          : "Unable to remove that admin.",
-        Markup.inlineKeyboard([
-          [
-            Markup.button.callback("🔙 Back", "admin:menu:admins"),
-            Markup.button.callback("❌ Close", "admin:close")
-          ]
-        ])
+        `Remove custom admin access from ${picked.appointment}${picked.boundFullName ? ` (${picked.boundFullName})` : ""}?`,
+        Markup.inlineKeyboard([[
+          Markup.button.callback("✅ Remove Admin", `admin:confirm:removeadmin:${confirmation.id}`),
+          Markup.button.callback("↩️ Cancel", "admin:menu:admins"),
+          Markup.button.callback("❌ Close", "admin:close")
+        ]])
       );
-      await refreshAdminCache(adminCache, config);
       return;
     }
 
@@ -6959,17 +8291,16 @@ export async function createAttendanceBot(config) {
         );
         return;
       }
-
-      await applyAttendanceOptionChange(
-        sheets,
-        config,
-        adminCache,
-        config.attendanceOptions.filter((entry) => entry !== option)
-      );
+      const confirmation = beginInteraction(ctx, "attendance-option-remove", {
+        confirm: { option, expectedOptions: [...config.attendanceOptions] }
+      }, { ttlMs: 2 * 60 * 1000 });
       await sendOrUpdateAdminMessage(
         ctx,
-        `${option} has been removed from the attendance options.`,
-        buildAttendanceOptionsMenu()
+        `Remove attendance option ${option}? Existing sheet values will be preserved, but it will disappear from future menus.`,
+        Markup.inlineKeyboard([[
+          Markup.button.callback("✅ Remove Option", `admin:confirm:optionremove:${confirmation.id}`),
+          Markup.button.callback("↩️ Cancel", "admin:menu:options")
+        ]])
       );
       return;
     }
@@ -6992,6 +8323,16 @@ export const __testing = {
   buildManageAdminsDescription,
   buildHomeMenuText,
   buildDatedAttendanceMenu,
+  buildDailyAttendanceIdempotencyKey,
+  buildWeeklyAttendanceIdempotencyKey,
+  rejectExpiredInteraction,
+  addManagedAppointment,
+  removeManagedAppointment,
+  applyAttendanceOptionChange,
+  formatAppointmentTransferFailure,
+  formatAttendanceTransferBlockedMessage,
+  isAttendanceTransferBlocked,
+  isAttendanceTransferCleanupBlocked,
   isPrivateTelegramIdentity,
   appendAttendancePromptMessageId,
   formatDepartmentViewMessage,
@@ -7008,12 +8349,16 @@ export const __testing = {
   handleFlushAttendanceAdminAction,
   handleQueueStatusAdminAction,
   handleSyncRosterAdminAction,
+  withSheetOperation,
+  triggerAttendanceQueueThresholdFlush,
   triggerBackgroundSheetRefresh,
   renderInviteSubmenu,
   renderAttendanceOptionsMenu,
   removeObsoleteAttendancePromptMessages,
   restoreWeeklyAttendanceSession,
   registerBackgroundSchedules,
+  completeAttendanceTransferCleanup,
+  recoverAttendanceTransferJournal,
   resetRosterSyncGuard() { rosterSyncInProgress = false; },
   detectSnapshotDivergences,
   snapshotAppointmentHasData,

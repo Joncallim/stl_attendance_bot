@@ -1,10 +1,30 @@
-// Keep launch rate below Telegram's approximate free broadcast limit of
-// 30 messages/second, leaving headroom for interactive replies and edits.
-export const TELEGRAM_SEND_INTERVAL_MS = 40;
-// Launch rate and in-flight capacity are separate concerns. Fifty in-flight
-// requests preserves 25 sends/second even when Telegram response latency rises
-// above one second.
-export const TELEGRAM_SEND_CONCURRENCY = 50;
+import {
+  getWorkPriorityStatus,
+  waitForInteractiveIdle
+} from "./workPriority.js";
+
+function boundedIntegerEnv(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value)
+    ? Math.min(Math.max(value, min), max)
+    : fallback;
+}
+
+// Keep broadcasts deliberately below Telegram's bot-wide throughput so direct
+// replies and message edits have ample headroom. Both values are tunable
+// without a deployment-time code edit.
+export const TELEGRAM_SEND_INTERVAL_MS = boundedIntegerEnv(
+  "TELEGRAM_BROADCAST_INTERVAL_MS",
+  100,
+  50,
+  1000
+);
+export const TELEGRAM_SEND_CONCURRENCY = boundedIntegerEnv(
+  "TELEGRAM_BROADCAST_CONCURRENCY",
+  12,
+  1,
+  15
+);
 export const TELEGRAM_SEND_MAX_ATTEMPTS = 3;
 export const TELEGRAM_SEND_TIMEOUT_MS = 15_000;
 
@@ -35,32 +55,84 @@ function getTelegramRetryAfterMs(error) {
     : 1000;
 }
 
-function createTelegramSendLimiter(options = {}) {
+function createTelegramSendDispatcher(options = {}) {
   const intervalMs = options.intervalMs ?? TELEGRAM_SEND_INTERVAL_MS;
+  const maxConcurrent = options.maxConcurrent ?? TELEGRAM_SEND_CONCURRENCY;
   const nowFn = options.nowFn ?? Date.now;
   const sleepFn = options.sleepFn ?? sleep;
   let nextAllowedAt = 0;
   let blockedUntil = 0;
-  let slotTail = Promise.resolve();
+  let active = 0;
+  let peakActive = 0;
+  let draining = false;
+  const queue = [];
 
-  function waitForSlot() {
-    const slot = slotTail.catch(() => {}).then(async () => {
-      while (true) {
-        const now = nowFn();
-        const target = Math.max(nextAllowedAt, blockedUntil);
-        const delayMs = target - now;
+  async function execute(task) {
+    try {
+      task.resolve(await task.fn());
+    } catch (error) {
+      task.reject(error);
+    } finally {
+      active = Math.max(0, active - 1);
+      void drain();
+    }
+  }
 
-        if (delayMs <= 0) {
-          nextAllowedAt = now + intervalMs;
-          return;
+  async function drain() {
+    if (draining) {
+      return;
+    }
+
+    draining = true;
+    try {
+      while (queue.length > 0 && active < maxConcurrent) {
+        // Check the interactive gate before every launch. The launch slot is
+        // not reserved until after this await, so an incoming update cannot
+        // accumulate a burst of already-reserved broadcast sends.
+        await waitForInteractiveIdle();
+
+        const priority = getWorkPriorityStatus();
+        if (priority.activeInteractiveWork > 0) {
+          continue;
         }
 
-        await sleepFn(delayMs);
-      }
-    });
+        const now = nowFn();
+        const target = Math.max(nextAllowedAt, blockedUntil);
+        if (target > now) {
+          await sleepFn(target - now);
+          continue;
+        }
 
-    slotTail = slot;
-    return slot;
+        // The final generation check catches an update that began while the
+        // dispatcher was waiting for rate capacity. Do not consume a slot in
+        // that case; loop back through the quiet-period gate instead.
+        const beforeLaunch = getWorkPriorityStatus();
+        if (
+          beforeLaunch.activeInteractiveWork > 0 ||
+          beforeLaunch.interactiveGeneration !== priority.interactiveGeneration
+        ) {
+          continue;
+        }
+
+        const task = queue.shift();
+        nextAllowedAt = nowFn() + intervalMs;
+        active += 1;
+        peakActive = Math.max(peakActive, active);
+        void execute(task);
+      }
+    } finally {
+      draining = false;
+      if (queue.length > 0 && active < maxConcurrent) {
+        void drain();
+      }
+    }
+  }
+
+  function run(fn) {
+    return new Promise((resolve, reject) => {
+      queue.push({ fn, resolve, reject });
+      void drain();
+    });
   }
 
   function pause(delayMs) {
@@ -70,32 +142,50 @@ function createTelegramSendLimiter(options = {}) {
   function reset() {
     nextAllowedAt = 0;
     blockedUntil = 0;
-    slotTail = Promise.resolve();
+    active = 0;
+    peakActive = 0;
+    queue.length = 0;
+    draining = false;
   }
 
-  return { waitForSlot, pause, reset };
+  function getStatus() {
+    return {
+      active,
+      peakActive,
+      queued: queue.length,
+      nextAllowedAt,
+      blockedUntil
+    };
+  }
+
+  return { run, pause, reset, getStatus };
 }
 
 // This singleton is intentionally shared by every allSettledConcurrent call.
 // Separate manual and scheduled broadcasts must contribute to one Telegram
 // launch rate instead of each independently sending 25 messages/second.
-const telegramSendLimiter = createTelegramSendLimiter();
+const telegramSendDispatcher = createTelegramSendDispatcher();
 
 async function runTelegramSend(fn) {
   let attempt = 0;
 
   while (attempt < TELEGRAM_SEND_MAX_ATTEMPTS) {
     attempt += 1;
-    await telegramSendLimiter.waitForSlot();
-    const controller = new AbortController();
-    const timeout = setTimeout(
-      () => controller.abort(new Error("Telegram send timed out.")),
-      TELEGRAM_SEND_TIMEOUT_MS
-    );
-    timeout.unref?.();
-
     try {
-      return await fn(controller.signal);
+      return await telegramSendDispatcher.run(async () => {
+        const controller = new AbortController();
+        const timeout = setTimeout(
+          () => controller.abort(new Error("Telegram send timed out.")),
+          TELEGRAM_SEND_TIMEOUT_MS
+        );
+        timeout.unref?.();
+
+        try {
+          return await fn(controller.signal);
+        } finally {
+          clearTimeout(timeout);
+        }
+      });
     } catch (error) {
       const retryAfterMs = getTelegramRetryAfterMs(error);
 
@@ -103,9 +193,7 @@ async function runTelegramSend(fn) {
         throw error;
       }
 
-      telegramSendLimiter.pause(retryAfterMs);
-    } finally {
-      clearTimeout(timeout);
+      telegramSendDispatcher.pause(retryAfterMs);
     }
   }
 
@@ -142,9 +230,12 @@ export async function allSettledConcurrent(fns, concurrency) {
 }
 
 export const __testing = {
-  createTelegramSendLimiter,
+  createTelegramSendDispatcher,
   getTelegramRetryAfterMs,
   resetTelegramSendLimiter() {
-    telegramSendLimiter.reset();
+    telegramSendDispatcher.reset();
+  },
+  getTelegramSendDispatcherStatus() {
+    return telegramSendDispatcher.getStatus();
   }
 };
