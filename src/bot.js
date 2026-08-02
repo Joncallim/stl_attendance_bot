@@ -957,6 +957,10 @@ function buildDailyAttendanceIdempotencyKey(chatId, promptId, isoDate, status) {
   return `daily:${chatId}:${promptId}:${isoDate}:${attendanceStatusFingerprint(status)}`;
 }
 
+function buildWeeklyAttendanceIdempotencyKey(flowId, appointment, isoDate, status) {
+  return `weekly:${flowId}:${appointment}:${isoDate}:${attendanceStatusFingerprint(status)}`;
+}
+
 function buildDatedAttendanceMenu(
   config,
   date,
@@ -2487,7 +2491,12 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
       status: entry.status,
       date,
       source: "weekly",
-      idempotencyKey: `weekly:${weeklyState.flowId}:${appointment}:${entry.date}`,
+      idempotencyKey: buildWeeklyAttendanceIdempotencyKey(
+        weeklyState.flowId,
+        appointment,
+        entry.date,
+        entry.status
+      ),
       ...buildQueuedAttendanceEventMetadata(cache.sheetSnapshots, config, {
         appointment,
         status: entry.status,
@@ -2518,6 +2527,16 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
   });
 
   await clearWeeklyAttendanceState(ctx);
+  // A completed weekly flow can reuse an earlier confirmation message. Wait
+  // for any old cleanup edit to finish before installing the new keyboard.
+  await cancelAttendanceButtonCleanup(
+    ctx.chat.id,
+    getMessageId(ctx.callbackQuery?.message)
+  ).catch((error) => {
+    logBotError("Failed to cancel prior weekly confirmation button cleanup.", {
+      error: error.message
+    });
+  });
   const latestUser = await getUserByChatId(ctx.chat.id);
   const confirmationMessage = await sendOrUpdateAdminMessage(
     ctx,
@@ -3750,12 +3769,14 @@ function isAttendanceTransferBlocked(results) {
   return results.some(
     (entry) =>
       entry.conflict ||
-      [
-        "empty_sheet",
-        "from_row_not_found",
-        "to_row_not_found",
-        "transfer_aborted_due_to_conflict"
-      ].includes(entry.reason)
+      entry.skipped ||
+      !entry.transferred
+  );
+}
+
+function isAttendanceTransferCleanupBlocked(results) {
+  return results.length === 0 || results.some(
+    (entry) => entry.conflict || entry.skipped || !entry.transferred
   );
 }
 
@@ -3764,7 +3785,13 @@ function formatAttendanceTransferBlockedMessage(results, toAppointment) {
     (entry) => entry.reason === "destination_has_attendance"
   );
   const structuralFailures = results.filter((entry) =>
-    ["empty_sheet", "from_row_not_found", "to_row_not_found"].includes(entry.reason)
+    [
+      "empty_sheet",
+      "from_row_not_found",
+      "to_row_not_found",
+      "duplicate_appointment_row",
+      "no_date_columns"
+    ].includes(entry.reason)
   );
   const lines = [
     "Transfer stopped safely. No binding or attendance was changed."
@@ -3782,7 +3809,9 @@ function formatAttendanceTransferBlockedMessage(results, toAppointment) {
   const structuralReasonMessages = {
     empty_sheet: "the monthly sheet is empty",
     from_row_not_found: "the source appointment row is missing",
-    to_row_not_found: "the destination appointment row is missing"
+    to_row_not_found: "the destination appointment row is missing",
+    duplicate_appointment_row: "the appointment appears more than once",
+    no_date_columns: "the monthly sheet has no attendance date columns"
   };
 
   for (const entry of structuralFailures) {
@@ -3810,7 +3839,9 @@ function formatAppointmentTransferFailure(result, toAppointment) {
       "The source binding changed after this transfer menu was opened.",
     to_not_found: "The destination appointment is no longer active.",
     to_already_bound:
-      `${toAppointment} is already bound to a user and cannot be used as the destination.`
+      `${toAppointment} is already bound to a user and cannot be used as the destination.`,
+    attendance_transfer_recovery_required:
+      "Another attendance transfer requires recovery before a new transfer can begin."
   };
 
   return [
@@ -5286,18 +5317,26 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         }
 
         const isFirstReminder = reminderTime === config.firstReminderTime;
-        const startReminderRefresh = () => Promise.resolve()
-          .then(() => adminCache.syncManager.runCycle({
-            force: true,
-            reason: "reminder",
-            ...(!isFirstReminder ? { essentialSnapshotRefresh: true } : {})
-          }))
-          .catch((error) => {
+        const startReminderRefresh = async () => {
+          try {
+            const result = await adminCache.syncManager.runCycle({
+              force: true,
+              reason: "reminder",
+              ...(!isFirstReminder ? { essentialSnapshotRefresh: true } : {})
+            });
+            return {
+              fresh: result?.monthSlicesRefreshed === true,
+              deferred: result === null || result?.monthSlicesRefreshed === false,
+              failed: false
+            };
+          } catch (error) {
             logBotWarn(
-              `[Reminder] Sheet refresh failed before ${reminderTime} reminder — using cached data.`,
+              `[Reminder] Sheet refresh failed before ${reminderTime} reminder.`,
               { error: error.message }
             );
-          });
+            return { fresh: false, deferred: false, failed: true };
+          }
+        };
 
         // The first reminder always targets every bound user, so fresh Sheets
         // data is not needed to choose recipients. Start the cycle after the
@@ -5305,7 +5344,14 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
         // defers. The second reminder must refresh first because it only targets
         // people whose attendance is still unfilled.
         if (!isFirstReminder) {
-          await startReminderRefresh();
+          const refresh = await startReminderRefresh();
+          if (!refresh.fresh) {
+            logBotWarn(
+              `[Reminder] Skipping ${reminderTime} reminder because its essential attendance refresh was not fresh.`,
+              refresh
+            );
+            return;
+          }
         }
 
         const users = (await listUsersFn()).filter((user) => {
@@ -5389,6 +5435,176 @@ function registerBackgroundSchedules({ bot, sheets, config, adminCache, deps = {
   }
 }
 
+async function recoverAttendanceTransferJournal({
+  journal,
+  registry,
+  sheets,
+  config,
+  transferAttendanceRowsFn = transferAttendanceRows,
+  transferAppointmentBindingFn = transferAppointmentBinding,
+  updateJournalFn = updateAttendanceTransferJournal,
+  clearJournalFn = clearAttendanceTransferJournal
+}) {
+  if (!journal) {
+    return { recovered: false, reason: "no_journal" };
+  }
+
+  if (journal.phase === "completed") {
+    await clearJournalFn(journal.id);
+    return { recovered: true, reason: "completed_journal_cleared" };
+  }
+
+  if (!["prepared", "copied", "binding_committed"].includes(journal.phase)) {
+    return { recovered: false, reason: "operator_recovery_required" };
+  }
+
+  const source = registry.appointments.find((entry) => entry.appointment === journal.fromAppointment);
+  const destination = registry.appointments.find((entry) => entry.appointment === journal.toAppointment);
+
+  if (journal.phase === "prepared" || journal.phase === "copied") {
+    const expectedBindingIdentity = journal.expectedFromBindingIdentity;
+    if (!expectedBindingIdentity) {
+      return { recovered: false, reason: "missing_binding_identity" };
+    }
+
+    // The registry commit can succeed just before the process advances the
+    // journal from copied to binding_committed. Recognize only the exact
+    // transferred identity; any other destination binding stays untouched.
+    if (
+      journal.phase === "copied" &&
+      !source?.boundChatId &&
+      hasTransferredAttendanceBindingIdentity(
+        expectedBindingIdentity,
+        destination
+      )
+    ) {
+      await updateJournalFn(journal.id, "binding_committed");
+      const cleanup = await completeAttendanceTransferCleanup({
+        journal,
+        sheets,
+        config,
+        transferAttendanceRowsFn,
+        updateJournalFn,
+        clearJournalFn
+      });
+      return cleanup.cleaned
+        ? {
+            recovered: true,
+            reason: "cleanup_completed",
+            cleanupResults: cleanup.attendanceResults
+          }
+        : {
+            recovered: false,
+            reason: "cleanup_blocked",
+            cleanupResults: cleanup.attendanceResults
+          };
+    }
+
+    if (
+      !source?.boundChatId ||
+      destination?.boundChatId ||
+      getAppointmentBindingIdentity(source) !== expectedBindingIdentity
+    ) {
+      return { recovered: false, reason: "binding_state_mismatch" };
+    }
+
+    if (journal.phase === "prepared") {
+      const copyResults = await transferAttendanceRowsFn(
+        sheets,
+        config,
+        journal.fromAppointment,
+        journal.toAppointment,
+        { phase: "copy" }
+      );
+      if (isAttendanceTransferBlocked(copyResults)) {
+        return { recovered: false, reason: "copy_blocked", copyResults };
+      }
+      await updateJournalFn(journal.id, "copied", {
+        copiedSheets: copyResults.filter((entry) => entry.transferred).map((entry) => entry.title)
+      });
+    }
+
+    const binding = await transferAppointmentBindingFn(
+      journal.fromAppointment,
+      journal.toAppointment,
+      {
+        expectedFromBindingIdentity: expectedBindingIdentity,
+        // Copy completion is durable in the journal before this point. Do not
+        // replay it while the storage lock is held; just revalidate and commit.
+        prepare: async () => ({ ok: true })
+      }
+    );
+    if (!binding.ok) {
+      return { recovered: false, reason: "binding_commit_blocked", binding };
+    }
+    await updateJournalFn(journal.id, "binding_committed");
+  }
+
+  if (source?.boundChatId || !destination?.boundChatId) {
+    // The committed phase is checked from the restart snapshot. The prepared
+    // and copied phases just committed the binding through storage above.
+    if (journal.phase === "binding_committed") {
+      return { recovered: false, reason: "binding_state_mismatch" };
+    }
+  }
+
+  const cleanup = await completeAttendanceTransferCleanup({
+    journal,
+    sheets,
+    config,
+    transferAttendanceRowsFn,
+    updateJournalFn,
+    clearJournalFn
+  });
+  if (!cleanup.cleaned) {
+    return {
+      recovered: false,
+      reason: "cleanup_blocked",
+      cleanupResults: cleanup.attendanceResults
+    };
+  }
+
+  return { recovered: true, reason: "cleanup_completed", cleanupResults: cleanup.attendanceResults };
+}
+
+function hasTransferredAttendanceBindingIdentity(expectedFromBindingIdentity, destination) {
+  if (!destination?.boundChatId || !expectedFromBindingIdentity) {
+    return false;
+  }
+
+  const [, ...bindingParts] = String(expectedFromBindingIdentity).split("\u0000");
+  if (bindingParts.length < 2) {
+    return false;
+  }
+
+  return getAppointmentBindingIdentity(destination) ===
+    `${destination.appointment}\u0000${bindingParts.join("\u0000")}`;
+}
+
+async function completeAttendanceTransferCleanup({
+  journal,
+  sheets,
+  config,
+  transferAttendanceRowsFn = transferAttendanceRows,
+  updateJournalFn = updateAttendanceTransferJournal,
+  clearJournalFn = clearAttendanceTransferJournal
+}) {
+  const attendanceResults = await transferAttendanceRowsFn(
+    sheets,
+    config,
+    journal.fromAppointment,
+    journal.toAppointment,
+    { phase: "clear" }
+  );
+  if (isAttendanceTransferCleanupBlocked(attendanceResults)) {
+    return { cleaned: false, attendanceResults };
+  }
+
+  await updateJournalFn(journal.id, "completed");
+  await clearJournalFn(journal.id);
+  return { cleaned: true, attendanceResults };
+}
+
 export async function createAttendanceBot(config) {
   await recoverStorageTransactions();
   const bot = new Telegraf(config.telegramBotToken, {
@@ -5400,36 +5616,29 @@ export async function createAttendanceBot(config) {
   const pendingTransfer = await getAttendanceTransferJournal();
   if (pendingTransfer) {
     const registry = await getAppointmentRegistry();
-    const source = registry.appointments.find((entry) => entry.appointment === pendingTransfer.fromAppointment);
-    const destination = registry.appointments.find((entry) => entry.appointment === pendingTransfer.toAppointment);
-    if (
-      pendingTransfer.phase === "binding_committed" &&
-      !source?.boundChatId &&
-      destination?.boundChatId
-    ) {
-      try {
-        await transferAttendanceRows(
-          sheets,
-          config,
-          pendingTransfer.fromAppointment,
-          pendingTransfer.toAppointment,
-          { phase: "clear" }
-        );
-        await updateAttendanceTransferJournal(pendingTransfer.id, "completed");
-        await clearAttendanceTransferJournal(pendingTransfer.id);
+    try {
+      const recovery = await recoverAttendanceTransferJournal({
+        journal: pendingTransfer,
+        registry,
+        sheets,
+        config
+      });
+      if (recovery.recovered) {
         logBot("Recovered interrupted attendance transfer cleanup.", {
           fromAppointment: pendingTransfer.fromAppointment,
           toAppointment: pendingTransfer.toAppointment
         });
-      } catch (error) {
-        logBotError("Attendance transfer recovery requires retry; journal retained.", {
-          error: error.message,
+      } else {
+        logBotWarn("Attendance transfer journal retained for safe operator recovery.", {
+          reason: recovery.reason,
+          phase: pendingTransfer.phase,
           fromAppointment: pendingTransfer.fromAppointment,
           toAppointment: pendingTransfer.toAppointment
         });
       }
-    } else {
-      logBotWarn("Attendance transfer journal retained for safe operator recovery.", {
+    } catch (error) {
+      logBotError("Attendance transfer recovery requires retry; journal retained.", {
+        error: error.message,
         phase: pendingTransfer.phase,
         fromAppointment: pendingTransfer.fromAppointment,
         toAppointment: pendingTransfer.toAppointment
@@ -5477,15 +5686,18 @@ export async function createAttendanceBot(config) {
           return false;
         }
         try {
-          await runAsNonessentialSnapshotRefresh(() =>
-            preloadSheetSnapshots(sheets, config, adminCache, {
-              structural: false,
-              normalizeAliases: options.reason === "five-minute"
-            })
-          );
+          const refreshSnapshots = () => preloadSheetSnapshots(sheets, config, adminCache, {
+            structural: false,
+            normalizeAliases: options.reason === "five-minute"
+          });
+          if (isEssential) {
+            await refreshSnapshots();
+          } else {
+            await runAsNonessentialSnapshotRefresh(refreshSnapshots);
+          }
           return true;
         } catch (error) {
-          if (isSnapshotRefreshDeferredError(error)) {
+          if (!isEssential && isSnapshotRefreshDeferredError(error)) {
             logBot("Snapshot refresh yielded after broadcast began.", {
               reason: options.reason ?? "background"
             });
@@ -6793,6 +7005,15 @@ export async function createAttendanceBot(config) {
       ctx.session.awaitingAttendance = false;
       const currentMessageId = getMessageId(ctx.callbackQuery?.message);
 
+      // Serialize against an expiring cleanup before changing this message's
+      // markup. The delayed cleanup is per-message serialized with this
+      // cancellation, so it cannot remove the freshly installed keyboard.
+      await cancelAttendanceButtonCleanup(ctx.chat.id, currentMessageId).catch((error) => {
+        logBotError("Failed to cancel prior attendance confirmation button cleanup.", {
+          error: error.message
+        });
+      });
+
       // The queue append above is already durable. Complete the user-visible
       // response, persist state, and clean older reminders concurrently.
       await Promise.all([
@@ -7859,13 +8080,11 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      // Validate and reserve both bindings under the storage mutation lock
-      // before touching Sheets. This prevents an old inline menu from copying
-      // attendance into a destination that has since been claimed.
-      const transferJournal = await beginAttendanceTransferJournal(
-        from.appointment,
-        to.appointment
-      );
+      // Validate the binding and create the recovery journal inside the same
+      // storage-serialized preparation step. A stale callback therefore cannot
+      // leave a prepared journal behind before its binding is proven current.
+      let transferJournal;
+      let remoteMutationOccurred = false;
       let result;
       try {
         result = await transferAppointmentBinding(
@@ -7873,7 +8092,21 @@ export async function createAttendanceBot(config) {
         to.appointment,
         {
           expectedFromBindingIdentity: from.bindingIdentity,
-          prepare: async ({ fromAppointment, toAppointment }) => {
+          prepare: async ({ fromAppointment, toAppointment, bindingIdentity }) => {
+            try {
+              transferJournal = await beginAttendanceTransferJournal(
+                fromAppointment,
+                toAppointment,
+                { expectedFromBindingIdentity: bindingIdentity }
+              );
+            } catch (error) {
+              logBotWarn("Rejected transfer while recovery journal is retained.", {
+                fromAppointment,
+                toAppointment,
+                error: error.message
+              });
+              return { ok: false, reason: "attendance_transfer_recovery_required" };
+            }
             const attendanceResults = await transferAttendanceRows(
               sheets,
               config,
@@ -7889,6 +8122,7 @@ export async function createAttendanceBot(config) {
                 attendanceResults
               };
             }
+            remoteMutationOccurred = attendanceResults.some((entry) => entry.transferred);
             await updateAttendanceTransferJournal(transferJournal.id, "copied", {
               copiedSheets: attendanceResults.filter((entry) => entry.transferred).map((entry) => entry.title)
             });
@@ -7907,16 +8141,31 @@ export async function createAttendanceBot(config) {
 
       if (result.ok) {
         await updateAttendanceTransferJournal(transferJournal.id, "binding_committed");
-        const attendanceResults = await transferAttendanceRows(
+        const cleanup = await completeAttendanceTransferCleanup({
+          journal: transferJournal,
           sheets,
-          config,
-          result.fromAppointment,
-          result.toAppointment,
-          { phase: "clear" }
-        );
-        await updateAttendanceTransferJournal(transferJournal.id, "completed");
-        await clearAttendanceTransferJournal(transferJournal.id);
-        const sheetsMoved = attendanceResults.filter((r) => r.transferred).map((r) => r.title);
+          config
+        });
+        if (!cleanup.cleaned) {
+          logBotError("Attendance transfer binding committed but source cleanup is blocked; journal retained.", {
+            fromAppointment: result.fromAppointment,
+            toAppointment: result.toAppointment,
+            attendanceResults: cleanup.attendanceResults
+          });
+          await sendOrUpdateAdminMessage(
+            ctx,
+            `⚠️ Transferred <b>${result.fromAppointment}</b> → <b>${result.toAppointment}</b>, but source attendance cleanup is blocked. Recovery is required; the transfer journal has been retained.`,
+            Markup.inlineKeyboard([[
+              Markup.button.callback("🔙 Back", "admin:menu:roster")
+            ], [
+              Markup.button.callback("❌ Close", "admin:close")
+            ]]),
+            { parse_mode: "HTML" }
+          );
+          await refreshAdminCache(adminCache, config);
+          return;
+        }
+        const sheetsMoved = cleanup.attendanceResults.filter((r) => r.transferred).map((r) => r.title);
         const attendanceNote = sheetsMoved.length > 0
           ? `\nAttendance carried over from: ${sheetsMoved.join(", ")}.`
           : "";
@@ -7933,9 +8182,12 @@ export async function createAttendanceBot(config) {
           { parse_mode: "HTML" }
         );
       } else {
-        // No binding changed when preflight rejects the transfer, so this
-        // journal is safe to remove and a corrected admin action may retry.
-        await clearAttendanceTransferJournal(transferJournal.id);
+        // Only this invocation's untouched prepared journal is safe to remove.
+        // A copied or committed journal may represent a crash after a remote
+        // Sheets mutation and must remain available for recovery.
+        if (transferJournal && !remoteMutationOccurred) {
+          await clearAttendanceTransferJournal(transferJournal.id);
+        }
         const message = result.reason === "attendance_transfer_blocked"
           ? formatAttendanceTransferBlockedMessage(
               result.preparation?.attendanceResults ?? [],
@@ -8072,6 +8324,7 @@ export const __testing = {
   buildHomeMenuText,
   buildDatedAttendanceMenu,
   buildDailyAttendanceIdempotencyKey,
+  buildWeeklyAttendanceIdempotencyKey,
   rejectExpiredInteraction,
   addManagedAppointment,
   removeManagedAppointment,
@@ -8079,6 +8332,7 @@ export const __testing = {
   formatAppointmentTransferFailure,
   formatAttendanceTransferBlockedMessage,
   isAttendanceTransferBlocked,
+  isAttendanceTransferCleanupBlocked,
   isPrivateTelegramIdentity,
   appendAttendancePromptMessageId,
   formatDepartmentViewMessage,
@@ -8103,6 +8357,8 @@ export const __testing = {
   removeObsoleteAttendancePromptMessages,
   restoreWeeklyAttendanceSession,
   registerBackgroundSchedules,
+  completeAttendanceTransferCleanup,
+  recoverAttendanceTransferJournal,
   resetRosterSyncGuard() { rosterSyncInProgress = false; },
   detectSnapshotDivergences,
   snapshotAppointmentHasData,

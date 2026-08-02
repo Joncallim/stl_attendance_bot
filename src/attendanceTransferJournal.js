@@ -12,24 +12,25 @@ export async function getAttendanceTransferJournal() {
 // The journal is intentionally separate from the user-binding transaction: a
 // crash between Sheets copy, binding commit, and source clear must leave a
 // durable, operator-visible recovery record rather than silently guessing.
-export async function beginAttendanceTransferJournal(fromAppointment, toAppointment) {
+export async function beginAttendanceTransferJournal(
+  fromAppointment,
+  toAppointment,
+  details = {}
+) {
   return runSerialized(JOURNAL_LOCK, async () => {
     const existing = await getAttendanceTransferJournal();
-    if (existing && (
-      existing.fromAppointment !== fromAppointment ||
-      existing.toAppointment !== toAppointment
-    )) {
+    if (existing) {
       throw new Error(
-        `Another attendance transfer (${existing.fromAppointment} → ${existing.toAppointment}) requires recovery first.`
+        `Attendance transfer recovery is required for ${existing.fromAppointment} → ${existing.toAppointment} (phase: ${existing.phase}).`
       );
     }
-    if (existing) return existing;
 
     const journal = {
       version: 1,
       id: randomUUID(),
       fromAppointment,
       toAppointment,
+      expectedFromBindingIdentity: details.expectedFromBindingIdentity ?? null,
       phase: "prepared",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()

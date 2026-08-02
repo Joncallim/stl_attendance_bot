@@ -153,7 +153,7 @@ test("permanent Telegram failures retire cleanup jobs", async () => {
   });
 });
 
-test("an older in-flight cleanup cannot erase a newer resubmission", async () => {
+test("cancellation waits for an in-flight cleanup before a new keyboard is installed", async () => {
   await withTempDataDir(async () => {
     const firstCompletedAt = new Date("2026-07-30T08:00:00.000Z");
     const cleanupAt = new Date(
@@ -167,22 +167,23 @@ test("an older in-flight cleanup cannot erase a newer resubmission", async () =>
     const editReleased = new Promise((resolve) => {
       releaseEdit = resolve;
     });
+    let finalMarkup = { inline_keyboard: [[{ text: "old" }]] };
 
     await scheduleAttendanceButtonCleanup("chat-1", 123, firstCompletedAt);
     const cleanupPromise = cleanupExpiredAttendanceButtons({
       async editMessageReplyMarkup() {
         notifyEditStarted();
         await editReleased;
+        finalMarkup = { inline_keyboard: [] };
       }
     }, { now: cleanupAt });
 
     await editStarted;
-    const newerJob = await scheduleAttendanceButtonCleanup(
-      "chat-1",
-      123,
-      cleanupAt
-    );
+    const cancelPromise = cancelAttendanceButtonCleanup("chat-1", 123);
     releaseEdit();
+    assert.equal(await cancelPromise, true, "cancellation runs after the old edit completes");
+    finalMarkup = { inline_keyboard: [[{ text: "fresh" }]] };
+    const newerJob = await scheduleAttendanceButtonCleanup("chat-1", 123, cleanupAt);
 
     assert.deepEqual(await cleanupPromise, {
       attempted: 1,
@@ -196,5 +197,6 @@ test("an older in-flight cleanup cannot erase a newer resubmission", async () =>
       Date.parse(pendingJob.removeAfter),
       cleanupAt.getTime() + ATTENDANCE_BUTTON_TTL_MS
     );
+    assert.deepEqual(finalMarkup, { inline_keyboard: [[{ text: "fresh" }]] });
   });
 });

@@ -109,6 +109,214 @@ test("attendance transfer conflict message explains the actionable sheet cells",
   assert.doesNotMatch(message, /destination_has_attendance|transfer_aborted_due_to_conflict/);
 });
 
+test("duplicate appointment rows block an attendance transfer before the binding moves", () => {
+  const results = [{
+    title: "Aug 26",
+    skipped: true,
+    reason: "duplicate_appointment_row",
+    fromRowNumbers: [2, 8],
+    toRowNumbers: [3]
+  }];
+
+  assert.equal(__testing.isAttendanceTransferBlocked(results), true);
+  assert.match(
+    __testing.formatAttendanceTransferBlockedMessage(results, "BRAVO"),
+    /appointment appears more than once/
+  );
+});
+
+test("live transfer cleanup retains its journal when any source clear is blocked", async () => {
+  const calls = [];
+  const result = await __testing.completeAttendanceTransferCleanup({
+    journal: { id: "journal-1", fromAppointment: "ALPHA", toAppointment: "BRAVO" },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async (_sheets, _config, _from, _to, options) => {
+      calls.push(options);
+      return [{ title: "Aug 26", skipped: true, reason: "duplicate_appointment_row" }];
+    },
+    updateJournalFn: async () => calls.push("update"),
+    clearJournalFn: async () => calls.push("clear")
+  });
+
+  assert.equal(result.cleaned, false);
+  assert.deepEqual(calls, [{ phase: "clear" }]);
+});
+
+test("restart recovery retains blocked and legacy partial transfer journals", async () => {
+  const calls = [];
+  const committed = await __testing.recoverAttendanceTransferJournal({
+    journal: {
+      id: "journal-committed",
+      phase: "binding_committed",
+      fromAppointment: "ALPHA",
+      toAppointment: "BRAVO"
+    },
+    registry: { appointments: [{ appointment: "ALPHA", boundChatId: null }, { appointment: "BRAVO", boundChatId: "chat-1" }] },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async () => [{ title: "Aug 26", conflict: true, reason: "destination_has_attendance" }],
+    updateJournalFn: async () => calls.push("update"),
+    clearJournalFn: async () => calls.push("clear")
+  });
+  const partial = await __testing.recoverAttendanceTransferJournal({
+    journal: {
+      id: "journal-partial",
+      phase: "copied",
+      fromAppointment: "ALPHA",
+      toAppointment: "BRAVO"
+    },
+    registry: { appointments: [] },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async () => {
+      throw new Error("partial journals must not replay automatically");
+    }
+  });
+
+  assert.equal(committed.reason, "cleanup_blocked");
+  assert.equal(partial.reason, "missing_binding_identity");
+  assert.deepEqual(calls, []);
+});
+
+test("restart recovery resumes a prepared transfer only with its persisted binding identity", async () => {
+  const source = {
+    appointment: "ALPHA",
+    boundChatId: "chat-1",
+    boundAt: "2026-03-24T00:00:00.000Z"
+  };
+  const expectedBindingIdentity = "ALPHA\u0000chat-1\u00002026-03-24T00:00:00.000Z";
+  const calls = [];
+  const result = await __testing.recoverAttendanceTransferJournal({
+    journal: {
+      id: "prepared-journal",
+      phase: "prepared",
+      fromAppointment: "ALPHA",
+      toAppointment: "BRAVO",
+      expectedFromBindingIdentity: expectedBindingIdentity
+    },
+    registry: { appointments: [source, { appointment: "BRAVO", boundChatId: null }] },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async (_sheets, _config, _from, _to, options) => {
+      calls.push(`sheet:${options.phase}`);
+      return [{ title: "Mar 26", transferred: true }];
+    },
+    transferAppointmentBindingFn: async (_from, _to, options) => {
+      calls.push(`binding:${options.expectedFromBindingIdentity}`);
+      assert.deepEqual(await options.prepare(), { ok: true });
+      return { ok: true };
+    },
+    updateJournalFn: async (_id, phase) => calls.push(`journal:${phase}`),
+    clearJournalFn: async () => calls.push("journal:clear")
+  });
+
+  assert.equal(result.recovered, true);
+  assert.deepEqual(calls, [
+    "sheet:copy",
+    "journal:copied",
+    `binding:${expectedBindingIdentity}`,
+    "journal:binding_committed",
+    "sheet:clear",
+    "journal:completed",
+    "journal:clear"
+  ]);
+});
+
+test("restart recovery resumes a copied transfer without replaying its remote copy", async () => {
+  const expectedBindingIdentity = "ALPHA\u0000chat-1\u00002026-03-24T00:00:00.000Z";
+  const calls = [];
+  const result = await __testing.recoverAttendanceTransferJournal({
+    journal: {
+      id: "copied-journal",
+      phase: "copied",
+      fromAppointment: "ALPHA",
+      toAppointment: "BRAVO",
+      expectedFromBindingIdentity: expectedBindingIdentity
+    },
+    registry: {
+      appointments: [
+        { appointment: "ALPHA", boundChatId: "chat-1", boundAt: "2026-03-24T00:00:00.000Z" },
+        { appointment: "BRAVO", boundChatId: null }
+      ]
+    },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async (_sheets, _config, _from, _to, options) => {
+      calls.push(`sheet:${options.phase}`);
+      assert.equal(options.phase, "clear");
+      return [{ title: "Mar 26", transferred: true }];
+    },
+    transferAppointmentBindingFn: async (_from, _to, options) => {
+      calls.push("binding");
+      assert.deepEqual(await options.prepare(), { ok: true });
+      return { ok: true };
+    },
+    updateJournalFn: async (_id, phase) => calls.push(`journal:${phase}`),
+    clearJournalFn: async () => calls.push("journal:clear")
+  });
+
+  assert.equal(result.recovered, true);
+  assert.deepEqual(calls, [
+    "binding",
+    "journal:binding_committed",
+    "sheet:clear",
+    "journal:completed",
+    "journal:clear"
+  ]);
+});
+
+test("restart recovery clears source attendance when binding committed before copied journal advanced", async () => {
+  const expectedBindingIdentity = "ALPHA\u0000chat-1\u00002026-03-24T00:00:00.000Z";
+  const calls = [];
+  const result = await __testing.recoverAttendanceTransferJournal({
+    journal: {
+      id: "copied-after-binding-journal",
+      phase: "copied",
+      fromAppointment: "ALPHA",
+      toAppointment: "BRAVO",
+      expectedFromBindingIdentity: expectedBindingIdentity
+    },
+    registry: {
+      appointments: [
+        { appointment: "ALPHA", boundChatId: null },
+        { appointment: "BRAVO", boundChatId: "chat-1", boundAt: "2026-03-24T00:00:00.000Z" }
+      ]
+    },
+    sheets: {},
+    config: {},
+    transferAttendanceRowsFn: async (_sheets, _config, _from, _to, options) => {
+      calls.push(`sheet:${options.phase}`);
+      assert.equal(options.phase, "clear");
+      return [{ title: "Mar 26", transferred: true }];
+    },
+    transferAppointmentBindingFn: async () => {
+      throw new Error("already committed bindings must not be replayed");
+    },
+    updateJournalFn: async (_id, phase) => calls.push(`journal:${phase}`),
+    clearJournalFn: async () => calls.push("journal:clear")
+  });
+
+  assert.equal(result.recovered, true);
+  assert.deepEqual(calls, [
+    "journal:binding_committed",
+    "sheet:clear",
+    "journal:completed",
+    "journal:clear"
+  ]);
+});
+
+test("weekly retry keys supersede a prior status after crash recovery", () => {
+  const absent = __testing.buildWeeklyAttendanceIdempotencyKey(
+    "flow-1", "ALPHA", "2026-03-24", "ABSENT"
+  );
+  const present = __testing.buildWeeklyAttendanceIdempotencyKey(
+    "flow-1", "ALPHA", "2026-03-24", "PRESENT"
+  );
+
+  assert.notEqual(absent, present);
+});
+
 test("stale transfer destination message does not expose internal reason codes", () => {
   const message = __testing.formatAppointmentTransferFailure(
     { ok: false, reason: "to_already_bound" },
@@ -1163,7 +1371,9 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
           if (options.reason === "reminder") {
             reminderRefreshWasEssential = options.essentialSnapshotRefresh === true;
             await reminderSync;
+            return { monthSlicesRefreshed: true };
           }
+          return { monthSlicesRefreshed: true };
         },
         setMaintenanceRunning: () => {}
       },
@@ -1213,6 +1423,51 @@ test("0800 reminder only sends to users with unfilled attendance", async () => {
 
   assert.deepEqual(prompts, ["chat-2"]);
   assert.equal(reminderRefreshWasEssential, true);
+});
+
+test("0800 reminder skips recipients when its essential refresh is deferred", async () => {
+  const schedules = [];
+  const prompts = [];
+
+  __testing.registerBackgroundSchedules({
+    bot: {},
+    sheets: {},
+    config: {
+      timezone: "Asia/Singapore",
+      firstReminderTime: "07:00",
+      secondReminderTime: "08:00"
+    },
+    adminCache: {
+      syncManager: {
+        runCycle: async (options) => options.reason === "reminder"
+          ? { monthSlicesRefreshed: false }
+          : { monthSlicesRefreshed: true },
+        setMaintenanceRunning: () => {}
+      },
+      sheetSnapshots: {
+        snapshots: new Map()
+      }
+    },
+    deps: {
+      setIntervalFn: () => 0,
+      setTimeoutFn: () => 0,
+      scheduleFn: (expression, fn) => {
+        schedules.push({ expression, fn });
+        return { stop() {} };
+      },
+      refreshAttendanceOptionUsageFn: async () => {},
+      runDailySheetMaintenanceFn: async () => {},
+      runStartupSheetCleanupFn: async () => {},
+      isReminderWorkingDayFn: async () => true,
+      listUsersFn: async () => [{ chatId: "chat-1", appointment: "ALPHA" }],
+      sendPromptToChatFn: async (_bot, _config, chatId) => prompts.push(chatId)
+    }
+  });
+
+  const reminderSchedule = schedules.find((entry) => entry.expression === "0 8 * * *");
+  await reminderSchedule.fn();
+
+  assert.deepEqual(prompts, []);
 });
 
 test("queue status shows empty message when nothing is outstanding", async () => {

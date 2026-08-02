@@ -498,6 +498,49 @@ test("attendance transfer aborts every sheet before writing when a destination h
   }
 });
 
+test("attendance transfer blocks every month when an appointment row is duplicated", async () => {
+  const timezone = "Asia/Singapore";
+  const dates = [
+    __testing.shiftMonth(new Date(), timezone, -1),
+    new Date(),
+    __testing.shiftMonth(new Date(), timezone, 1)
+  ];
+  const initialSheets = {};
+
+  dates.forEach((date, index) => {
+    const { title, month } = __testing.getMonthParts(date, timezone);
+    initialSheets[title] = {
+      sheetId: index + 1,
+      values: [
+        ["Appointment", `1 ${month}`],
+        ["ALPHA", "PRESENT"],
+        ["ALPHA", ""],
+        ["BRAVO", ""],
+        ["Remarks"]
+      ]
+    };
+  });
+
+  const fake = createInMemorySheets(initialSheets);
+  const results = await transferAttendanceRows(
+    fake.client,
+    {
+      spreadsheetId: "spreadsheet-id",
+      timezone,
+      rosterStopMarkers: ["Remarks"]
+    },
+    "ALPHA",
+    "BRAVO",
+    { phase: "copy" }
+  );
+
+  assert.equal(
+    results.filter((entry) => entry.reason === "duplicate_appointment_row").length,
+    dates.length
+  );
+  assert.equal(fake.calls.batchValueUpdates.length, 0);
+});
+
 test("managed monthly rows follow onboarding order while preserving existing row data", async () => {
   const result = __testing.buildManagedMonthlyRows({
     preferredAppointments: ["BRAVO", "ALPHA"],

@@ -1174,7 +1174,8 @@ export async function transferAppointmentBinding(
       preparation = await options.prepare({
         fromAppointment: fromEntry.appointment,
         toAppointment: toEntry.appointment,
-        chatId: fromEntry.boundChatId
+        chatId: fromEntry.boundChatId,
+        bindingIdentity: currentFromBindingIdentity
       });
 
       if (preparation?.ok === false) {

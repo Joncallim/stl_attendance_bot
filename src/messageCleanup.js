@@ -21,6 +21,10 @@ function buildJobId(chatId, messageId) {
     .digest("hex");
 }
 
+function buildMessageMutexKey(chatId, messageId) {
+  return `attendance-button-cleanup-message:${buildJobId(chatId, messageId)}`;
+}
+
 function validateCleanupState(value) {
   if (
     !value ||
@@ -127,13 +131,15 @@ export async function scheduleAttendanceButtonCleanup(
     nextAttemptAt: null
   };
 
-  await runSerialized(CLEANUP_STATE_MUTEX_KEY, async () => {
-    const state = await readCleanupState();
-    const jobs = state.jobs.filter((entry) => entry.id !== job.id);
-    jobs.push(job);
-    await writeJsonFile(getCleanupFile(), {
-      version: CLEANUP_STATE_VERSION,
-      jobs
+  await runSerialized(buildMessageMutexKey(chatId, normalizedMessageId), async () => {
+    await runSerialized(CLEANUP_STATE_MUTEX_KEY, async () => {
+      const state = await readCleanupState();
+      const jobs = state.jobs.filter((entry) => entry.id !== job.id);
+      jobs.push(job);
+      await writeJsonFile(getCleanupFile(), {
+        version: CLEANUP_STATE_VERSION,
+        jobs
+      });
     });
   });
 
@@ -160,20 +166,22 @@ export async function cancelAttendanceButtonCleanup(chatId, messageId) {
 
   const jobId = buildJobId(chatId, normalizedMessageId);
 
-  return runSerialized(CLEANUP_STATE_MUTEX_KEY, async () => {
-    const state = await readCleanupState();
-    const jobs = state.jobs.filter((job) => job.id !== jobId);
+  return runSerialized(buildMessageMutexKey(chatId, normalizedMessageId), async () =>
+    runSerialized(CLEANUP_STATE_MUTEX_KEY, async () => {
+      const state = await readCleanupState();
+      const jobs = state.jobs.filter((job) => job.id !== jobId);
 
-    if (jobs.length === state.jobs.length) {
-      return false;
-    }
+      if (jobs.length === state.jobs.length) {
+        return false;
+      }
 
-    await writeJsonFile(getCleanupFile(), {
-      version: CLEANUP_STATE_VERSION,
-      jobs
-    });
-    return true;
-  });
+      await writeJsonFile(getCleanupFile(), {
+        version: CLEANUP_STATE_VERSION,
+        jobs
+      });
+      return true;
+    })
+  );
 }
 
 export async function cleanupExpiredAttendanceButtons(
@@ -207,7 +215,21 @@ export async function cleanupExpiredAttendanceButtons(
     }
 
     const results = await allSettledConcurrent(
-      dueJobs.map((job) => (signal) => removeInlineKeyboard(telegram, job, signal)),
+      dueJobs.map((job) => (signal) =>
+        runSerialized(buildMessageMutexKey(job.chatId, job.messageId), async () => {
+          const currentJob = await runSerialized(CLEANUP_STATE_MUTEX_KEY, async () => {
+            const state = await readCleanupState();
+            return state.jobs.find((entry) => entry.id === job.id) ?? null;
+          });
+
+          if (!currentJob || currentJob.scheduleId !== job.scheduleId) {
+            return { stale: true };
+          }
+
+          await removeInlineKeyboard(telegram, job, signal);
+          return { stale: false };
+        })
+      ),
       concurrency
     );
     let removed = 0;
@@ -229,6 +251,10 @@ export async function cleanupExpiredAttendanceButtons(
         }
 
         const result = results[index];
+
+        if (result.status === "fulfilled" && result.value?.stale) {
+          continue;
+        }
 
         if (result.status === "fulfilled") {
           jobsById.delete(attemptedJob.id);
@@ -272,5 +298,6 @@ export async function cleanupExpiredAttendanceButtons(
 
 export const __testing = {
   buildJobId,
+  buildMessageMutexKey,
   isPermanentTelegramEditError
 };

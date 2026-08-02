@@ -22,6 +22,10 @@ import {
   updateUserByChatId,
   upsertUser
 } from "../src/storage.js";
+import {
+  beginAttendanceTransferJournal,
+  getAttendanceTransferJournal
+} from "../src/attendanceTransferJournal.js";
 
 async function withTempDataDir(run) {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "attendance-storage-"));
@@ -547,12 +551,16 @@ test("transferAppointmentBinding rejects invalid combinations", async () => {
       expectedFromBindingIdentity: "ALPHA\u0000stale-chat-id",
       prepare: async () => {
         preparationCalled = true;
+        await beginAttendanceTransferJournal("ALPHA", "CHARLIE", {
+          expectedFromBindingIdentity: "ALPHA\u0000stale-chat-id"
+        });
         return { ok: true };
       }
     });
     assert.equal(sourceChanged.ok, false);
     assert.equal(sourceChanged.reason, "from_binding_changed");
     assert.equal(preparationCalled, false);
+    assert.equal(await getAttendanceTransferJournal(), null);
 
     // Cannot transfer from an unbound slot.
     const fromUnbound = await transferAppointmentBinding("CHARLIE", "ALPHA");

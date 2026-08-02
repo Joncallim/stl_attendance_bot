@@ -105,6 +105,35 @@ test("attendance queue deduplicates repeated keys inside one batch", async () =>
   });
 });
 
+test("weekly status edits after a restart use a new event and flush the replacement", async () => {
+  await withTempDataDir(async () => {
+    const config = { timezone: "Asia/Singapore" };
+    await enqueueAttendanceEvents(config, [{
+      appointment: "ALPHA",
+      status: "ABSENT",
+      date: new Date("2026-03-24T00:00:00.000Z"),
+      source: "weekly",
+      idempotencyKey: "weekly:flow-1:ALPHA:2026-03-24:absent-version"
+    }]);
+
+    // Simulate resuming the flow after a crash and changing the submitted
+    // selection before the original event reached Google Sheets.
+    await enqueueAttendanceEvents(config, [{
+      appointment: "ALPHA",
+      status: "PRESENT",
+      date: new Date("2026-03-24T00:00:00.000Z"),
+      source: "weekly",
+      idempotencyKey: "weekly:flow-1:ALPHA:2026-03-24:present-version"
+    }]);
+
+    assert.equal((await loadAttendanceQueueState()).events.size, 2);
+    const flushed = [];
+    await flushAttendanceQueue(async (entries) => flushed.push(...entries));
+
+    assert.deepEqual(flushed.map((entry) => entry.status), ["PRESENT"]);
+  });
+});
+
 test("attendance queue keeps events pending after a failed flush", async () => {
   await withTempDataDir(async () => {
     const config = { timezone: "Asia/Singapore" };
