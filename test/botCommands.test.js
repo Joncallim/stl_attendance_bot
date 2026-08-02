@@ -1533,3 +1533,46 @@ test("queue status surfaces conflicted entries with sync reminder", async () => 
   assert.match(messages[0], /2 conflicted/);
   assert.match(messages[0], /Sync Roster/);
 });
+
+test("attendance push self-heals a roster conflict and retries once", async () => {
+  const messages = [];
+  let flushCalls = 0;
+  let syncCalls = 0;
+  let resetCalls = 0;
+
+  await __testing.handleFlushAttendanceAdminAction({}, { timezone: "Asia/Singapore" }, {
+    getAttendanceQueueStatus: async () => ({ queueDepth: 1, conflictedCount: 0, permanentlyFailedCount: 0 }),
+    flushAttendanceQueue: async (writeEntries) => {
+      flushCalls += 1;
+      const outcome = await writeEntries([{
+        id: "event-1",
+        appointment: "ALPHA",
+        date: "2026-03-24",
+        status: "PRESENT"
+      }]);
+      return { flushedEvents: outcome.writtenEventIds ?? [] };
+    },
+    reconcilePendingAttendanceWithSheets: async () => flushCalls === 1
+      ? { writtenEventIds: [], skippedEvents: [], conflictedEvents: [{ eventId: "event-1", reason: "appointment_missing" }] }
+      : { writtenEventIds: ["event-1"], skippedEvents: [], conflictedEvents: [] },
+    syncRosterState: async () => {
+      syncCalls += 1;
+      return { currentMonthTitle: "Mar 26", nextMonthTitle: "Apr 26", driftDetected: false };
+    },
+    refreshAdminCache: async () => {},
+    preloadSheetSnapshots: async () => {},
+    resetConflictedQueueEntries: async () => {
+      resetCalls += 1;
+      return { resetCount: 1 };
+    },
+    sendOrUpdateAdminMessage: async (_ctx, message) => messages.push(message),
+    sendCompletionMessage: async (_ctx, message) => messages.push(message),
+    sheets: {},
+    cache: {}
+  });
+
+  assert.equal(flushCalls, 2);
+  assert.equal(syncCalls, 1);
+  assert.equal(resetCalls, 1);
+  assert.match(messages.at(-1), /1 entry written to sheet/);
+});

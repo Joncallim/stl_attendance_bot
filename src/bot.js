@@ -1748,31 +1748,30 @@ function formatHomeSynchronizationTimestamp(timestamp, timezone) {
 
 function buildHomeMenuText({ greeting, name, isAdminUser, timezone, syncStatus }) {
   const todayLabel = formatAttendanceDateLabel(new Date(), timezone);
-  const descriptions = [
-    "📝 Today's Attendance: Submit or update your attendance for today.",
-    ...getHomeWeekDescriptions(timezone),
-    "🏢 My Department: View and edit your department's workweek attendance.",
-    "⚠️ Deregister: Remove your Telegram binding and rotate your code.",
-    "📊 Summary: View the attendance summary for the selected day.",
-    "❓ Help: Show the command and usage guide.",
-    "❌ Close: Close this menu."
-  ];
-
-  if (isAdminUser) {
-    descriptions.splice(
-      2,
-      0,
-      "🛠️ Admin Menu: Manage roster sync, invitations, admins, prompts, and deregistration."
-    );
-  }
-
   const lines = [
     `${greeting}, ${name}. Today is ${todayLabel}.`,
     "",
-    "Choose an action below:",
+    "Choose an action:",
     "",
-    ...descriptions
+    "📝 Today's Attendance: Submit or update today's attendance.",
+    ...getHomeWeekDescriptions(timezone),
+    "🏢 My Department: View and edit your department's workweek.",
+    "📊 Summary: View attendance counts for a selected day.",
+    "❓ Help: Open the short user guide."
   ];
+
+  if (isAdminUser) {
+    lines.push(
+      "",
+      "🛠️ Admin Menu: Roster, invitations, prompts, queue, and settings."
+    );
+  }
+
+  lines.push(
+    "",
+    "⚠️ Deregister: Remove this Telegram binding.",
+    "❌ Close: Close this menu."
+  );
 
   if (isAdminUser) {
     const latestSynchronizationAt = getLatestHomeSynchronizationTimestamp(syncStatus);
@@ -1969,14 +1968,16 @@ function buildRosterDescription() {
   return [
     "Roster",
     "",
-    "Manage the onboarding roster and attendance sheets.",
+    "Keep the onboarding roster and attendance sheets aligned.",
     "",
     "🕓 Pending — Personnel who have not yet onboarded.",
-    "🔄 Sync Roster — Sort ONBOARDING and sync monthly attendance sheets.",
+    "🔄 Sync Roster — repair roster order, rows, and sheet layout.",
     "➕ Add Appointment — Add a new appointment and generate a registration code.",
     "➖ Remove Appointment — Remove an appointment and clear their Telegram binding.",
     "🔀 Transfer User — Move a registered user from one appointment slot to another.",
-    "🔓 Clear All Protections — Remove all sheet protections from the spreadsheet."
+    "🔓 Clear All Protections — Remove all sheet protections from the spreadsheet.",
+    "🔧 Self-Heal Logs — review automatic roster and cache repairs.",
+    "📄 Change Spreadsheet — point the bot at another validated spreadsheet."
   ].join("\n");
 }
 
@@ -2936,9 +2937,29 @@ async function startWeeklyAttendanceFlow(ctx, config, sheets, user, cache, weekO
     weeklyAttendanceFlowId: ctx.session.weeklyAttendanceFlowId
   });
 
-  await autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache);
-
+  // Public-holiday metadata is normally cached, but the first-ever load can
+  // take several seconds while data.gov.sg responds. Never make the user wait
+  // for that network call before seeing the weekly menu.
   await showWeeklyAttendanceOverview(ctx, config, user, cache);
+
+  const flowId = ctx.session.weeklyAttendanceFlowId;
+  void autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache)
+    .then(async () => {
+      if (
+        ctx.session.weeklyAttendanceFlowId !== flowId ||
+        ctx.session.awaitingWeeklyAttendance !== true ||
+        Number(ctx.session.weeklyAttendanceIndex ?? 0) !== 0
+      ) {
+        return;
+      }
+      await showWeeklyAttendanceOverview(ctx, config, user, cache);
+    })
+    .catch((error) => {
+      logBotWarn("Weekly public-holiday prefill deferred; the weekly menu remains usable.", {
+        error: error.message,
+        flowId
+      });
+    });
 }
 
 async function registerUser(ctx) {
@@ -4007,6 +4028,9 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       getAttendanceQueueStatus,
       flushAttendanceQueue,
       reconcilePendingAttendanceWithSheets,
+      syncRosterState,
+      refreshAdminCache,
+      resetConflictedQueueEntries,
       preloadSheetSnapshots,
       sendOrUpdateAdminMessage,
       sendCompletionMessage: (_ctx, message, replyMarkup, extraOptions) =>
@@ -4862,10 +4886,10 @@ async function handleSyncRosterAdminAction(ctx, config, deps) {
     logBotError("[Admin] Roster sync failed.", { error: error.message });
     await sendCompletionMessage(
       ctx,
-      `❌ Roster sync failed: ${error.message}`,
+      `❌ Roster sync failed: ${error.message}\n\nThe queued attendance was kept. The bot will retry its automatic repair path on a later sync.`,
       adminBackMenu
     );
-    throw error;
+    return;
   } finally {
     rosterSyncInProgress = false;
   }
@@ -4904,6 +4928,66 @@ async function handleClearProtectionsAdminAction(ctx, config, deps) {
   }
 }
 
+const ATTENDANCE_ROSTER_RECOVERY_REASONS = new Set([
+  "appointment_missing",
+  "appointment_identity_changed",
+  "duplicate_appointment_row",
+  "duplicate_date_column",
+  "date_column_changed",
+  "sheet_layout_changed",
+  "empty_sheet",
+  "from_row_not_found",
+  "to_row_not_found",
+  "no_date_columns"
+]);
+
+function isAttendanceRosterRecoveryReason(reason) {
+  return ATTENDANCE_ROSTER_RECOVERY_REASONS.has(String(reason ?? ""));
+}
+
+async function selfHealAttendanceRosterForQueue(deps, config) {
+  if (rosterSyncInProgress) {
+    logBotWarn("[SelfHeal] Attendance push found a roster conflict, but a roster sync is already running.");
+    return { ok: false, reason: "sync_in_progress", resetCount: 0 };
+  }
+
+  rosterSyncInProgress = true;
+  logBot("[SelfHeal] Attendance push found a roster conflict; starting one automatic repair attempt.");
+
+  try {
+    const roster = await deps.syncRosterState(deps.sheets, config);
+
+    if (roster.driftDetected) {
+      logBotWarn("[SelfHeal] Automatic roster repair stopped on unresolved sheet drift.", {
+        reason: "drift_detected"
+      });
+      return { ok: false, reason: "drift_detected", resetCount: 0 };
+    }
+
+    await deps.refreshAdminCache(deps.cache, config);
+    await deps.preloadSheetSnapshots(deps.sheets, config, deps.cache, {
+      force: true,
+      structural: false,
+      normalizeAliases: true
+    });
+    const resetResult = await deps.resetConflictedQueueEntries();
+
+    logBot("[SelfHeal] Automatic roster repair completed; conflicted attendance re-queued.", {
+      resetCount: resetResult.resetCount,
+      currentMonth: roster.currentMonthTitle,
+      nextMonth: roster.nextMonthTitle
+    });
+    return { ok: true, reason: "repaired", resetCount: resetResult.resetCount };
+  } catch (error) {
+    logBotError("[SelfHeal] Automatic roster repair failed; attendance remains queued.", {
+      error: error.message
+    });
+    return { ok: false, reason: error.message, resetCount: 0 };
+  } finally {
+    rosterSyncInProgress = false;
+  }
+}
+
 async function handleFlushAttendanceAdminAction(ctx, config, deps) {
   const adminBackMenu = Markup.inlineKeyboard([[
     Markup.button.callback("🔙 Back", "admin:main"),
@@ -4915,7 +4999,7 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
   if (status.queueDepth === 0) {
     const notes = [];
     if (status.conflictedCount > 0) {
-      notes.push(`⚠️ ${status.conflictedCount} conflicted ${status.conflictedCount === 1 ? "entry" : "entries"} cannot be pushed until a Sync Roster is run to fix the sheet layout.`);
+      notes.push(`⚠️ ${status.conflictedCount} conflicted ${status.conflictedCount === 1 ? "entry remains" : "entries remain"} queued for automatic roster repair.`);
     }
     if (status.permanentlyFailedCount > 0) {
       notes.push(`❌ ${status.permanentlyFailedCount} attendance ${status.permanentlyFailedCount === 1 ? "entry" : "entries"} permanently failed after exhausting retries and cannot be recovered automatically. Check the logs for details.`);
@@ -4930,10 +5014,12 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
 
   logBot(`[Admin] Attendance push started.`, { queueDepth: status.queueDepth });
 
-  await deps.sendOrUpdateAdminMessage(
-    ctx,
-    `📤 Pushing ${status.queueDepth} pending attendance ${status.queueDepth === 1 ? "entry" : "entries"} to Google Sheets…`
-  );
+  if (!deps.selfHealAttempted) {
+    await deps.sendOrUpdateAdminMessage(
+      ctx,
+      `📤 Pushing ${status.queueDepth} pending attendance ${status.queueDepth === 1 ? "entry" : "entries"} to Google Sheets…`
+    );
+  }
 
   let outcome = null;
 
@@ -4944,8 +5030,27 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
     });
 
     const writtenCount = outcome?.writtenEventIds?.length ?? result.flushedEvents?.length ?? 0;
-    const conflictedCount = outcome?.conflictedEvents?.length ?? 0;
+    const conflictedEvents = outcome?.conflictedEvents ?? [];
+    const conflictedCount = conflictedEvents.length;
     const skippedCount = outcome?.skippedEvents?.length ?? 0;
+
+    if (
+      conflictedCount > 0 &&
+      !deps.selfHealAttempted &&
+      conflictedEvents.every((entry) => isAttendanceRosterRecoveryReason(entry.reason))
+    ) {
+      const repair = await selfHealAttendanceRosterForQueue(deps, config);
+
+      if (repair.ok && repair.resetCount > 0) {
+        logBot("[Admin] Retrying attendance push after automatic roster repair.", {
+          resetCount: repair.resetCount
+        });
+        return handleFlushAttendanceAdminAction(ctx, config, {
+          ...deps,
+          selfHealAttempted: true
+        });
+      }
+    }
 
     logBot("[Admin] Attendance push complete.", { written: writtenCount, skipped: skippedCount, conflicted: conflictedCount });
 
@@ -4964,8 +5069,8 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
 
     if (conflictedCount > 0) {
       parts.push(
-        `⚠️ ${conflictedCount} conflicted — run 🔄 Sync Roster to fix the sheet layout, ` +
-        `then push again.`
+        `⚠️ ${conflictedCount} conflicted — automatic roster repair was attempted. ` +
+        `Review Sync Roster and try again when the sheet layout is corrected.`
       );
     }
 
@@ -4978,7 +5083,7 @@ async function handleFlushAttendanceAdminAction(ctx, config, deps) {
     logBotError("[Admin] Attendance push failed.", { error: error.message });
     await sendCompletionMessage(
       ctx,
-      `❌ Push failed: ${error.message}\n\nThe queue will retry automatically in the background.`,
+      `❌ Push could not complete: ${error.message}\n\nThe attendance remains queued. The bot will retry automatically, and a roster repair will be attempted when the error indicates a sheet-layout problem.`,
       adminBackMenu
     );
   }
@@ -5034,7 +5139,7 @@ async function handleQueueStatusAdminAction(ctx, deps) {
   if (conflictedCount > 0) {
     if (lines.length > 0) lines.push("");
     lines.push(
-      `⚠️ ${conflictedCount} conflicted ${conflictedCount === 1 ? "entry" : "entries"} — run 🔄 Sync Roster to fix the sheet layout, then push again.`
+      `⚠️ ${conflictedCount} conflicted ${conflictedCount === 1 ? "entry" : "entries"} — the bot will attempt roster repair before the next push. Use 🔄 Sync Roster for an immediate repair.`
     );
   }
 
@@ -6478,13 +6583,14 @@ export async function createAttendanceBot(config) {
 
   bot.action(/home:(.+)/, async (ctx) => {
     const action = ctx.match[1];
+    const isWeeklyEntryAction = action === "week:this" || action === "week:next" || action === "week";
 
     if (
       !action.startsWith("pick:attendance:") &&
       !action.startsWith("department:pickoption:") &&
       !action.startsWith("pick:week:")
     ) {
-      await ctx.answerCbQuery();
+      await ctx.answerCbQuery(isWeeklyEntryAction ? "Opening weekly attendance…" : undefined);
     }
 
     // Successful attendance confirmations reuse the original Telegram message.
