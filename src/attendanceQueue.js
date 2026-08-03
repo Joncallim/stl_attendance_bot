@@ -339,52 +339,49 @@ export async function flushAttendanceQueue(writeEntries) {
             return 0;
           });
 
-        const eligibleKeys = new Set(
-          unresolvedEvents
-            .filter((event) => !event.nextRetryAt || new Date(event.nextRetryAt).getTime() <= now)
-            .map((event) => `${event.appointment}:${event.date}`)
-        );
-        const latestEventByKey = new Map();
+        const eventsByKey = new Map();
         for (const event of unresolvedEvents) {
-          latestEventByKey.set(`${event.appointment}:${event.date}`, event);
+          const key = `${event.appointment}:${event.date}`;
+          if (!eventsByKey.has(key)) {
+            eventsByKey.set(key, []);
+          }
+          eventsByKey.get(key).push(event);
         }
-
-        // If the latest edit for a key is eligible, include its entire
-        // unresolved predecessor chain. This keeps the earliest optimistic
-        // lock even when an earlier edit is in retry backoff.
-        const attemptedKeys = new Set(
-          [...eligibleKeys].filter((key) => {
-            const latest = latestEventByKey.get(key);
-            return latest && (!latest.nextRetryAt || new Date(latest.nextRetryAt).getTime() <= now);
-          })
-        );
-        const pendingEvents = unresolvedEvents.filter((event) =>
-          attemptedKeys.has(`${event.appointment}:${event.date}`)
-        );
 
         const coalescedEntries = new Map();
         const eventGroups = new Map();
-        const firstEventByKey = new Map();
 
-        for (const event of pendingEvents) {
-          const key = `${event.appointment}:${event.date}`;
-          const firstEvent = firstEventByKey.get(key) ?? event;
-          firstEventByKey.set(key, firstEvent);
+        for (const [key, events] of eventsByKey.entries()) {
+          const firstEvent = events[0];
+          const hasRetryablePredecessor = events.some((event) => event.queueStatus === "failed_retryable");
+          const firstEligible = !firstEvent.nextRetryAt || new Date(firstEvent.nextRetryAt).getTime() <= now;
+
+          if (!firstEligible) {
+            continue;
+          }
+
+          if (hasRetryablePredecessor) {
+            // An earlier remote write may have succeeded even if its response
+            // was lost. Replay that predecessor alone first; a newer edit is
+            // safely applied on the next flush once the predecessor is known.
+            coalescedEntries.set(key, firstEvent);
+            eventGroups.set(key, [firstEvent]);
+            continue;
+          }
+
+          const latestEvent = events.at(-1);
           // Keep the latest status, but compare it with the value that was
           // expected before the first queued change. This preserves optimistic
           // locking when a user changes status more than once before Sheets
           // flushes (for example blank -> A -> B).
           coalescedEntries.set(key, {
-            ...event,
+            ...latestEvent,
             expectedPreviousValue: firstEvent.expectedPreviousValue ?? ""
           });
-
-          if (!eventGroups.has(key)) {
-            eventGroups.set(key, []);
-          }
-
-          eventGroups.get(key).push(event);
+          eventGroups.set(key, events);
         }
+
+        const pendingEvents = [...eventGroups.values()].flat();
 
         return {
           pendingEvents,

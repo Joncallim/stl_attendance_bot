@@ -337,14 +337,23 @@ test("a newer edit carries forward an earlier retrying predecessor", async () =>
       expectedPreviousValue: "A"
     });
 
-    const flushed = [];
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    const retried = [];
     await flushAttendanceQueue(async (entries) => {
-      flushed.push(...entries);
+      retried.push(...entries);
     });
 
-    assert.equal(flushed.length, 1);
-    assert.equal(flushed[0].status, "B");
-    assert.equal(flushed[0].expectedPreviousValue, "");
+    assert.equal(retried.length, 1);
+    assert.equal(retried[0].status, "A");
+
+    const corrected = [];
+    await flushAttendanceQueue(async (entries) => {
+      corrected.push(...entries);
+    });
+
+    assert.equal(corrected.length, 1);
+    assert.equal(corrected[0].status, "B");
+    assert.equal(corrected[0].expectedPreviousValue, "A");
   });
 });
 
