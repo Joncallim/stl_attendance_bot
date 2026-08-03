@@ -884,6 +884,19 @@ test("attendance options description groups codes using configured attendance gr
   assert.ok(description.indexOf("PRESENT") < description.indexOf("LL"));
 });
 
+test("attendance selection groups preserve configured categories and collect custom options", () => {
+  const groups = __testing.getAttendanceOptionGroups({
+    attendanceOptions: ["PRESENT", "DUTY", "LL", "FCL"],
+    attendanceGroups: [
+      { key: "present", label: "Present", options: ["PRESENT", "DUTY"] },
+      { key: "local_leave", label: "Local Leave", options: ["LL"] }
+    ]
+  });
+
+  assert.deepEqual(groups.map((group) => group.key), ["present", "local_leave", "other"]);
+  assert.deepEqual(groups.at(-1).options, ["FCL"]);
+});
+
 test("department workweek view uses the viewer's own department for non-admins", () => {
   const cache = {
     activeCodes: [

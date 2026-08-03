@@ -942,6 +942,54 @@ function buildInlineAttendanceMenu(
   return Markup.inlineKeyboard(rows);
 }
 
+function getAttendanceOptionGroups(config) {
+  const activeOptions = new Set(config.attendanceOptions ?? []);
+  const groups = [];
+  const assigned = new Set();
+
+  for (const group of config.attendanceGroups ?? []) {
+    const options = (group.options ?? []).filter((option) => activeOptions.has(option));
+    if (options.length === 0) continue;
+    groups.push({ ...group, options });
+    options.forEach((option) => assigned.add(option));
+  }
+
+  const uncategorized = [...activeOptions].filter((option) => !assigned.has(option));
+  if (uncategorized.length > 0) {
+    groups.push({
+      id: "other",
+      key: "other",
+      label: "Other",
+      options: uncategorized.sort((left, right) => left.localeCompare(right))
+    });
+  }
+
+  return groups;
+}
+
+function buildAttendanceGroupMenu(config, groupCallbackBuilder, backTarget, extraRows = []) {
+  const groups = getAttendanceOptionGroups(config);
+  const rows = [...extraRows];
+
+  for (let index = 0; index < groups.length; index += 2) {
+    rows.push(
+      groups.slice(index, index + 2).map((group) =>
+        Markup.button.callback(
+          `${group.label} (${group.options.length})`,
+          groupCallbackBuilder(group.key)
+        )
+      )
+    );
+  }
+
+  rows.push([
+    Markup.button.callback("🔙 Back", backTarget),
+    Markup.button.callback("❌ Close", "home:close")
+  ]);
+
+  return Markup.inlineKeyboard(rows);
+}
+
 function attendanceStatusFingerprint(status) {
   return createHash("sha256")
     .update(String(status ?? ""), "utf8")
@@ -974,6 +1022,15 @@ function buildDatedAttendanceMenu(
   const isoDate = toIsoDateString(date, config.timezone);
   const promptSuffix = menuOptions.promptId ? `:${menuOptions.promptId}` : "";
 
+  if (typeof menuOptions.groupCallbackBuilder === "function") {
+    return buildAttendanceGroupMenu(
+      config,
+      (groupKey) => menuOptions.groupCallbackBuilder(groupKey, isoDate, menuOptions.promptId ?? "legacy"),
+      backTarget,
+      extraRows
+    );
+  }
+
   return buildInlineAttendanceMenu(
     config.attendanceOptions,
     page,
@@ -984,6 +1041,61 @@ function buildDatedAttendanceMenu(
     {
       itemTokenBuilder: (option, index) =>
         `${index}:${attendanceStatusFingerprint(option)}`
+    }
+  );
+}
+
+function buildDatedAttendanceGroupMenu(
+  config,
+  date,
+  groupKey,
+  itemPrefix,
+  backTarget,
+  extraRows = [],
+  menuOptions = {}
+) {
+  const group = getAttendanceOptionGroups(config).find((entry) => entry.key === groupKey);
+  if (!group) {
+    return buildDatedAttendanceMenu(config, date, 0, itemPrefix, "", backTarget, extraRows, menuOptions);
+  }
+
+  const isoDate = toIsoDateString(date, config.timezone);
+  const promptSuffix = menuOptions.promptId ? `:${menuOptions.promptId}` : "";
+  const optionIndexByValue = new Map(config.attendanceOptions.map((option, index) => [option, index]));
+
+  return buildInlineAttendanceMenu(
+    group.options,
+    0,
+    `${itemPrefix}${promptSuffix}:${isoDate}`,
+    "",
+    backTarget,
+    extraRows,
+    {
+      itemTokenBuilder: (option) => {
+        const absoluteIndex = optionIndexByValue.get(option);
+        return `${absoluteIndex}:${attendanceStatusFingerprint(option)}`;
+      }
+    }
+  );
+}
+
+function buildAttendanceGroupOptionMenu(config, groupKey, itemPrefix, backTarget, extraRows = []) {
+  const group = getAttendanceOptionGroups(config).find((entry) => entry.key === groupKey);
+  if (!group) {
+    return buildAttendanceGroupMenu(config, () => backTarget, backTarget);
+  }
+
+  const optionIndexByValue = new Map(config.attendanceOptions.map((option, index) => [option, index]));
+  return buildInlineAttendanceMenu(
+    group.options,
+    0,
+    itemPrefix,
+    "",
+    backTarget,
+    extraRows,
+    {
+      itemTokenBuilder: (option) =>
+        `${optionIndexByValue.get(option)}:${attendanceStatusFingerprint(option)}`
     }
   );
 }
@@ -1866,8 +1978,8 @@ function buildAttendanceOptionsDescription(
   } else if (Array.isArray(attendanceGroups) && attendanceGroups.length > 0) {
     lines.push(`Current options (${attendanceOptions.length}):`);
 
-    for (const group of attendanceGroups) {
-      const visibleOptions = group.options.filter((option) => attendanceOptions.includes(option));
+    for (const group of getAttendanceOptionGroups({ attendanceOptions, attendanceGroups })) {
+      const visibleOptions = group.options;
 
       if (visibleOptions.length === 0) {
         continue;
@@ -2726,7 +2838,11 @@ async function askAttendance(ctx, config, user = null, cache = null) {
       "home:attendance:page",
       "home:main",
       [],
-      { promptId }
+      {
+        promptId,
+        groupCallbackBuilder: (groupKey, isoDate, prompt) =>
+          `home:attendance:groups:${prompt}:${isoDate}:${groupKey}`
+      }
     )
   );
   const messageId = getMessageId(promptMessage) ??
@@ -2872,7 +2988,11 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
       `home:pick:week:${weeklyState.flowId}`,
       `home:week:page:${weeklyState.flowId}`,
       `home:week:overview:${weeklyState.flowId}:${toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)}`,
-      [[Markup.button.callback(WEEK_SKIP_LABEL, `home:pick:week:${weeklyState.flowId}:${isoDate}:skip`)]]
+      [[Markup.button.callback(WEEK_SKIP_LABEL, `home:pick:week:${weeklyState.flowId}:${isoDate}:skip`)]],
+      {
+        groupCallbackBuilder: (groupKey, requestedDate) =>
+          `home:week:groups:${weeklyState.flowId}:${requestedDate}:${groupKey}`
+      }
     )
   );
   const messageId = getMessageId(promptMessage) ??
@@ -3470,13 +3590,36 @@ async function removeManagedAppointment(sheets, config, cache, appointment, opti
   });
 }
 
-function sortAttendanceOptionsByUsage(attendanceOptions, usageMap = {}) {
+function sortAttendanceOptionsByGroupAndUsage(attendanceOptions, attendanceGroups = [], usageMap = {}) {
+  const groupRank = new Map();
+  const optionRank = new Map();
+
+  attendanceGroups.forEach((group, groupIndex) => {
+    group.options.forEach((option, optionIndex) => {
+      groupRank.set(option, groupIndex);
+      optionRank.set(option, optionIndex);
+    });
+  });
+
   return [...attendanceOptions].sort((left, right) => {
+    const leftGroup = groupRank.get(left) ?? Number.MAX_SAFE_INTEGER;
+    const rightGroup = groupRank.get(right) ?? Number.MAX_SAFE_INTEGER;
+
+    if (leftGroup !== rightGroup) {
+      return leftGroup - rightGroup;
+    }
+
     const leftUsage = Number(usageMap[left] ?? 0);
     const rightUsage = Number(usageMap[right] ?? 0);
 
     if (rightUsage !== leftUsage) {
       return rightUsage - leftUsage;
+    }
+
+    const leftOption = optionRank.get(left) ?? Number.MAX_SAFE_INTEGER;
+    const rightOption = optionRank.get(right) ?? Number.MAX_SAFE_INTEGER;
+    if (leftOption !== rightOption) {
+      return leftOption - rightOption;
     }
 
     return left.localeCompare(right);
@@ -3485,10 +3628,17 @@ function sortAttendanceOptionsByUsage(attendanceOptions, usageMap = {}) {
 
 async function refreshAttendanceOptionUsage(sheets, config, cache) {
   const usageMap = await summarizeAttendanceOptionUsage(sheets, config);
+  const sortedOptions = sortAttendanceOptionsByGroupAndUsage(
+    config.attendanceOptions,
+    config.attendanceGroups ?? [],
+    usageMap
+  );
 
   await setAttendanceOptionUsage(usageMap);
+  await setAttendanceOptions(sortedOptions);
+  config.attendanceOptions = sortedOptions;
 
-  return config.attendanceOptions;
+  return sortedOptions;
 }
 
 async function renderCodesSubmenu(ctx, cache) {
@@ -6813,17 +6963,42 @@ export async function createAttendanceBot(config) {
       await sendOrUpdateAdminMessage(
         ctx,
         promptMessage,
-        buildInlineAttendanceMenu(
-          config.attendanceOptions,
-          0,
-          "home:department:pickoption",
-          `home:department:pickpage:${interaction.id}`,
-          `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}`,
-          [],
-          {
-            itemTokenBuilder: (option, index) =>
-              `${interaction.id}:${index}:${attendanceStatusFingerprint(option)}`
-          }
+        buildAttendanceGroupMenu(
+          config,
+          (groupKey) => `home:department:pickgroup:${interaction.id}:${groupKey}`,
+          `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}`
+        )
+      );
+      return;
+    }
+
+    if (action.startsWith("department:pickgroup:")) {
+      triggerBackgroundSheetRefresh(adminCache, "home:department:pickgroup");
+      const user = await ensureUserBound(ctx, config);
+      if (!user) return;
+
+      const [, , interactionId, groupKey] = action.split(":");
+      const current = getInteraction(ctx, interactionId, "department-attendance");
+      const target = current?.payload;
+      const group = getAttendanceOptionGroups(config).find((entry) => entry.key === groupKey);
+      if (!target || !group) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+
+      const targetDate = new Date(target.date);
+      const currentStatus = getCachedAttendanceStatus(adminCache, config, target.appointment, targetDate);
+      const dateLabel = formatAttendanceDateLabel(targetDate, config.timezone);
+      await sendOrUpdateAdminMessage(
+        ctx,
+        currentStatus
+          ? `Set ${target.appointment}'s attendance for ${dateLabel}. Current: ${currentStatus}. Choose from ${group.label}.`
+          : `Set ${target.appointment}'s attendance for ${dateLabel}. Choose from ${group.label}.`,
+        buildAttendanceGroupOptionMenu(
+          config,
+          groupKey,
+          `home:department:pickoption:${interactionId}`,
+          `home:department:pickgroup:${interactionId}:${groupKey}`
         )
       );
       return;
@@ -6990,6 +7165,57 @@ export async function createAttendanceBot(config) {
     if (action === "reportissue:cancel") {
       cancelInteractions(ctx);
       await renderHomeMenu(ctx, config, { cache: adminCache });
+      return;
+    }
+
+    if (action.startsWith("attendance:groups:")) {
+      const [, , promptId, isoDate, groupKey] = action.split(":");
+      const user = await ensureUserBound(ctx, config);
+      if (!user) return;
+
+      const date = parseIsoDate(isoDate);
+      const currentIsoDate = toIsoDateString(new Date(), config.timezone);
+      if (!date || isoDate !== currentIsoDate) {
+        await rejectExpiredInteraction(ctx, "This attendance prompt has expired. Nothing was changed.");
+        return;
+      }
+
+      if (!groupKey) {
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "Choose a category, then select your attendance status.",
+          buildAttendanceGroupMenu(
+            config,
+            (nextGroupKey) => `home:attendance:groups:${promptId}:${isoDate}:${nextGroupKey}`,
+            "home:main"
+          )
+        );
+        return;
+      }
+
+      const group = getAttendanceOptionGroups(config).find((entry) => entry.key === groupKey);
+      if (!group) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+
+      const existingStatus = getCachedAttendanceStatus(adminCache, config, user.appointment, date);
+      const label = formatAttendanceDateLabel(date, config.timezone);
+      await sendOrUpdateAdminMessage(
+        ctx,
+        existingStatus
+          ? `Your attendance for ${label} is currently ${existingStatus}. Select a status from ${group.label}.`
+          : `Select a status from ${group.label} for ${label}.`,
+        buildDatedAttendanceGroupMenu(
+          config,
+          date,
+          groupKey,
+          "home:pick:attendance",
+          "home:attendance:groups:" + promptId + ":" + isoDate,
+          [],
+          { promptId }
+        )
+      );
       return;
     }
 
@@ -7247,6 +7473,69 @@ export async function createAttendanceBot(config) {
       await updateUserByChatId(ctx.chat.id, { weeklyAttendanceIndex: dayIndex });
       await ctx.answerCbQuery();
       await promptWeeklyAttendanceDay(ctx, config, user, adminCache);
+      return;
+    }
+
+    if (action.startsWith("week:groups:")) {
+      const [, , flowId, isoDate, groupKey] = action.split(":");
+      const user = await ensureUserBound(ctx, config);
+      if (!user) return;
+
+      const weeklyState = getWeeklyAttendanceState(ctx, user);
+      const currentWeekId = weeklyState.dates[0]
+        ? toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)
+        : "";
+      const requestedDate = weeklyState.dates.find(
+        (value) => toIsoDateString(new Date(value), config.timezone) === isoDate
+      );
+      if (!flowId || flowId !== weeklyState.flowId || !requestedDate) {
+        await rejectExpiredInteraction(ctx, "This weekly prompt has expired. Nothing was changed.");
+        return;
+      }
+
+      const overviewTarget = `home:week:overview:${flowId}:${currentWeekId}`;
+      if (!groupKey) {
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "Choose a category, then select a status for the day.",
+          buildAttendanceGroupMenu(
+            config,
+            (nextGroupKey) => `home:week:groups:${flowId}:${isoDate}:${nextGroupKey}`,
+            overviewTarget
+          )
+        );
+        return;
+      }
+
+      const group = getAttendanceOptionGroups(config).find((entry) => entry.key === groupKey);
+      if (!group) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+
+      const date = new Date(requestedDate);
+      const currentStatus = getStagedAttendanceStatus(
+        weeklyState.entries,
+        isoDate,
+        (value) => toIsoDateString(value, config.timezone)
+      ) || getCachedAttendanceStatus(adminCache, config, user.appointment, date);
+      const label = formatAttendanceDateLabel(date, config.timezone);
+
+      await sendOrUpdateAdminMessage(
+        ctx,
+        currentStatus
+          ? `Your attendance for ${label} is currently ${currentStatus}. Select a status from ${group.label}.`
+          : `Select a status from ${group.label} for ${label}.`,
+        buildDatedAttendanceGroupMenu(
+          config,
+          date,
+          groupKey,
+          `home:pick:week:${flowId}`,
+          overviewTarget,
+          [[Markup.button.callback(WEEK_SKIP_LABEL, `home:pick:week:${flowId}:${isoDate}:skip`)]],
+          {}
+        )
+      );
       return;
     }
 
@@ -7704,7 +7993,7 @@ export async function createAttendanceBot(config) {
         );
         await sendOrUpdateAdminMessage(
           ctx,
-          "Attendance option usage has been refreshed. Display order remains canonical.",
+          "Attendance option usage has been refreshed. Categories stay in the configured order; options within each category are now sorted by recent usage.",
           buildAttendanceOptionsMenu()
         );
       } catch (error) {
@@ -8429,6 +8718,9 @@ export const __testing = {
   buildManageAdminsDescription,
   buildHomeMenuText,
   buildDatedAttendanceMenu,
+  getAttendanceOptionGroups,
+  buildAttendanceGroupMenu,
+  buildAttendanceGroupOptionMenu,
   buildDailyAttendanceIdempotencyKey,
   buildWeeklyAttendanceIdempotencyKey,
   rejectExpiredInteraction,
