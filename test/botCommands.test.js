@@ -1179,8 +1179,8 @@ test("unaccounted details separate Telegram users from people not registered", (
     }
   );
 
-  assert.match(details.lines.join("\n"), /Telegram users who have not entered attendance:/);
-  assert.match(details.lines.join("\n"), /People not yet registered for Telegram:/);
+  assert.match(details.lines.join("\n"), /registered with the attendance bot who have not submitted attendance:/);
+  assert.match(details.lines.join("\n"), /not yet registered with the attendance bot:/);
   assert.match(details.lines.join("\n"), /BOUND/);
   assert.match(details.lines.join("\n"), /NO TELEGRAM/);
   assert.equal(details.boundRows[0][0].url, "https://t.me/bound");

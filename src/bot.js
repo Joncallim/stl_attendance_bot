@@ -844,21 +844,23 @@ function buildUnaccountedDetails(date, config, appointments, registry, page = 0)
   const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
   const safePage = Math.min(Math.max(page, 0), totalPages - 1);
   const pageItems = items.slice(safePage * pageSize, (safePage + 1) * pageSize);
-  const lines = [`Attendance still missing for ${formatAttendanceDateLabel(date, config.timezone)}:`];
+  const dateLabel = formatAttendanceDateLabel(date, config.timezone);
+  const lines = [`Attendance still missing for ${dateLabel}:`];
   if (pageItems.some((item) => item.kind === "bound")) {
-    lines.push("", "Telegram users who have not entered attendance:");
+    lines.push("", "People registered with the attendance bot who have not submitted attendance:");
     lines.push(...pageItems.filter((item) => item.kind === "bound").map((item) => `• ${item.appointment}`));
   }
   if (pageItems.some((item) => item.kind === "notRegistered")) {
-    lines.push("", "People not yet registered for Telegram:");
+    lines.push("", "People not yet registered with the attendance bot:");
     lines.push(...pageItems.filter((item) => item.kind === "notRegistered").map((item) => `• ${item.appointment}`));
   }
   if (pageItems.some((item) => item.kind === "unavailable")) {
-    lines.push("", "Registration status is unavailable for:");
+    lines.push("", "These names are in the attendance sheet but not in the bot roster:");
     lines.push(...pageItems.filter((item) => item.kind === "unavailable").map((item) => `• ${item.appointment}`));
   }
   if (items.length === 0) {
-    lines.push("", "Everyone has entered attendance.");
+    lines[0] = `Attendance complete for ${dateLabel}.`;
+    lines.push("Everyone has submitted attendance.");
   }
 
   for (const item of pageItems.filter((entry) => entry.kind === "bound")) {
@@ -2220,7 +2222,10 @@ function getUnaccountedAppointments(cache, config, date) {
       day: "numeric"
     }).format(date)
   );
-  const statuses = snapshot.statusesByDay.get(day) ?? [];
+  if (!snapshot.statusesByDay.has(day)) {
+    return null;
+  }
+  const statuses = snapshot.statusesByDay.get(day);
 
   return snapshot.appointments.filter((appointment, index) => !String(statuses[index] ?? "").trim());
 }
