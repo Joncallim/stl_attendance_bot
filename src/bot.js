@@ -7001,8 +7001,26 @@ export async function createAttendanceBot(config) {
       const [, , interactionId, groupKey] = action.split(":");
       const current = getInteraction(ctx, interactionId, "department-attendance");
       const target = current?.payload;
+      if (!target) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+
+      if (!groupKey) {
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "Choose a category, then select an attendance status.",
+          buildAttendanceGroupMenu(
+            config,
+            (nextGroupKey) => `home:department:pickgroup:${interactionId}:${nextGroupKey}`,
+            `home:department:view:${target.departmentKey}:${target.weekOffset}:${target.page}`
+          )
+        );
+        return;
+      }
+
       const group = getAttendanceOptionGroups(config).find((entry) => entry.key === groupKey);
-      if (!target || !group) {
+      if (!group) {
         await rejectExpiredInteraction(ctx);
         return;
       }
