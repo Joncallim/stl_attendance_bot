@@ -380,6 +380,7 @@ async function loadSettingsDocument() {
 
 export const defaultAttendanceOptions = [];
 const ATTENDANCE_OPTION_SCHEMA_VERSION = 3;
+const MAX_ATTENDANCE_OPTIONS = 100;
 const RETIRED_ATTENDANCE_OPTIONS = new Set(["PCL"]);
 
 const privateKey = requireEnv("GOOGLE_PRIVATE_KEY").replace(/\\n/g, "\n");
@@ -465,6 +466,10 @@ export async function applyStoredConfigOverrides() {
     config.attendanceOptions = storedOptions;
   } else {
     config.attendanceOptions = [...config.onboardingAttendanceOptions];
+  }
+
+  if (config.attendanceOptions.length > MAX_ATTENDANCE_OPTIONS) {
+    throw new Error(`Attendance options cannot exceed ${MAX_ATTENDANCE_OPTIONS}. Remove unused options before starting the bot.`);
   }
 
   if (needsMigration || storedOptions.length !== (settings.attendanceOptions?.length ?? 0)) {
