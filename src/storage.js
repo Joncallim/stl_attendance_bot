@@ -8,7 +8,7 @@ import {
 } from "./fileStore.js";
 
 const STORAGE_MUTEX_KEY = "storage";
-const ATTENDANCE_OPTION_SCHEMA_VERSION = 2;
+const ATTENDANCE_OPTION_SCHEMA_VERSION = 3;
 
 function getUsersFile() {
   return getDataFile("users.json");

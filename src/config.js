@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { readFile } from "node:fs/promises";
 import dotenv from "dotenv";
 import YAML from "yaml";
-import { getSettings } from "./storage.js";
+import { getSettings, setAttendanceOptions } from "./storage.js";
 
 dotenv.config();
 
@@ -307,7 +307,14 @@ async function loadSettingsDocument() {
       ensureNonEmptyString(option, `attendance.groups[${index}].options[${optionIndex}]`).toUpperCase()
     );
 
-    normalizedOptions.forEach((option) => seenOptions.add(option));
+    const groupOptions = new Set();
+    for (const option of normalizedOptions) {
+      if (groupOptions.has(option)) {
+        throw new Error(`Attendance option '${option}' appears more than once in group '${id}'.`);
+      }
+      groupOptions.add(option);
+      seenOptions.add(option);
+    }
 
     attendanceGroups.push({
       id,
@@ -370,7 +377,9 @@ async function loadSettingsDocument() {
 }
 
 export const defaultAttendanceOptions = [];
-const ATTENDANCE_OPTION_SCHEMA_VERSION = 2;
+const ATTENDANCE_OPTION_SCHEMA_VERSION = 3;
+const RETIRED_ATTENDANCE_OPTIONS = new Set(["PCL"]);
+const MIGRATED_ATTENDANCE_OPTIONS = ["FCL"];
 
 const privateKey = requireEnv("GOOGLE_PRIVATE_KEY").replace(/\\n/g, "\n");
 const runtimeConfig = {
@@ -436,14 +445,22 @@ export async function applyStoredConfigOverrides() {
 
   const settings = await getSettings();
 
-  if (
-    settings.attendanceOptionsVersion === ATTENDANCE_OPTION_SCHEMA_VERSION &&
-    Array.isArray(settings.attendanceOptions) &&
-    settings.attendanceOptions.length > 0
-  ) {
-    config.attendanceOptions = settings.attendanceOptions;
+  const storedOptions = Array.isArray(settings.attendanceOptions)
+    ? [...new Set(settings.attendanceOptions.map((option) => String(option).trim().toUpperCase()).filter(Boolean))]
+      .filter((option) => !RETIRED_ATTENDANCE_OPTIONS.has(option))
+    : [];
+  const needsMigration = settings.attendanceOptionsVersion !== ATTENDANCE_OPTION_SCHEMA_VERSION;
+
+  if (storedOptions.length > 0) {
+    config.attendanceOptions = needsMigration
+      ? [...new Set([...storedOptions, ...MIGRATED_ATTENDANCE_OPTIONS])]
+      : storedOptions;
   } else {
     config.attendanceOptions = [...config.onboardingAttendanceOptions];
+  }
+
+  if (needsMigration || storedOptions.length !== (settings.attendanceOptions?.length ?? 0)) {
+    await setAttendanceOptions(config.attendanceOptions);
   }
 
   return config;

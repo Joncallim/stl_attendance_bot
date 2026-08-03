@@ -2226,14 +2226,27 @@ function formatSummaryMessage(summary, config, options = {}) {
   }
 
   const configuredSections = Array.isArray(config.attendanceGroups) && config.attendanceGroups.length > 0
-    ? config.attendanceGroups.map((group) => ({
-      heading: group.summaryLabel ?? group.label,
-      total: group.options.reduce(
-        (sum, option) => sum + Number(rawCounts.get(option) ?? 0),
-        0
-      ),
-      breakdown: buildBreakdown(group.options)
-    }))
+    ? (() => {
+      const summaryOwnedOptions = new Set();
+      return config.attendanceGroups.map((group) => {
+        const summaryCandidates = group.key === "OFF_LEAVE"
+          ? [...group.options, "PCL", "PARENT CARE LEAVE"]
+          : group.options;
+        const ownedOptions = summaryCandidates.filter((option) => {
+          if (summaryOwnedOptions.has(option)) return false;
+          summaryOwnedOptions.add(option);
+          return true;
+        });
+        return {
+          heading: group.summaryLabel ?? group.label,
+          total: ownedOptions.reduce(
+            (sum, option) => sum + Number(rawCounts.get(option) ?? 0),
+            0
+          ),
+          breakdown: buildBreakdown(ownedOptions)
+        };
+      });
+    })()
     : [
       {
         heading: "Total PRESENT",
@@ -2283,7 +2296,7 @@ function formatSummaryMessage(summary, config, options = {}) {
       {
         heading: "Local Leave",
         total: counts.localLeave,
-        breakdown: buildBreakdown(["LL", "CCL", "CSL", "COMPASSIONATE", "PTL"])
+        breakdown: buildBreakdown(["LL", "CCL", "CSL", "COMPASSIONATE", "PTL", "PCL"])
       },
       {
         heading: "Overseas Leave",

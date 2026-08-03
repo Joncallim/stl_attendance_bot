@@ -2673,7 +2673,9 @@ function buildSummaryCounts(values) {
       "EMBARK OFF",
       "RR",
       "SR",
-      "FCL"
+      "FCL",
+      "PCL",
+      "PARENT CARE LEAVE"
     ]),
     outstationed: countStatuses(activeValues, [
       "OS",
