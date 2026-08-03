@@ -1037,7 +1037,7 @@ function getAttendanceOptionGroups(config) {
   return groups;
 }
 
-function buildAttendanceGroupMenu(config, groupCallbackBuilder, backTarget, extraRows = []) {
+function buildAttendanceGroupMenu(config, groupCallbackBuilder, backTarget, extraRows = [], menuOptions = {}) {
   const groups = getAttendanceOptionGroups(config);
   const rows = [...extraRows];
 
@@ -1046,7 +1046,9 @@ function buildAttendanceGroupMenu(config, groupCallbackBuilder, backTarget, extr
       groups.slice(index, index + 3).map((group) =>
         Markup.button.callback(
           group.label,
-          groupCallbackBuilder(group.key)
+          group.options.length === 1 && menuOptions.directOptionCallbackBuilder
+            ? menuOptions.directOptionCallbackBuilder(group.options[0], group)
+            : groupCallbackBuilder(group.key)
         )
       )
     );
@@ -1065,6 +1067,10 @@ function attendanceStatusFingerprint(status) {
     .update(String(status ?? ""), "utf8")
     .digest("base64url")
     .slice(0, 8);
+}
+
+function attendanceOptionToken(config, option) {
+  return `${config.attendanceOptions.indexOf(option)}:${attendanceStatusFingerprint(option)}`;
 }
 
 function newAttendancePromptId() {
@@ -6096,7 +6102,8 @@ export async function createAttendanceBot(config) {
 
     const storedUser = await getUserByChatId(ctx.chat.id);
 
-    if (storedUser?.userId && String(storedUser.userId) !== String(ctx.from.id)) {
+    const isHardDeregisterCommand = /^\/deregister(?:@\S+)?\s+hard\b/i.test(ctx.message?.text ?? "");
+    if (!isHardDeregisterCommand && storedUser?.userId && String(storedUser.userId) !== String(ctx.from.id)) {
       logBotWarn("Rejected Telegram identity mismatch.");
 
       if (ctx.callbackQuery) {
@@ -6265,6 +6272,16 @@ export async function createAttendanceBot(config) {
   });
 
   bot.command("deregister", async (ctx) => {
+    const hardReset = /^\/deregister(?:@\S+)?\s+hard\b/i.test(ctx.message?.text ?? "");
+    if (hardReset) {
+      const result = await deregisterRequestorByChatId(ctx.chat.id, { force: true });
+      await ctx.reply(
+        result.ok
+          ? "Hard reset complete. The Telegram identity was removed, the appointment was kept, and attendance records were preserved. An admin can now send a new invitation."
+          : "No saved Telegram identity was found to reset."
+      );
+      return;
+    }
     await registerUser(ctx);
     const registry = await getAppointmentRegistry();
     const target = registry.appointments.find(
@@ -7054,7 +7071,12 @@ export async function createAttendanceBot(config) {
         buildAttendanceGroupMenu(
           config,
           (groupKey) => `home:department:pickgroup:${interaction.id}:${groupKey}`,
-          `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}`
+          `home:department:view:${viewModel.departmentKey}:${viewModel.weekOffset}:${viewModel.page}`,
+          [],
+          {
+            directOptionCallbackBuilder: (option) =>
+              `home:department:pickoption:${interaction.id}:${attendanceOptionToken(config, option)}`
+          }
         )
       );
       return;
@@ -7080,7 +7102,12 @@ export async function createAttendanceBot(config) {
           buildAttendanceGroupMenu(
             config,
             (nextGroupKey) => `home:department:pickgroup:${interactionId}:${nextGroupKey}`,
-            `home:department:view:${target.departmentKey}:${target.weekOffset}:${target.page}`
+            `home:department:view:${target.departmentKey}:${target.weekOffset}:${target.page}`,
+            [],
+            {
+              directOptionCallbackBuilder: (option) =>
+                `home:department:pickoption:${interactionId}:${attendanceOptionToken(config, option)}`
+            }
           )
         );
         return;
@@ -7293,7 +7320,12 @@ export async function createAttendanceBot(config) {
           buildAttendanceGroupMenu(
             config,
             (nextGroupKey) => `home:attendance:groups:${promptId}:${isoDate}:${nextGroupKey}`,
-            "home:main"
+            "home:main",
+            [],
+            {
+              directOptionCallbackBuilder: (option) =>
+                `home:pick:attendance:${promptId}:${isoDate}:${attendanceOptionToken(config, option)}`
+            }
           )
         );
         return;
@@ -7607,7 +7639,12 @@ export async function createAttendanceBot(config) {
           buildAttendanceGroupMenu(
             config,
             (nextGroupKey) => `home:week:groups:${flowId}:${isoDate}:${nextGroupKey}`,
-            overviewTarget
+            overviewTarget,
+            [],
+            {
+              directOptionCallbackBuilder: (option) =>
+                `home:pick:week:${flowId}:${isoDate}:${attendanceOptionToken(config, option)}`
+            }
           )
         );
         return;

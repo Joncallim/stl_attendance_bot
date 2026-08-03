@@ -1257,24 +1257,52 @@ export async function transferAppointmentBinding(
 export async function deregisterRequestorByChatId(chatId, options = {}) {
   return withStorageMutation(async () => {
     const registry = await readAppointmentRegistry();
-    const target = registry.appointments.find(
+    let target = registry.appointments.find(
       (entry) => entry.active && String(entry.boundChatId) === String(chatId)
     );
 
-    if (!target) {
+    if (!target && options.force) {
+      const users = await readUsers();
+      const staleUser = users.find((user) => String(user.chatId) === String(chatId));
+      target = staleUser?.appointment
+        ? registry.appointments.find((entry) =>
+            entry.active && normalizeAppointmentName(entry.appointment) === normalizeAppointmentName(staleUser.appointment)
+          )
+        : null;
+    }
+
+    if (!target && !options.force) {
       return { ok: false, reason: "not_bound" };
     }
 
-    if (
+    if (target && !options.force &&
       options.expectedBindingIdentity &&
       options.expectedBindingIdentity !== getAppointmentBindingIdentity(target)
     ) {
       return { ok: false, reason: "binding_changed" };
     }
 
-    return deregisterAppointmentBindingLocked(target.appointment, {
-      expectedBindingIdentity: getAppointmentBindingIdentity(target)
-    });
+    if (target?.boundChatId) {
+      const result = await deregisterAppointmentBindingLocked(target.appointment, {
+        expectedBindingIdentity: options.force ? undefined : getAppointmentBindingIdentity(target)
+      });
+      if (!result.ok) return result;
+      if (options.force && String(result.previousChatId) !== String(chatId)) {
+        const currentUsers = await readUsers();
+        const nextUsers = currentUsers.map((user) =>
+          String(user.chatId) === String(chatId) ? clearUserBindingFields(user) : user
+        );
+        await commitRegistryAndUsers(await readAppointmentRegistry(), nextUsers, "hard_reset_identity");
+      }
+      return result;
+    }
+
+    const users = await readUsers();
+    const nextUsers = users.map((user) =>
+      String(user.chatId) === String(chatId) ? clearUserBindingFields(user) : user
+    );
+    await commitRegistryAndUsers(registry, nextUsers, "hard_reset_identity");
+    return { ok: true, appointment: target?.appointment ?? null, previousChatId: chatId, hardReset: true };
   });
 }
 
