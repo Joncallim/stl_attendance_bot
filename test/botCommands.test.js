@@ -90,6 +90,32 @@ test("daily attendance idempotency is scoped to one Telegram prompt", () => {
   assert.notEqual(first, laterPrompt);
 });
 
+test("missing attendance contact buttons cascade at three per row", () => {
+  const rows = ["A", "B", "C", "D", "E"].map((name) => [{ text: name, callback_data: name }]);
+  const keyboard = __testing.buildUnaccountedMenu(
+    new Date("2026-03-24T00:00:00.000Z"),
+    "UTC",
+    rows,
+    "home:main",
+    "home"
+  ).reply_markup.inline_keyboard;
+
+  assert.deepEqual(keyboard.slice(0, 2).map((row) => row.length), [3, 2]);
+  assert.ok(keyboard.every((row) => row.length <= 3));
+});
+
+test("broadcast recipients are unique registered Telegram users", () => {
+  const recipients = __testing.getBroadcastRecipients([
+    { appointment: "A", chatId: "10" },
+    { appointment: "B", chatId: 10 },
+    { appointment: "C", chatId: "11" },
+    { appointment: null, chatId: "12" }
+  ]);
+
+  assert.deepEqual(recipients.map((user) => user.appointment), ["A", "C"]);
+  assert.equal(__testing.formatAnnouncementMessage("Latest update"), "📢 Stalwart Announcement Bot\n\nLatest update");
+});
+
 test("attendance transfer conflict message explains the actionable sheet cells", () => {
   const message = __testing.formatAttendanceTransferBlockedMessage(
     [

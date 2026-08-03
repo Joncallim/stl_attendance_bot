@@ -604,6 +604,9 @@ function buildAdminMenu() {
       Markup.button.callback("📣 Prompt All", "admin:promptall")
     ],
     [
+      Markup.button.callback("📢 Broadcast Message", "admin:broadcast")
+    ],
+    [
       Markup.button.callback("🧩 Attendance Options", "admin:menu:options"),
       Markup.button.callback("🧾 Deregister Person", "admin:menu:deregister:0")
     ],
@@ -616,6 +619,22 @@ function buildAdminMenu() {
       Markup.button.callback("❌ Close", "admin:close")
     ],
   ]);
+}
+
+function formatAnnouncementMessage(message) {
+  return ["📢 Stalwart Announcement Bot", "", String(message).trim()].join("\n");
+}
+
+function getBroadcastRecipients(users) {
+  const seen = new Set();
+  return users.filter((user) => {
+    const chatId = user?.chatId;
+    if (!user?.appointment || chatId == null || seen.has(String(chatId))) {
+      return false;
+    }
+    seen.add(String(chatId));
+    return true;
+  });
 }
 
 function buildAdminRosterMenu() {
@@ -795,8 +814,12 @@ function buildUnaccountedMenu(date, timezone, rows, backTarget, namespace, page 
   const navigation = [];
   if (page > 0) navigation.push(Markup.button.callback("⬅️ Previous", `${namespace}:summary:unaccounted:${dateKey}:${page - 1}`));
   if (page < totalPages - 1) navigation.push(Markup.button.callback("Next ➡️", `${namespace}:summary:unaccounted:${dateKey}:${page + 1}`));
+  const contactRows = [];
+  for (let index = 0; index < rows.length; index += 3) {
+    contactRows.push(rows.slice(index, index + 3).flat());
+  }
   return Markup.inlineKeyboard([
-    ...rows,
+    ...contactRows,
     ...(navigation.length > 0 ? [navigation] : []),
     [
       Markup.button.callback("🔙 Back", `${namespace}:summary:${toIsoDateString(date, timezone)}`),
@@ -1989,6 +2012,7 @@ function buildAdminMenuDescription() {
     "✉️ Send Invitation — Generate an invite for unregistered personnel.",
     "👮 Manage Admins — Add or remove admin appointments.",
     "📣 Prompt All — Send the attendance prompt to all bound users.",
+    "📢 Broadcast Message — Send a plain-language announcement to all registered users.",
     "🧩 Attendance Options — View and update the allowed attendance codes.",
     "🧾 Deregister Person — Remove a user’s Telegram binding and rotate their code.",
     "📤 Push Attendance — Flush all queued entries to Google Sheets immediately.",
@@ -2889,6 +2913,7 @@ async function resetConversationState(ctx) {
   ctx.session.awaitingAttendanceOptionAdd = false;
   ctx.session.awaitingAppointmentAdd = false;
   ctx.session.awaitingIssueReport = false;
+  ctx.session.broadcastInteractionId = null;
   ctx.session.awaitingSpreadsheetIdChange = false;
   ctx.session.departmentEditTarget = null;
   ctx.session.awaitingWeeklyAttendance = false;
@@ -4331,6 +4356,59 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
         Markup.button.callback("✅ Prompt All", `admin:confirm:promptall:${confirmation.id}`),
         Markup.button.callback("↩️ Cancel", "admin:main")
       ]])
+    );
+    return;
+  }
+
+  if (action === "broadcast") {
+    beginTextInput(ctx, "broadcast-message", { ttlMs: 10 * 60 * 1000 });
+    await sendOrUpdateAdminMessage(
+      ctx,
+      [
+        "📢 Broadcast Message",
+        "",
+        "Type the announcement to send to everyone currently registered with the bot.",
+        "You will see a preview before anything is sent."
+      ].join("\n"),
+      Markup.inlineKeyboard([[
+        Markup.button.callback("🔙 Back", "admin:main"),
+        Markup.button.callback("❌ Cancel", "admin:close")
+      ]])
+    );
+    return;
+  }
+
+  if (action === "broadcast:execute") {
+    const interactionId = ctx.session.broadcastInteractionId;
+    const interaction = getInteraction(ctx, interactionId, "broadcast-message");
+    const message = interaction?.choices?.confirm?.message;
+    if (!message || !consumeInteraction(ctx, interactionId, "broadcast-message")) {
+      await rejectExpiredInteraction(ctx);
+      return;
+    }
+    ctx.session.broadcastInteractionId = null;
+    const recipients = getBroadcastRecipients(await listUsers());
+    if (recipients.length === 0) {
+      await sendOrUpdateAdminMessage(ctx, "No registered users found.", buildAdminMenu());
+      return;
+    }
+    const results = await allSettledConcurrent(
+      recipients.map((user) => async () => bot.telegram.sendMessage(user.chatId, formatAnnouncementMessage(message))),
+      TELEGRAM_SEND_CONCURRENCY
+    );
+    const sent = results.filter((result) => result.status === "fulfilled").length;
+    results.forEach((result, index) => {
+      if (result.status === "rejected") {
+        logBotError("Failed to send broadcast announcement.", {
+          appointment: recipients[index].appointment,
+          error: result.reason?.message
+        });
+      }
+    });
+    await sendOrUpdateAdminMessage(
+      ctx,
+      `Broadcast complete: ${sent}/${recipients.length} messages sent.`,
+      buildAdminMenu()
     );
     return;
   }
@@ -6506,6 +6584,7 @@ export async function createAttendanceBot(config) {
     const awaitingAttendanceOptionAdd = Boolean(getTextInput(ctx, "attendance-option"));
     const awaitingAppointmentAdd = Boolean(getTextInput(ctx, "appointment"));
     const awaitingIssueReport = Boolean(getTextInput(ctx, "issue"));
+    const awaitingBroadcastMessage = Boolean(getTextInput(ctx, "broadcast-message"));
     const awaitingSpreadsheetIdChange = Boolean(getTextInput(ctx, "spreadsheet"));
 
     if (awaitingIssueReport) {
@@ -6567,6 +6646,40 @@ export async function createAttendanceBot(config) {
         Markup.inlineKeyboard([[
           Markup.button.callback("🔙 Back", "home:main"),
           Markup.button.callback("❌ Close", "home:close")
+        ]])
+      );
+      return;
+    }
+
+    if (awaitingBroadcastMessage) {
+      if (!(await requireAdmin(ctx, config))) {
+        consumeTextInput(ctx, "broadcast-message");
+        return;
+      }
+
+      if (!message || message.length > 3500) {
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "The announcement must be between 1 and 3,500 characters. Please try again.",
+          Markup.inlineKeyboard([[
+            Markup.button.callback("🔙 Back", "admin:main"),
+            Markup.button.callback("❌ Cancel", "admin:close")
+          ]])
+        );
+        return;
+      }
+
+      consumeTextInput(ctx, "broadcast-message");
+      const interaction = beginInteraction(ctx, "broadcast-message", {
+        confirm: { message }
+      }, { ttlMs: 5 * 60 * 1000 });
+      ctx.session.broadcastInteractionId = interaction.id;
+      await sendOrUpdateAdminMessage(
+        ctx,
+        ["📢 Preview", "", formatAnnouncementMessage(message), "", "Send this announcement to all registered users?"] .join("\n"),
+        Markup.inlineKeyboard([[
+          Markup.button.callback("✅ Send Broadcast", `admin:confirm:broadcast:${interaction.id}`),
+          Markup.button.callback("↩️ Cancel", "admin:main")
         ]])
       );
       return;
@@ -8432,6 +8545,18 @@ export async function createAttendanceBot(config) {
       return;
     }
 
+    if (action.startsWith("confirm:broadcast:")) {
+      const interactionId = action.split(":")[2];
+      const resolved = getInteraction(ctx, interactionId, "broadcast-message", "confirm");
+      if (!resolved) {
+        await rejectExpiredInteraction(ctx);
+        return;
+      }
+      ctx.session.broadcastInteractionId = interactionId;
+      await runAdminAction("broadcast:execute", ctx, bot, sheets, config, adminCache);
+      return;
+    }
+
     if (action.startsWith("pick:code:")) {
       await ensureSheetReadiness(sheets, config, adminCache);
       const [, , interactionId, choiceId] = action.split(":");
@@ -8856,6 +8981,9 @@ export const __testing = {
   formatDepartmentViewMessage,
   buildSummaryMenu,
   buildUnaccountedDetails,
+  buildUnaccountedMenu,
+  formatAnnouncementMessage,
+  getBroadcastRecipients,
   getUnaccountedAppointments,
   formatSummaryMessage,
   formatHomeSynchronizationTimestamp,
