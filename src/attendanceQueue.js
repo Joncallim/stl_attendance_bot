@@ -324,10 +324,9 @@ export async function flushAttendanceQueue(writeEntries) {
       async () => {
         const state = await loadAttendanceQueueState();
         const now = Date.now();
-        const pendingEvents = [...state.events.values()]
+        const unresolvedEvents = [...state.events.values()]
           .filter((event) =>
-            (event.queueStatus === "pending" || event.queueStatus === "failed_retryable") &&
-            (!event.nextRetryAt || new Date(event.nextRetryAt).getTime() <= now)
+            event.queueStatus === "pending" || event.queueStatus === "failed_retryable"
           )
           .sort((left, right) => {
             if (left.createdAt !== right.createdAt) {
@@ -339,6 +338,29 @@ export async function flushAttendanceQueue(writeEntries) {
             // sorting random UUIDs here broke last-write-wins batch ordering.
             return 0;
           });
+
+        const eligibleKeys = new Set(
+          unresolvedEvents
+            .filter((event) => !event.nextRetryAt || new Date(event.nextRetryAt).getTime() <= now)
+            .map((event) => `${event.appointment}:${event.date}`)
+        );
+        const latestEventByKey = new Map();
+        for (const event of unresolvedEvents) {
+          latestEventByKey.set(`${event.appointment}:${event.date}`, event);
+        }
+
+        // If the latest edit for a key is eligible, include its entire
+        // unresolved predecessor chain. This keeps the earliest optimistic
+        // lock even when an earlier edit is in retry backoff.
+        const attemptedKeys = new Set(
+          [...eligibleKeys].filter((key) => {
+            const latest = latestEventByKey.get(key);
+            return latest && (!latest.nextRetryAt || new Date(latest.nextRetryAt).getTime() <= now);
+          })
+        );
+        const pendingEvents = unresolvedEvents.filter((event) =>
+          attemptedKeys.has(`${event.appointment}:${event.date}`)
+        );
 
         const coalescedEntries = new Map();
         const eventGroups = new Map();

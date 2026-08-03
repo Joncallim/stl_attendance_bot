@@ -313,6 +313,41 @@ test("coalesced status changes keep the earliest optimistic-lock value", async (
   });
 });
 
+test("a newer edit carries forward an earlier retrying predecessor", async () => {
+  await withTempDataDir(async () => {
+    const date = new Date("2026-03-10T12:00:00.000Z");
+    await enqueueAttendanceEvent(CONFIG, {
+      appointment: "GOLF",
+      status: "A",
+      date,
+      expectedPreviousValue: ""
+    });
+
+    await assert.rejects(
+      () => flushAttendanceQueue(async () => {
+        throw new Error("temporary outage");
+      }),
+      /temporary outage/
+    );
+
+    await enqueueAttendanceEvent(CONFIG, {
+      appointment: "GOLF",
+      status: "B",
+      date,
+      expectedPreviousValue: "A"
+    });
+
+    const flushed = [];
+    await flushAttendanceQueue(async (entries) => {
+      flushed.push(...entries);
+    });
+
+    assert.equal(flushed.length, 1);
+    assert.equal(flushed[0].status, "B");
+    assert.equal(flushed[0].expectedPreviousValue, "");
+  });
+});
+
 test("new attendance can be enqueued while a remote flush is still running", async () => {
   await withTempDataDir(async () => {
     await enqueueAttendanceEvent(CONFIG, makeEvent("HOTEL", "PRESENT"));
