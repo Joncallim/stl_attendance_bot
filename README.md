@@ -212,56 +212,10 @@ The bot is intentionally conservative when people edit spreadsheets manually.
 
 ## Attendance Options
 
-`ATTENDANCE_OPTIONS` defines the default attendance codes.
-
-Current default order:
-
-```text
-PRESENT
-DUTY
-PH
-OSD
-OE
-WFH
-FISHING
-OIL
-EMBARK OFF
-OFF
-DISEMBARK OFF
-RR
-SR
-OS
-TNB
-YARD
-ORCA
-RSO
-MC
-OML
-MA
-HL
-RSI
-LL
-CCL
-PCL
-CSL
-COMPASSIONATE
-PTL
-OL
-AO
-68
-69
-70
-71
-73
-OC
-ORD
-POST OUT
-IPPT
-FMSS
-CNB
-CST
-DCTC
-```
+Attendance defaults and menu grouping are defined by `attendance.groups` in
+`settings.yaml`; there is no `ATTENDANCE_OPTIONS` environment override.
+Statuses may appear in more than one Telegram menu for searchability, while
+the Google Sheets dropdown always receives each status only once.
 
 Behavior:
 
@@ -269,6 +223,7 @@ Behavior:
 - admins can add, remove, and reset options from Telegram
 - changes are stored in `data/settings.json`
 - resetting options restores the `settings.yaml` defaults
+- older stored option overrides are migrated when the attendance option schema changes
 
 ## Local Data Files
 

@@ -899,7 +899,7 @@ function buildInlineAttendanceMenu(
   extraRows = [],
   menuOptions = {}
 ) {
-  const pageSize = 20;
+  const pageSize = menuOptions.pageSize ?? 20;
   const totalPages = Math.max(1, Math.ceil(options.length / pageSize));
   const safePage = Math.min(Math.max(page, 0), totalPages - 1);
   const startIndex = safePage * pageSize;
@@ -1069,6 +1069,7 @@ function buildDatedAttendanceGroupMenu(
     backTarget,
     extraRows,
     {
+      pageSize: 100,
       itemTokenBuilder: (option) => {
         const absoluteIndex = optionIndexByValue.get(option);
         return `${absoluteIndex}:${attendanceStatusFingerprint(option)}`;
@@ -1092,6 +1093,7 @@ function buildAttendanceGroupOptionMenu(config, groupKey, itemPrefix, backTarget
     backTarget,
     extraRows,
     {
+      pageSize: 100,
       itemTokenBuilder: (option) =>
         `${optionIndexByValue.get(option)}:${attendanceStatusFingerprint(option)}`
     }
