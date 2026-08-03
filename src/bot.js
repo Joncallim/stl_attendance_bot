@@ -4405,6 +4405,7 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
         TELEGRAM_SEND_CONCURRENCY
       );
       const sent = results.filter((result) => result.status === "fulfilled").length;
+      const failed = recipients.length - sent;
       results.forEach((result, index) => {
         if (result.status === "rejected") {
           logBotError("Failed to send broadcast announcement.", {
@@ -4416,13 +4417,15 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       await sendBackgroundBotMessage(
         bot,
         initiatingChatId,
-        `Broadcast complete: ${sent}/${recipients.length} messages sent.`,
+        failed === 0
+          ? `Broadcast complete. All ${sent} registered people received the announcement.`
+          : `Broadcast complete. ${sent} registered people received the announcement. ${failed} could not be reached.`,
         buildAdminMenu()
       );
     });
     await sendOrUpdateAdminMessage(
       ctx,
-      `Broadcast started for ${recipients.length} registered user(s). You can continue using the bot.`,
+      `Broadcast started for ${recipients.length} people registered with the bot. You can continue using the bot.`,
       buildAdminMenu()
     );
     void queuedBroadcast.catch((error) => {
