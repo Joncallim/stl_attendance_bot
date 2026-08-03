@@ -591,6 +591,24 @@ test("scheduled attendance prompts use grouped menus and direct singleton callba
   assert.match(callbacks[2], /^home:pick:attendance:[^:]+:2026-07-30:2:[A-Za-z0-9_-]{8}$/);
 });
 
+test("scheduled group callbacks stay short for custom group ids", () => {
+  const context = __testing.buildAttendancePromptBroadcastContext({
+    attendanceOptions: ["PRESENT", "A".repeat(200), "B".repeat(200)],
+    attendanceGroups: [
+      { key: "present", label: "PRESENT", options: ["PRESENT"] },
+      { key: "custom:group:" + "x".repeat(200), label: "Custom", options: ["A".repeat(200), "B".repeat(200)] }
+    ],
+    timezone: "Asia/Singapore"
+  }, new Date("2026-07-30T04:00:00.000Z"));
+  const callbacks = context.replyMarkup.reply_markup.inline_keyboard
+    .flat()
+    .map((button) => button.callback_data)
+    .filter(Boolean);
+
+  assert.ok(callbacks.some((value) => value.startsWith("home:attendance:groups:")));
+  assert.ok(callbacks.every((value) => Buffer.byteLength(value, "utf8") <= 64));
+});
+
 test("stale interactions leave a visible explanation even after callback acknowledgement", async () => {
   const calls = [];
   const ctx = {

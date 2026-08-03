@@ -1123,6 +1123,20 @@ function attendanceStatusFingerprint(status) {
     .slice(0, 8);
 }
 
+function attendanceGroupCallbackToken(groupKey) {
+  return attendanceStatusFingerprint(groupKey);
+}
+
+function resolveAttendanceGroupKey(config, callbackKey) {
+  const groups = getAttendanceOptionGroups(config);
+  const exact = groups.find((group) => group.key === callbackKey);
+  if (exact) {
+    return exact.key;
+  }
+
+  return groups.find((group) => attendanceGroupCallbackToken(group.key) === callbackKey)?.key ?? null;
+}
+
 function attendanceOptionToken(config, option) {
   return `${config.attendanceOptions.indexOf(option)}:${attendanceStatusFingerprint(option)}`;
 }
@@ -3042,7 +3056,7 @@ async function askAttendance(ctx, config, user = null, cache = null) {
       {
         promptId,
         groupCallbackBuilder: (groupKey, isoDate, prompt) =>
-          `home:attendance:groups:${prompt}:${isoDate}:${groupKey}`,
+          `home:attendance:groups:${prompt}:${isoDate}:${attendanceGroupCallbackToken(groupKey)}`,
         directOptionCallbackBuilder: (option, isoDate, prompt) =>
           `home:pick:attendance:${prompt}:${isoDate}:${attendanceOptionToken(config, option)}`
       }
@@ -4682,7 +4696,7 @@ function buildAttendancePromptBroadcastContext(config, date = new Date()) {
       {
         promptId,
         groupCallbackBuilder: (groupKey, isoDate, prompt) =>
-          `home:attendance:groups:${prompt}:${isoDate}:${groupKey}`,
+          `home:attendance:groups:${prompt}:${isoDate}:${attendanceGroupCallbackToken(groupKey)}`,
         directOptionCallbackBuilder: (option, isoDate, prompt) =>
           `home:pick:attendance:${prompt}:${isoDate}:${attendanceOptionToken(config, option)}`
       }
@@ -7327,7 +7341,7 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      if (!groupKey) {
+      if (!groupCallbackKey) {
         await sendOrUpdateAdminMessage(
           ctx,
           "Choose a category, then select an attendance status.",
@@ -7342,6 +7356,11 @@ export async function createAttendanceBot(config) {
             }
           )
         );
+        return;
+      }
+
+      if (!groupKey) {
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
@@ -7534,9 +7553,11 @@ export async function createAttendanceBot(config) {
     }
 
     if (action.startsWith("attendance:groups:")) {
-      const [, , promptId, isoDate, groupKey] = action.split(":");
+      const [, , promptId, isoDate, groupCallbackKey] = action.split(":");
       const user = await ensureUserBound(ctx, config);
       if (!user) return;
+
+      const groupKey = resolveAttendanceGroupKey(config, groupCallbackKey);
 
       const date = parseIsoDate(isoDate);
       const currentIsoDate = toIsoDateString(new Date(), config.timezone);
@@ -7638,7 +7659,7 @@ export async function createAttendanceBot(config) {
           {
             promptId,
             groupCallbackBuilder: (groupKey, requestedDate, prompt) =>
-              `home:attendance:groups:${prompt}:${requestedDate}:${groupKey}`,
+              `home:attendance:groups:${prompt}:${requestedDate}:${attendanceGroupCallbackToken(groupKey)}`,
             directOptionCallbackBuilder: (option, requestedDate, prompt) =>
               `home:pick:attendance:${prompt}:${requestedDate}:${attendanceOptionToken(config, option)}`
           }
