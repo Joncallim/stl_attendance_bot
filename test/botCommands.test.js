@@ -1120,7 +1120,7 @@ test("summary message uses grouped headers and can hide unaccounted", () => {
   assert.match(message, /RSO: 1/);
   assert.match(message, /<b><u>In Base:<\/u><\/b> 1/);
   assert.match(message, /IPPT: 1/);
-  assert.doesNotMatch(message, /<b>Unaccounted:/);
+  assert.doesNotMatch(message, /<b>Missing attendance:/);
 });
 
 test("summary message uses configured attendance groups when provided", () => {
@@ -1164,6 +1164,26 @@ test("summary menu can omit unaccounted button", () => {
 
   const labels = menu.reply_markup.inline_keyboard.flat().map((button) => button.text);
   assert.ok(!labels.includes("🕳️ Unaccounted"));
+});
+
+test("unaccounted details separate Telegram users from people not registered", () => {
+  const details = __testing.buildUnaccountedDetails(
+    new Date("2026-03-28T12:00:00.000Z"),
+    { timezone: "Asia/Singapore" },
+    ["BOUND", "NO TELEGRAM"],
+    {
+      appointments: [
+        { appointment: "BOUND", boundChatId: "chat-1", boundUsername: "bound" },
+        { appointment: "NO TELEGRAM" }
+      ]
+    }
+  );
+
+  assert.match(details.lines.join("\n"), /Telegram users who have not entered attendance:/);
+  assert.match(details.lines.join("\n"), /People not yet registered for Telegram:/);
+  assert.match(details.lines.join("\n"), /BOUND/);
+  assert.match(details.lines.join("\n"), /NO TELEGRAM/);
+  assert.equal(details.boundRows[0][0].url, "https://t.me/bound");
 });
 
 test("background schedules keep both 1-minute and 5-minute reconciliation intervals", async () => {

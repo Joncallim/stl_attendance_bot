@@ -563,7 +563,7 @@ const USER_MANUAL_SECTIONS = {
     lines: [
       "Use Summary to view attendance counts and status breakdowns for a selected day.",
       "Use Previous Day and Next Day to move across dates.",
-      "Use Unaccounted to view personnel who still have no attendance recorded for that day."
+      "Use Missing Attendance to see who still has no attendance recorded for that day."
     ]
   },
   admin: {
@@ -728,7 +728,7 @@ function buildSummaryMenu(date, timezone, backTarget = "admin:menu:roster", opti
 
   if (options.includeUnaccounted !== false) {
     rows.push([
-      Markup.button.callback("🕳️ Unaccounted", `${namespace}:summary:unaccounted:${toIsoDateString(date, timezone)}`)
+      Markup.button.callback("🕳️ Missing Attendance", `${namespace}:summary:unaccounted:${toIsoDateString(date, timezone)}`)
     ]);
   }
 
@@ -790,14 +790,84 @@ function buildSyncPendingMenu(backTarget) {
   ]);
 }
 
-function buildUnaccountedMenu(date, timezone, rows, backTarget, namespace) {
+function buildUnaccountedMenu(date, timezone, rows, backTarget, namespace, page = 0, totalPages = 1) {
+  const dateKey = toIsoDateString(date, timezone);
+  const navigation = [];
+  if (page > 0) navigation.push(Markup.button.callback("⬅️ Previous", `${namespace}:summary:unaccounted:${dateKey}:${page - 1}`));
+  if (page < totalPages - 1) navigation.push(Markup.button.callback("Next ➡️", `${namespace}:summary:unaccounted:${dateKey}:${page + 1}`));
   return Markup.inlineKeyboard([
     ...rows,
+    ...(navigation.length > 0 ? [navigation] : []),
     [
       Markup.button.callback("🔙 Back", `${namespace}:summary:${toIsoDateString(date, timezone)}`),
       Markup.button.callback("❌ Close", `${namespace}:close`)
     ]
   ]);
+}
+
+function buildUnaccountedDetails(date, config, appointments, registry, page = 0) {
+  if (!Array.isArray(appointments)) {
+    return {
+      lines: [
+        `Attendance data for ${formatAttendanceDateLabel(date, config.timezone)} is not available yet.`,
+        "Please refresh the summary and try again."
+      ],
+      boundRows: [],
+      page: 0,
+      totalPages: 1
+    };
+  }
+  const bound = [];
+  const notRegistered = [];
+  const unavailable = [];
+  const boundRows = [];
+
+  for (const appointment of appointments) {
+    const entry = registry.appointments.find(
+      (value) => value.appointment.toUpperCase() === appointment.toUpperCase()
+    );
+    if (!entry) {
+      unavailable.push(appointment);
+    } else if (entry.boundChatId) {
+      bound.push(appointment);
+    } else {
+      notRegistered.push(appointment);
+    }
+  }
+
+  const items = [
+    ...bound.map((appointment) => ({ appointment, kind: "bound" })),
+    ...notRegistered.map((appointment) => ({ appointment, kind: "notRegistered" })),
+    ...unavailable.map((appointment) => ({ appointment, kind: "unavailable" }))
+  ];
+  const pageSize = 30;
+  const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
+  const safePage = Math.min(Math.max(page, 0), totalPages - 1);
+  const pageItems = items.slice(safePage * pageSize, (safePage + 1) * pageSize);
+  const lines = [`Attendance still missing for ${formatAttendanceDateLabel(date, config.timezone)}:`];
+  if (pageItems.some((item) => item.kind === "bound")) {
+    lines.push("", "Telegram users who have not entered attendance:");
+    lines.push(...pageItems.filter((item) => item.kind === "bound").map((item) => `• ${item.appointment}`));
+  }
+  if (pageItems.some((item) => item.kind === "notRegistered")) {
+    lines.push("", "People not yet registered for Telegram:");
+    lines.push(...pageItems.filter((item) => item.kind === "notRegistered").map((item) => `• ${item.appointment}`));
+  }
+  if (pageItems.some((item) => item.kind === "unavailable")) {
+    lines.push("", "Registration status is unavailable for:");
+    lines.push(...pageItems.filter((item) => item.kind === "unavailable").map((item) => `• ${item.appointment}`));
+  }
+  if (items.length === 0) {
+    lines.push("", "Everyone has entered attendance.");
+  }
+
+  for (const item of pageItems.filter((entry) => entry.kind === "bound")) {
+    const entry = registry.appointments.find((value) => value.appointment.toUpperCase() === item.appointment.toUpperCase());
+    const url = buildChatUrlForRegistryEntry(entry);
+    if (url) boundRows.push([{ text: item.appointment, url }]);
+  }
+
+  return { lines, boundRows, page: safePage, totalPages };
 }
 
 function buildPagedSelectionMenu(
@@ -2224,7 +2294,7 @@ function formatSummaryMessage(summary, config, options = {}) {
   ];
 
   if (!hideUnaccounted) {
-    lines.push(`<b>Unaccounted:</b> ${counts.unaccounted}`);
+    lines.push(`<b>Missing attendance:</b> ${counts.unaccounted}`);
   }
 
   const configuredSections = Array.isArray(config.attendanceGroups) && config.attendanceGroups.length > 0
@@ -4348,7 +4418,9 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
 
   if (action.startsWith("summary:")) {
     if (action.startsWith("summary:unaccounted:")) {
-      const targetDate = parseIsoDate(action.split(":")[2]);
+      const parts = action.split(":");
+      const targetDate = parseIsoDate(parts[2]);
+      const page = Number(parts[3] ?? 0);
 
       if (!targetDate) {
         await sendOrUpdateAdminMessage(ctx, "Invalid summary date.", buildAdminRosterMenu());
@@ -4362,45 +4434,12 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
 
       const registry = await getAppointmentRegistry();
       const unaccountedAppointments = getUnaccountedAppointments(cache, config, targetDate);
-      const boundRows = [];
-      const unbound = [];
-
-      for (const appointment of unaccountedAppointments) {
-        const entry = registry.appointments.find(
-          (value) => value.appointment.toUpperCase() === appointment.toUpperCase()
-        );
-        const url = buildChatUrlForRegistryEntry(entry);
-
-        if (url) {
-          boundRows.push([{
-            text: appointment,
-            url
-          }]);
-        } else {
-          unbound.push(appointment);
-        }
-      }
-
-      const lines = [
-        `Unaccounted for ${formatAttendanceDateLabel(targetDate, config.timezone)}:`
-      ];
-
-      if (unaccountedAppointments.length === 0) {
-        lines.push("No personnel are currently unaccounted.");
-      } else {
-        lines.push(...unaccountedAppointments.map((appointment) => `• ${appointment}`));
-      }
-
-      if (unbound.length > 0) {
-        lines.push("");
-        lines.push("No Telegram chat available for:");
-        lines.push(...unbound.map((appointment) => `• ${appointment}`));
-      }
+      const details = buildUnaccountedDetails(targetDate, config, unaccountedAppointments, registry, page);
 
       await sendOrUpdateAdminMessage(
         ctx,
-        lines.join("\n"),
-        buildUnaccountedMenu(targetDate, config.timezone, boundRows, "admin:menu:roster", "admin")
+        details.lines.join("\n"),
+        buildUnaccountedMenu(targetDate, config.timezone, details.boundRows, "admin:menu:roster", "admin", details.page, details.totalPages)
       );
       return;
     }
@@ -7806,7 +7845,9 @@ export async function createAttendanceBot(config) {
     }
 
     if (action.startsWith("summary:unaccounted:")) {
-      const targetDate = parseIsoDate(action.split(":")[2]);
+      const parts = action.split(":");
+      const targetDate = parseIsoDate(parts[2]);
+      const page = Number(parts[3] ?? 0);
 
       if (!targetDate) {
         await renderHomeMenu(ctx, config, { cache: adminCache });
@@ -7820,45 +7861,12 @@ export async function createAttendanceBot(config) {
 
       const registry = await getAppointmentRegistry();
       const unaccountedAppointments = getUnaccountedAppointments(adminCache, config, targetDate);
-      const boundRows = [];
-      const unbound = [];
-
-      for (const appointment of unaccountedAppointments) {
-        const entry = registry.appointments.find(
-          (value) => value.appointment.toUpperCase() === appointment.toUpperCase()
-        );
-        const url = buildChatUrlForRegistryEntry(entry);
-
-        if (url) {
-          boundRows.push([{
-            text: appointment,
-            url
-          }]);
-        } else {
-          unbound.push(appointment);
-        }
-      }
-
-      const lines = [
-        `Unaccounted for ${formatAttendanceDateLabel(targetDate, config.timezone)}:`
-      ];
-
-      if (unaccountedAppointments.length === 0) {
-        lines.push("No personnel are currently unaccounted.");
-      } else {
-        lines.push(...unaccountedAppointments.map((appointment) => `• ${appointment}`));
-      }
-
-      if (unbound.length > 0) {
-        lines.push("");
-        lines.push("No Telegram chat available for:");
-        lines.push(...unbound.map((appointment) => `• ${appointment}`));
-      }
+      const details = buildUnaccountedDetails(targetDate, config, unaccountedAppointments, registry, page);
 
       await sendOrUpdateAdminMessage(
         ctx,
-        lines.join("\n"),
-        buildUnaccountedMenu(targetDate, config.timezone, boundRows, "home:main", "home")
+        details.lines.join("\n"),
+        buildUnaccountedMenu(targetDate, config.timezone, details.boundRows, "home:main", "home", details.page, details.totalPages)
       );
       return;
     }
@@ -8797,6 +8805,7 @@ export const __testing = {
   appendAttendancePromptMessageId,
   formatDepartmentViewMessage,
   buildSummaryMenu,
+  buildUnaccountedDetails,
   formatSummaryMessage,
   formatHomeSynchronizationTimestamp,
   getCanonicalAttendanceOptions,
