@@ -2346,7 +2346,7 @@ function formatSummaryMessage(summary, config, options = {}) {
       continue;
     }
 
-    lines.push(...section.breakdown.map((entry) => `${entry.status}: ${entry.count}`));
+    lines.push(...section.breakdown.map((entry) => `${escapeHtml(entry.status)}: ${entry.count}`));
   }
 
   return lines.join("\n");
@@ -6639,6 +6639,16 @@ export async function createAttendanceBot(config) {
         await sendOrUpdateAdminMessage(
           ctx,
           "PCL is retired and cannot be added. Use FCL instead.",
+          buildAttendanceOptionsMenu()
+        );
+        return;
+      }
+
+      if (config.attendanceOptions.length >= 100) {
+        consumeTextInput(ctx, "attendance-option");
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "The attendance option limit is 100. Remove an unused option before adding another.",
           buildAttendanceOptionsMenu()
         );
         return;
