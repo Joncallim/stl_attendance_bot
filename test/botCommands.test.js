@@ -488,6 +488,15 @@ test("admin menu description includes the current pre-v1 version", () => {
   assert.match(description, /^Admin Menu \(v0\.9\.24\)/);
 });
 
+test("admin menu uses compact section buttons", () => {
+  const rows = __testing.buildAdminMenu().reply_markup.inline_keyboard;
+
+  assert.deepEqual(rows.slice(0, 2).map((row) => row.map((button) => button.text)), [
+    ["👥 Roster", "📣 Messaging"],
+    ["📊 Attendance", "⚙️ Settings"]
+  ]);
+});
+
 test("attendance prompt tracking is deduplicated and bounded", () => {
   const user = {
     attendancePromptMessageIds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 9, "bad"]

@@ -596,28 +596,62 @@ const USER_MANUAL_SECTIONS = {
 function buildAdminMenu() {
   return Markup.inlineKeyboard([
     [
-      Markup.button.callback("📋 Roster", "admin:menu:roster"),
-      Markup.button.callback("✉️ Send Invitation", "admin:menu:codes:0")
+      Markup.button.callback("👥 Roster", "admin:menu:roster"),
+      Markup.button.callback("📣 Messaging", "admin:menu:messaging")
     ],
     [
-      Markup.button.callback("👮 Manage Admins", "admin:menu:admins"),
-      Markup.button.callback("📣 Prompt All", "admin:promptall")
-    ],
-    [
-      Markup.button.callback("📢 Broadcast Message", "admin:broadcast")
-    ],
-    [
-      Markup.button.callback("🧩 Attendance Options", "admin:menu:options"),
-      Markup.button.callback("🧾 Deregister Person", "admin:menu:deregister:0")
-    ],
-    [
-      Markup.button.callback("📤 Push Attendance", "admin:flushqueue"),
-      Markup.button.callback("📬 Outstanding", "admin:queue")
+      Markup.button.callback("📊 Attendance", "admin:menu:attendance"),
+      Markup.button.callback("⚙️ Settings", "admin:menu:settings")
     ],
     [
       Markup.button.callback("🔙 Back", "home:main"),
       Markup.button.callback("❌ Close", "admin:close")
     ],
+  ]);
+}
+
+function buildAdminMessagingMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("📣 Prompt All", "admin:promptall"),
+      Markup.button.callback("📢 Broadcast Message", "admin:broadcast")
+    ],
+    [
+      Markup.button.callback("🔙 Back", "admin:main"),
+      Markup.button.callback("❌ Close", "admin:close")
+    ]
+  ]);
+}
+
+function buildAdminAttendanceMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("📤 Push Attendance", "admin:flushqueue"),
+      Markup.button.callback("📬 Outstanding", "admin:queue")
+    ],
+    [Markup.button.callback("📊 Summary", "admin:summary")],
+    [
+      Markup.button.callback("🔙 Back", "admin:main"),
+      Markup.button.callback("❌ Close", "admin:close")
+    ]
+  ]);
+}
+
+function buildAdminSettingsMenu() {
+  return Markup.inlineKeyboard([
+    [
+      Markup.button.callback("👮 Manage Admins", "admin:menu:admins"),
+      Markup.button.callback("🧩 Attendance Options", "admin:menu:options")
+    ],
+    [
+      Markup.button.callback("📄 Spreadsheet", "admin:changespreadsheet"),
+      Markup.button.callback("🔓 Clear Protections", "admin:clearprotections")
+    ],
+    [Markup.button.callback("🔧 Self-Heal Logs", "admin:selfheallogs:0")],
+    [
+      Markup.button.callback("🔙 Back", "admin:main"),
+      Markup.button.callback("❌ Close", "admin:close")
+    ]
   ]);
 }
 
@@ -644,18 +678,15 @@ function buildAdminRosterMenu() {
       Markup.button.callback("🔄 Sync Roster", "admin:syncroster")
     ],
     [
+      Markup.button.callback("✉️ Send Invitation", "admin:menu:codes:0"),
+      Markup.button.callback("🧾 Deregister Person", "admin:menu:deregister:0")
+    ],
+    [
       Markup.button.callback("➕ Add Appointment", "admin:appointments:add"),
       Markup.button.callback("➖ Remove Appointment", "admin:menu:appointments:remove:0")
     ],
     [
       Markup.button.callback("🔀 Transfer User", "admin:menu:transfer:0")
-    ],
-    [
-      Markup.button.callback("🔓 Clear All Protections", "admin:clearprotections"),
-      Markup.button.callback("📄 Change Spreadsheet", "admin:changespreadsheet")
-    ],
-    [
-      Markup.button.callback("🔧 Self-Heal Logs", "admin:selfheallogs:0")
     ],
     [
       Markup.button.callback("🔙 Back", "admin:main"),
@@ -2006,17 +2037,12 @@ function buildAdminMenuDescription() {
   return [
     `Admin Menu (${BOT_VERSION})`,
     "",
-    "Manage roster, onboarding, admins, and attendance.",
+    "Choose a section to manage the bot.",
     "",
-    "📋 Roster — Sync the roster and manage appointments.",
-    "✉️ Send Invitation — Generate an invite for unregistered personnel.",
-    "👮 Manage Admins — Add or remove admin appointments.",
-    "📣 Prompt All — Send the attendance prompt to all bound users.",
-    "📢 Broadcast Message — Send a plain-language announcement to all registered users.",
-    "🧩 Attendance Options — View and update the allowed attendance codes.",
-    "🧾 Deregister Person — Remove a user’s Telegram binding and rotate their code.",
-    "📤 Push Attendance — Flush all queued entries to Google Sheets immediately.",
-    "📬 Outstanding — View attendance entries queued but not yet pushed."
+    "👥 Roster — onboarding, invitations, and appointments.",
+    "📣 Messaging — prompts and announcements.",
+    "📊 Attendance — push, outstanding entries, and summaries.",
+    "⚙️ Settings — admins, options, spreadsheet, and repairs."
   ].join("\n");
 }
 
@@ -8108,6 +8134,36 @@ export async function createAttendanceBot(config) {
       return;
     }
 
+    if (action === "menu:messaging") {
+      cancelInteractions(ctx);
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "Messaging\n\nSend attendance prompts or a plain-language announcement.",
+        buildAdminMessagingMenu()
+      );
+      return;
+    }
+
+    if (action === "menu:attendance") {
+      cancelInteractions(ctx);
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "Attendance\n\nPush queued attendance, review outstanding entries, or open a summary.",
+        buildAdminAttendanceMenu()
+      );
+      return;
+    }
+
+    if (action === "menu:settings") {
+      cancelInteractions(ctx);
+      await sendOrUpdateAdminMessage(
+        ctx,
+        "Settings\n\nManage access, attendance options, spreadsheet settings, and repairs.",
+        buildAdminSettingsMenu()
+      );
+      return;
+    }
+
     if (action === "menu:options") {
       cancelInteractions(ctx);
       await renderAttendanceOptionsMenu(ctx, config);
@@ -8976,6 +9032,10 @@ export async function createAttendanceBot(config) {
 
 export const __testing = {
   buildAdminMenuDescription,
+  buildAdminMenu,
+  buildAdminMessagingMenu,
+  buildAdminAttendanceMenu,
+  buildAdminSettingsMenu,
   buildAttendanceOptionsDescription,
   buildHomeMenu,
   buildDepartmentWorkweekViewModel,
