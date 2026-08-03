@@ -4395,7 +4395,12 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
     const initiatingChatId = ctx.chat.id;
     const queuedBroadcast = runWithBackgroundPriority(async () => {
       const results = await allSettledConcurrent(
-        recipients.map((user) => async () => bot.telegram.sendMessage(user.chatId, formatAnnouncementMessage(message))),
+        recipients.map((user) => (signal) => {
+          const text = formatAnnouncementMessage(message);
+          return typeof bot.telegram.callApi === "function"
+            ? bot.telegram.callApi("sendMessage", { chat_id: user.chatId, text }, { signal })
+            : bot.telegram.sendMessage(user.chatId, text);
+        }),
         TELEGRAM_SEND_CONCURRENCY
       );
       const sent = results.filter((result) => result.status === "fulfilled").length;
