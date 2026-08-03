@@ -4392,24 +4392,36 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       await sendOrUpdateAdminMessage(ctx, "No registered users found.", buildAdminMenu());
       return;
     }
-    const results = await allSettledConcurrent(
-      recipients.map((user) => async () => bot.telegram.sendMessage(user.chatId, formatAnnouncementMessage(message))),
-      TELEGRAM_SEND_CONCURRENCY
-    );
-    const sent = results.filter((result) => result.status === "fulfilled").length;
-    results.forEach((result, index) => {
-      if (result.status === "rejected") {
-        logBotError("Failed to send broadcast announcement.", {
-          appointment: recipients[index].appointment,
-          error: result.reason?.message
-        });
-      }
+    const initiatingChatId = ctx.chat.id;
+    const queuedBroadcast = runWithBackgroundPriority(async () => {
+      const results = await allSettledConcurrent(
+        recipients.map((user) => async () => bot.telegram.sendMessage(user.chatId, formatAnnouncementMessage(message))),
+        TELEGRAM_SEND_CONCURRENCY
+      );
+      const sent = results.filter((result) => result.status === "fulfilled").length;
+      results.forEach((result, index) => {
+        if (result.status === "rejected") {
+          logBotError("Failed to send broadcast announcement.", {
+            appointment: recipients[index].appointment,
+            error: result.reason?.message
+          });
+        }
+      });
+      await sendBackgroundBotMessage(
+        bot,
+        initiatingChatId,
+        `Broadcast complete: ${sent}/${recipients.length} messages sent.`,
+        buildAdminMenu()
+      );
     });
     await sendOrUpdateAdminMessage(
       ctx,
-      `Broadcast complete: ${sent}/${recipients.length} messages sent.`,
+      `Broadcast started for ${recipients.length} registered user(s). You can continue using the bot.`,
       buildAdminMenu()
     );
+    void queuedBroadcast.catch((error) => {
+      logBotError("Background broadcast announcement failed.", { error: error.message });
+    });
     return;
   }
 
