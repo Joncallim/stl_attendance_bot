@@ -1327,6 +1327,45 @@ async function sendOrUpdateAdminMessage(ctx, text, replyMarkup, extraOptions = {
   return ctx.reply(text, messageOptions);
 }
 
+async function editBroadcastPreview(ctx, text, replyMarkup) {
+  const messageId = Number(ctx.session?.broadcastPreviewMessageId);
+  if (Number.isInteger(messageId) && messageId > 0) {
+    try {
+      return await ctx.telegram.editMessageText(
+        ctx.chat.id,
+        messageId,
+        undefined,
+        text,
+        replyMarkup ?? {}
+      );
+    } catch (error) {
+      const description = error?.response?.description ?? error?.message ?? "";
+      if (description.includes("message is not modified")) {
+        return null;
+      }
+      logBotWarn("Broadcast preview could not be edited; sending a new preview.", {
+        error: description
+      });
+    }
+  }
+
+  const preview = await ctx.reply(text, replyMarkup);
+  ctx.session.broadcastPreviewMessageId = getMessageId(preview);
+  return preview;
+}
+
+async function editBroadcastPreviewWithBot(bot, chatId, messageId, text, replyMarkup) {
+  try {
+    await bot.telegram.editMessageText(chatId, messageId, undefined, text, replyMarkup ?? {});
+  } catch (error) {
+    const description = error?.response?.description ?? error?.message ?? "";
+    if (!description.includes("message is not modified")) {
+      logBotWarn("Broadcast completion could not update its preview.", { error: description });
+      await sendBackgroundBotMessage(bot, chatId, text, replyMarkup);
+    }
+  }
+}
+
 async function sendBackgroundBotMessage(
   bot,
   chatId,
@@ -2940,6 +2979,8 @@ async function resetConversationState(ctx) {
   ctx.session.awaitingAppointmentAdd = false;
   ctx.session.awaitingIssueReport = false;
   ctx.session.broadcastInteractionId = null;
+  ctx.session.broadcastDrafting = false;
+  ctx.session.broadcastPreviewMessageId = null;
   ctx.session.awaitingSpreadsheetIdChange = false;
   ctx.session.departmentEditTarget = null;
   ctx.session.awaitingWeeklyAttendance = false;
@@ -4387,8 +4428,9 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
   }
 
   if (action === "broadcast") {
+    ctx.session.broadcastDrafting = true;
     beginTextInput(ctx, "broadcast-message", { ttlMs: 10 * 60 * 1000 });
-    await sendOrUpdateAdminMessage(
+    const promptMessage = await sendOrUpdateAdminMessage(
       ctx,
       [
         "📢 Broadcast Message",
@@ -4401,6 +4443,7 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
         Markup.button.callback("❌ Cancel", "admin:close")
       ]])
     );
+    ctx.session.broadcastPreviewMessageId = getMessageId(promptMessage);
     return;
   }
 
@@ -4412,14 +4455,25 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       await rejectExpiredInteraction(ctx);
       return;
     }
+    const previewMessageId = Number(ctx.session.broadcastPreviewMessageId);
+    const initiatingChatId = ctx.chat.id;
     ctx.session.broadcastInteractionId = null;
+    ctx.session.broadcastDrafting = false;
     const registry = await getAppointmentRegistry();
     const recipients = getBroadcastRecipients(registry.appointments);
     if (recipients.length === 0) {
       await sendOrUpdateAdminMessage(ctx, "No registered users found.", buildAdminMenu());
       return;
     }
-    const initiatingChatId = ctx.chat.id;
+    await editBroadcastPreview(
+      ctx,
+      "📢 Sending announcement…",
+      Markup.inlineKeyboard([[
+        Markup.button.callback("🔙 Back", "admin:main"),
+        Markup.button.callback("❌ Close", "admin:close")
+      ]])
+    );
+    ctx.session.broadcastPreviewMessageId = null;
     const queuedBroadcast = runWithBackgroundPriority(async () => {
       const results = await allSettledConcurrent(
         recipients.map((user) => (signal) => {
@@ -4440,12 +4494,14 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
           });
         }
       });
-      await sendBackgroundBotMessage(
+      const completionMessage = failed === 0
+        ? `Broadcast complete. All ${sent} registered people received the announcement.`
+        : `Broadcast complete. ${sent} registered people received the announcement. ${failed} could not be reached.`;
+      await editBroadcastPreviewWithBot(
         bot,
         initiatingChatId,
-        failed === 0
-          ? `Broadcast complete. All ${sent} registered people received the announcement.`
-          : `Broadcast complete. ${sent} registered people received the announcement. ${failed} could not be reached.`,
+        previewMessageId,
+        completionMessage,
         buildAdminMenu()
       );
     });
@@ -6631,7 +6687,7 @@ export async function createAttendanceBot(config) {
     const awaitingAttendanceOptionAdd = Boolean(getTextInput(ctx, "attendance-option"));
     const awaitingAppointmentAdd = Boolean(getTextInput(ctx, "appointment"));
     const awaitingIssueReport = Boolean(getTextInput(ctx, "issue"));
-    const awaitingBroadcastMessage = Boolean(getTextInput(ctx, "broadcast-message"));
+    const awaitingBroadcastMessage = Boolean(getTextInput(ctx, "broadcast-message")) || ctx.session.broadcastDrafting === true;
     const awaitingSpreadsheetIdChange = Boolean(getTextInput(ctx, "spreadsheet"));
 
     if (awaitingIssueReport) {
@@ -6705,7 +6761,8 @@ export async function createAttendanceBot(config) {
       }
 
       if (!message || message.length > 3500) {
-        await sendOrUpdateAdminMessage(
+        await ctx.deleteMessage().catch(() => {});
+        await editBroadcastPreview(
           ctx,
           "The announcement must be between 1 and 3,500 characters. Please try again.",
           Markup.inlineKeyboard([[
@@ -6716,12 +6773,13 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      consumeTextInput(ctx, "broadcast-message");
+      await ctx.deleteMessage().catch(() => {});
+      ctx.session.pendingTextInput = null;
       const interaction = beginInteraction(ctx, "broadcast-message", {
         confirm: { message }
       }, { ttlMs: 5 * 60 * 1000 });
       ctx.session.broadcastInteractionId = interaction.id;
-      await sendOrUpdateAdminMessage(
+      await editBroadcastPreview(
         ctx,
         ["📢 Preview", "", formatAnnouncementMessage(message), "", "Send this announcement to all registered users?"] .join("\n"),
         Markup.inlineKeyboard([[
