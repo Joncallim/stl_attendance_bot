@@ -2211,7 +2211,7 @@ function getUnaccountedAppointments(cache, config, date) {
   const snapshot = cache.sheetSnapshots?.snapshots?.get(title);
 
   if (!snapshot) {
-    return [];
+    return null;
   }
 
   const day = Number(

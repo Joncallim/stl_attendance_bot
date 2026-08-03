@@ -1186,6 +1186,18 @@ test("unaccounted details separate Telegram users from people not registered", (
   assert.equal(details.boundRows[0][0].url, "https://t.me/bound");
 });
 
+test("unaccounted details explain when attendance data is unavailable", () => {
+  const details = __testing.buildUnaccountedDetails(
+    new Date("2026-03-28T12:00:00.000Z"),
+    { timezone: "Asia/Singapore" },
+    null,
+    { appointments: [] }
+  );
+
+  assert.match(details.lines.join("\n"), /data .* not available yet/);
+  assert.doesNotMatch(details.lines.join("\n"), /Everyone has entered attendance/);
+});
+
 test("background schedules keep both 1-minute and 5-minute reconciliation intervals", async () => {
   const intervals = [];
   const schedules = [];
