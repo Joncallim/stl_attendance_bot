@@ -94,7 +94,7 @@ function logStorageSuccess(message, details = null) {
   console.log(message);
 }
 
-function clearUserBindingFields(user) {
+function clearUserBindingFields(user, options = {}) {
   return {
     ...user,
     appointment: null,
@@ -102,6 +102,12 @@ function clearUserBindingFields(user) {
     onboardingCompletedAt: null,
     awaitingSecretCode: false,
     awaitingAttendance: false,
+    ...(options.hardReset ? {
+      userId: null,
+      username: null,
+      firstName: null,
+      lastName: null
+    } : {}),
     updatedAt: new Date().toISOString()
   };
 }
@@ -1100,7 +1106,7 @@ async function deregisterAppointmentBindingLocked(appointment, options = {}) {
     const users = await readUsers();
     const nextUsers = users.map((user) =>
       String(user.chatId) === String(target.boundChatId)
-        ? clearUserBindingFields(user)
+        ? clearUserBindingFields(user, options)
         : user
     );
     await commitRegistryAndUsers(registry, nextUsers, "deregister_binding");
@@ -1293,13 +1299,14 @@ export async function deregisterRequestorByChatId(chatId, options = {}) {
 
     if (target?.boundChatId) {
       const result = await deregisterAppointmentBindingLocked(target.appointment, {
-        expectedBindingIdentity: options.force ? undefined : getAppointmentBindingIdentity(target)
+        expectedBindingIdentity: options.force ? undefined : getAppointmentBindingIdentity(target),
+        hardReset: options.force
       });
       if (!result.ok) return result;
       if (options.force && String(result.previousChatId) !== String(chatId)) {
         const currentUsers = await readUsers();
         const nextUsers = currentUsers.map((user) =>
-          String(user.chatId) === String(chatId) ? clearUserBindingFields(user) : user
+          String(user.chatId) === String(chatId) ? clearUserBindingFields(user, { hardReset: true }) : user
         );
         await commitRegistryAndUsers(await readAppointmentRegistry(), nextUsers, "hard_reset_identity");
       }
@@ -1308,7 +1315,7 @@ export async function deregisterRequestorByChatId(chatId, options = {}) {
 
     const users = await readUsers();
     const nextUsers = users.map((user) =>
-      String(user.chatId) === String(chatId) ? clearUserBindingFields(user) : user
+      String(user.chatId) === String(chatId) ? clearUserBindingFields(user, { hardReset: true }) : user
     );
     await commitRegistryAndUsers(registry, nextUsers, "hard_reset_identity");
     return { ok: true, appointment: target?.appointment ?? staleAppointment, previousChatId: chatId, hardReset: true };
