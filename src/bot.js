@@ -6621,6 +6621,16 @@ export async function createAttendanceBot(config) {
         return;
       }
 
+      if (normalizedOption === "PCL" || normalizedOption === "PARENT CARE LEAVE") {
+        consumeTextInput(ctx, "attendance-option");
+        await sendOrUpdateAdminMessage(
+          ctx,
+          "PCL is retired and cannot be added. Use FCL instead.",
+          buildAttendanceOptionsMenu()
+        );
+        return;
+      }
+
       if (config.attendanceOptions.includes(normalizedOption)) {
         consumeTextInput(ctx, "attendance-option");
         await sendOrUpdateAdminMessage(
@@ -7009,7 +7019,7 @@ export async function createAttendanceBot(config) {
           config,
           groupKey,
           `home:department:pickoption:${interactionId}`,
-          `home:department:pickgroup:${interactionId}:${groupKey}`
+          `home:department:pickgroup:${interactionId}`
         )
       );
       return;
@@ -7542,7 +7552,7 @@ export async function createAttendanceBot(config) {
           date,
           groupKey,
           `home:pick:week:${flowId}`,
-          overviewTarget,
+          `home:week:groups:${flowId}:${isoDate}`,
           [[Markup.button.callback(WEEK_SKIP_LABEL, `home:pick:week:${flowId}:${isoDate}:skip`)]],
           {}
         )
