@@ -897,6 +897,29 @@ test("attendance selection groups preserve configured categories and collect cus
   assert.deepEqual(groups.at(-1).options, ["FCL"]);
 });
 
+test("singleton attendance statuses use direct selection callbacks", () => {
+  const menu = __testing.buildAttendanceGroupMenu(
+    {
+      attendanceOptions: ["PRESENT", "DUTY", "FISHING", "OTHER"],
+      attendanceGroups: [
+        { key: "present", label: "PRESENT", options: ["PRESENT"] },
+        { key: "duty", label: "DUTY", options: ["DUTY"] },
+        { key: "fishing", label: "FISHING", options: ["FISHING"] },
+        { key: "other", label: "Other", options: ["OTHER"] }
+      ]
+    },
+    (key) => `group:${key}`,
+    "back",
+    [],
+    { directOptionCallbackBuilder: (option) => `direct:${option}` }
+  );
+
+  assert.deepEqual(
+    menu.reply_markup.inline_keyboard[0].map((button) => button.callback_data),
+    ["direct:PRESENT", "direct:DUTY", "direct:FISHING"]
+  );
+});
+
 test("department workweek view uses the viewer's own department for non-admins", () => {
   const cache = {
     activeCodes: [

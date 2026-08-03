@@ -9,6 +9,7 @@ import {
   bindAppointmentCode,
   computeRosterChecksum,
   deregisterAppointmentBinding,
+  deregisterRequestorByChatId,
   getAppointmentBindingIdentity,
   getAppointmentRegistry,
   getAppointmentStateIdentity,
@@ -94,6 +95,23 @@ test("binding is serialized and deregistration clears binding and custom admin a
 
     const admins = await listAdminAppointments([]);
     assert.deepEqual(admins, []);
+  });
+});
+
+test("hard deregistration clears only the caller's stale identity", async () => {
+  await withTempDataDir(async () => {
+    await syncAppointmentRegistry(["ALPHA"]);
+    const invite = await getOnboardingInvite("ALPHA");
+    await upsertUser({ chatId: "chat-current", userId: "user-current", appointment: "ALPHA" });
+    await upsertUser({ chatId: "chat-stale", userId: "old-user", appointment: "ALPHA" });
+    await bindAppointmentCode(invite.secretCode, {
+      chatId: "chat-current", userId: "user-current", username: "current", fullName: "Current"
+    });
+
+    const result = await deregisterRequestorByChatId("chat-stale", { force: true });
+    assert.equal(result.ok, true);
+    assert.equal((await getAppointmentRegistry()).appointments[0].boundChatId, "chat-current");
+    assert.equal((await getUserByChatId("chat-stale")).userId, null);
   });
 });
 
