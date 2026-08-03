@@ -2673,9 +2673,7 @@ function buildSummaryCounts(values) {
       "EMBARK OFF",
       "RR",
       "SR",
-      "FCL",
-      "PCL",
-      "PARENT CARE LEAVE"
+      "FCL"
     ]),
     outstationed: countStatuses(activeValues, [
       "OS",
@@ -2697,7 +2695,11 @@ function buildSummaryCounts(values) {
       "CSL (AM)",
       "CSL (PM)",
       "COMPASSIONATE",
-      "PTL"
+      "PTL",
+      "PCL",
+      "PCL (AM)",
+      "PCL (PM)",
+      "PARENT CARE LEAVE"
     ]),
     overseasLeave: countStatuses(activeValues, ["OL"]),
     attachedOut: countStatuses(activeValues, ["AO", "68", "69", "70", "71", "73"]),

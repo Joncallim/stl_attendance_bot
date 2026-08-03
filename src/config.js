@@ -341,7 +341,9 @@ async function loadSettingsDocument() {
 
   for (const group of attendanceGroups) {
     for (const option of group.options) {
-      attendanceGroupByOption.set(option, group);
+      if (!attendanceGroupByOption.has(option)) {
+        attendanceGroupByOption.set(option, group);
+      }
     }
   }
 
@@ -449,7 +451,9 @@ export async function applyStoredConfigOverrides() {
     ? [...new Set(settings.attendanceOptions.map((option) => String(option).trim().toUpperCase()).filter(Boolean))]
       .filter((option) => !RETIRED_ATTENDANCE_OPTIONS.has(option))
     : [];
-  const needsMigration = settings.attendanceOptionsVersion !== ATTENDANCE_OPTION_SCHEMA_VERSION;
+  const isLegacyVersion = settings.attendanceOptionsVersion === 2;
+  const isFutureVersion = Number(settings.attendanceOptionsVersion) > ATTENDANCE_OPTION_SCHEMA_VERSION;
+  const needsMigration = isLegacyVersion && Array.isArray(settings.attendanceOptions);
 
   if (storedOptions.length > 0) {
     config.attendanceOptions = needsMigration
@@ -459,7 +463,7 @@ export async function applyStoredConfigOverrides() {
     config.attendanceOptions = [...config.onboardingAttendanceOptions];
   }
 
-  if (needsMigration || storedOptions.length !== (settings.attendanceOptions?.length ?? 0)) {
+  if (!isFutureVersion && (needsMigration || storedOptions.length !== (settings.attendanceOptions?.length ?? 0))) {
     await setAttendanceOptions(config.attendanceOptions);
   }
 
