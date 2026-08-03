@@ -1198,6 +1198,23 @@ test("unaccounted details explain when attendance data is unavailable", () => {
   assert.doesNotMatch(details.lines.join("\n"), /Everyone has entered attendance/);
 });
 
+test("missing attendance day data is not treated as an all-clear", () => {
+  const result = __testing.getUnaccountedAppointments(
+    {
+      sheetSnapshots: {
+        snapshots: new Map([["Mar 26", {
+          appointments: ["ALPHA"],
+          statusesByDay: new Map()
+        }]])
+      }
+    },
+    { timezone: "Asia/Singapore" },
+    new Date("2026-03-28T12:00:00.000Z")
+  );
+
+  assert.equal(result, null);
+});
+
 test("background schedules keep both 1-minute and 5-minute reconciliation intervals", async () => {
   const intervals = [];
   const schedules = [];

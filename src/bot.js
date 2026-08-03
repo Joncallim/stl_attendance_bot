@@ -8811,6 +8811,7 @@ export const __testing = {
   formatDepartmentViewMessage,
   buildSummaryMenu,
   buildUnaccountedDetails,
+  getUnaccountedAppointments,
   formatSummaryMessage,
   formatHomeSynchronizationTimestamp,
   getCanonicalAttendanceOptions,
