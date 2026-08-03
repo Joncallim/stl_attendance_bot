@@ -4679,7 +4679,13 @@ function buildAttendancePromptBroadcastContext(config, date = new Date()) {
       "home:attendance:page",
       "home:main",
       [],
-      { promptId }
+      {
+        promptId,
+        groupCallbackBuilder: (groupKey, isoDate, prompt) =>
+          `home:attendance:groups:${prompt}:${isoDate}:${groupKey}`,
+        directOptionCallbackBuilder: (option, isoDate, prompt) =>
+          `home:pick:attendance:${prompt}:${isoDate}:${attendanceOptionToken(config, option)}`
+      }
     )
   };
 }
@@ -7629,7 +7635,13 @@ export async function createAttendanceBot(config) {
           "home:attendance:page",
           "home:main",
           [],
-          { promptId }
+          {
+            promptId,
+            groupCallbackBuilder: (groupKey, requestedDate, prompt) =>
+              `home:attendance:groups:${prompt}:${requestedDate}:${groupKey}`,
+            directOptionCallbackBuilder: (option, requestedDate, prompt) =>
+              `home:pick:attendance:${prompt}:${requestedDate}:${attendanceOptionToken(config, option)}`
+          }
         )
       );
       return;
@@ -9094,6 +9106,7 @@ export const __testing = {
   buildAdminMessagingMenu,
   buildAdminAttendanceMenu,
   buildAdminSettingsMenu,
+  buildAttendancePromptBroadcastContext,
   buildAttendanceOptionsDescription,
   buildHomeMenu,
   buildDepartmentWorkweekViewModel,

@@ -571,6 +571,26 @@ test("daily attendance prompt ids distinguish new prompts and stay within Telegr
   assert.ok(callbacks.every((value) => Buffer.byteLength(value, "utf8") <= 64));
 });
 
+test("scheduled attendance prompts use grouped menus and direct singleton callbacks", () => {
+  const context = __testing.buildAttendancePromptBroadcastContext({
+    attendanceOptions: ["PRESENT", "DUTY", "MC"],
+    attendanceGroups: [
+      { key: "present", label: "PRESENT", options: ["PRESENT"] },
+      { key: "duty", label: "DUTY", options: ["DUTY"] },
+      { key: "other", label: "Other", options: ["MC"] }
+    ],
+    timezone: "Asia/Singapore"
+  }, new Date("2026-07-30T04:00:00.000Z"));
+  const buttons = context.replyMarkup.reply_markup.inline_keyboard.flat();
+  const labels = buttons.map((button) => button.text);
+  const callbacks = buttons.map((button) => button.callback_data);
+
+  assert.deepEqual(labels.slice(0, 3), ["PRESENT", "DUTY", "Other"]);
+  assert.match(callbacks[0], /^home:pick:attendance:[^:]+:2026-07-30:0:/);
+  assert.match(callbacks[1], /^home:pick:attendance:[^:]+:2026-07-30:1:/);
+  assert.match(callbacks[2], /^home:pick:attendance:[^:]+:2026-07-30:2:[A-Za-z0-9_-]{8}$/);
+});
+
 test("stale interactions leave a visible explanation even after callback acknowledgement", async () => {
   const calls = [];
   const ctx = {
