@@ -106,7 +106,8 @@ function clearUserBindingFields(user, options = {}) {
       userId: null,
       username: null,
       firstName: null,
-      lastName: null
+      lastName: null,
+      fullName: null
     } : {}),
     updatedAt: new Date().toISOString()
   };
@@ -1313,11 +1314,42 @@ export async function deregisterRequestorByChatId(chatId, options = {}) {
       return result;
     }
 
+    let nextRegistry = registry;
+    if (target && !target.boundChatId) {
+      const existingCodes = new Set(
+        registry.appointments
+          .filter((entry) => entry.appointment !== target.appointment)
+          .map((entry) => normalizeCode(entry.secretCode))
+      );
+      const resetAt = new Date().toISOString();
+      const updatedTarget = {
+        ...target,
+        secretCode: generateSecretCode(existingCodes),
+        bindingRemovedAt: resetAt,
+        bindingRemovalReason: "hard_reset"
+      };
+      nextRegistry = {
+        ...registry,
+        appointments: registry.appointments.map((entry) =>
+          normalizeAppointmentName(entry.appointment) === normalizeAppointmentName(target.appointment)
+            ? updatedTarget
+            : entry
+        ),
+        adminAppointments: pruneUnboundAdminAppointments({ ...registry, appointments: registry.appointments.map((entry) =>
+          normalizeAppointmentName(entry.appointment) === normalizeAppointmentName(target.appointment)
+            ? updatedTarget
+            : entry
+        ) }),
+        updatedAt: resetAt
+      };
+      invalidateRegistryIntegrity(nextRegistry);
+    }
+
     const users = await readUsers();
     const nextUsers = users.map((user) =>
       String(user.chatId) === String(chatId) ? clearUserBindingFields(user, { hardReset: true }) : user
     );
-    await commitRegistryAndUsers(registry, nextUsers, "hard_reset_identity");
+    await commitRegistryAndUsers(nextRegistry, nextUsers, "hard_reset_identity");
     return { ok: true, appointment: target?.appointment ?? staleAppointment, previousChatId: chatId, hardReset: true };
   });
 }

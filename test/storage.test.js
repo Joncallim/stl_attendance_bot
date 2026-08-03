@@ -115,6 +115,29 @@ test("hard deregistration clears only the caller's stale identity", async () => 
   });
 });
 
+test("hard deregistration rotates an unbound appointment code and removes admin access", async () => {
+  await withTempDataDir(async () => {
+    await syncAppointmentRegistry(["ALPHA"]);
+    const before = await getOnboardingInvite("ALPHA");
+    await addAdminAppointment("ALPHA");
+    await upsertUser({
+      chatId: "chat-stale",
+      userId: "old-user",
+      appointment: "ALPHA",
+      fullName: "Old Identity"
+    });
+
+    const result = await deregisterRequestorByChatId("chat-stale", { force: true });
+    const after = await getOnboardingInvite("ALPHA");
+    assert.equal(result.ok, true);
+    assert.notEqual(after.secretCode, before.secretCode);
+    assert.deepEqual((await getAppointmentRegistry()).adminAppointments, []);
+    const cleared = await getUserByChatId("chat-stale");
+    assert.equal(cleared.userId, null);
+    assert.equal(cleared.fullName, null);
+  });
+});
+
 test("destructive registry mutations reject stale binding and state identities", async () => {
   await withTempDataDir(async () => {
     await syncAppointmentRegistry(["ALPHA", "BRAVO"]);
