@@ -284,6 +284,35 @@ test("enqueueAttendanceEvents then flush writes last-write-wins across 10 events
   });
 });
 
+test("coalesced status changes keep the earliest optimistic-lock value", async () => {
+  await withTempDataDir(async () => {
+    const date = new Date("2026-03-10T12:00:00.000Z");
+    await enqueueAttendanceEvents(CONFIG, [
+      {
+        appointment: "GOLF",
+        status: "A",
+        date,
+        expectedPreviousValue: ""
+      },
+      {
+        appointment: "GOLF",
+        status: "B",
+        date,
+        expectedPreviousValue: "A"
+      }
+    ]);
+
+    const flushed = [];
+    await flushAttendanceQueue(async (entries) => {
+      flushed.push(...entries);
+    });
+
+    assert.equal(flushed.length, 1);
+    assert.equal(flushed[0].status, "B");
+    assert.equal(flushed[0].expectedPreviousValue, "");
+  });
+});
+
 test("new attendance can be enqueued while a remote flush is still running", async () => {
   await withTempDataDir(async () => {
     await enqueueAttendanceEvent(CONFIG, makeEvent("HOTEL", "PRESENT"));

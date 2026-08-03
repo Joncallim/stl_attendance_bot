@@ -342,10 +342,20 @@ export async function flushAttendanceQueue(writeEntries) {
 
         const coalescedEntries = new Map();
         const eventGroups = new Map();
+        const firstEventByKey = new Map();
 
         for (const event of pendingEvents) {
           const key = `${event.appointment}:${event.date}`;
-          coalescedEntries.set(key, event);
+          const firstEvent = firstEventByKey.get(key) ?? event;
+          firstEventByKey.set(key, firstEvent);
+          // Keep the latest status, but compare it with the value that was
+          // expected before the first queued change. This preserves optimistic
+          // locking when a user changes status more than once before Sheets
+          // flushes (for example blank -> A -> B).
+          coalescedEntries.set(key, {
+            ...event,
+            expectedPreviousValue: firstEvent.expectedPreviousValue ?? ""
+          });
 
           if (!eventGroups.has(key)) {
             eventGroups.set(key, []);
