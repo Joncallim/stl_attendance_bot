@@ -307,13 +307,7 @@ async function loadSettingsDocument() {
       ensureNonEmptyString(option, `attendance.groups[${index}].options[${optionIndex}]`).toUpperCase()
     );
 
-    for (const option of normalizedOptions) {
-      if (seenOptions.has(option)) {
-        throw new Error(`Attendance option '${option}' appears in more than one group.`);
-      }
-
-      seenOptions.add(option);
-    }
+    normalizedOptions.forEach((option) => seenOptions.add(option));
 
     attendanceGroups.push({
       id,
@@ -333,7 +327,9 @@ async function loadSettingsDocument() {
     return left.label.localeCompare(right.label);
   });
 
-  const attendanceOptions = attendanceGroups.flatMap((group) => group.options);
+  // A status may intentionally appear in multiple Telegram menu categories
+  // (for example OC and OL), but it must remain one value in Sheets.
+  const attendanceOptions = [...new Set(attendanceGroups.flatMap((group) => group.options))];
   const attendanceGroupByOption = new Map();
 
   for (const group of attendanceGroups) {

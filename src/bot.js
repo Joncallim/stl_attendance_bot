@@ -165,7 +165,6 @@ const ATTENDANCE_OPTION_DISPLAY_ORDER = [
   "RSI",
   "LL",
   "CCL",
-  "PCL",
   "CSL",
   "COMPASSIONATE",
   "PTL",
@@ -205,7 +204,6 @@ const ATTENDANCE_OPTION_DESCRIPTIONS = {
   HL: "Hospitalisation Leave",
   OIL: "Off in Lieu",
   CNB: "Changi Naval Base",
-  PCL: "Parent Care Leave",
   PTL: "Paternity Leave",
   RR: "Reverse Routine",
   RSI: "Report Sick In-Camp",
@@ -908,9 +906,9 @@ function buildInlineAttendanceMenu(
   const pageItems = options.slice(startIndex, startIndex + pageSize);
   const rows = [...extraRows];
 
-  for (let index = 0; index < pageItems.length; index += 4) {
+  for (let index = 0; index < pageItems.length; index += 3) {
     rows.push(
-      pageItems.slice(index, index + 4).map((option, offset) => {
+      pageItems.slice(index, index + 3).map((option, offset) => {
         const absoluteIndex = startIndex + index + offset;
         const token = menuOptions.itemTokenBuilder
           ? menuOptions.itemTokenBuilder(option, absoluteIndex)
@@ -971,11 +969,11 @@ function buildAttendanceGroupMenu(config, groupCallbackBuilder, backTarget, extr
   const groups = getAttendanceOptionGroups(config);
   const rows = [...extraRows];
 
-  for (let index = 0; index < groups.length; index += 2) {
+  for (let index = 0; index < groups.length; index += 3) {
     rows.push(
-      groups.slice(index, index + 2).map((group) =>
+      groups.slice(index, index + 3).map((group) =>
         Markup.button.callback(
-          `${group.label} (${group.options.length})`,
+          group.label,
           groupCallbackBuilder(group.key)
         )
       )
@@ -2285,7 +2283,7 @@ function formatSummaryMessage(summary, config, options = {}) {
       {
         heading: "Local Leave",
         total: counts.localLeave,
-        breakdown: buildBreakdown(["LL", "CCL", "PCL", "CSL", "COMPASSIONATE", "PTL"])
+        breakdown: buildBreakdown(["LL", "CCL", "CSL", "COMPASSIONATE", "PTL"])
       },
       {
         heading: "Overseas Leave",

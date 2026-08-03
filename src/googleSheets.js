@@ -284,7 +284,6 @@ const ATTENDANCE_STATUS_ALIAS_MAP = new Map([
   ["REPORT SICK IN-CAMP", "RSI"],
   ["LOCAL LEAVE", "LL"],
   ["CHILD CARE LEAVE", "CCL"],
-  ["PARENT CARE LEAVE", "PCL"],
   ["CHILD SICK LEAVE", "CSL"],
   ["PATERNITY LEAVE", "PTL"],
   ["OVERSEAS LEAVE", "OL"],
@@ -2673,7 +2672,8 @@ function buildSummaryCounts(values) {
       "DISEMBARK OFF",
       "EMBARK OFF",
       "RR",
-      "SR"
+      "SR",
+      "FCL"
     ]),
     outstationed: countStatuses(activeValues, [
       "OS",
@@ -2691,9 +2691,6 @@ function buildSummaryCounts(values) {
       "CCL",
       "CCL (AM)",
       "CCL (PM)",
-      "PCL",
-      "PCL (AM)",
-      "PCL (PM)",
       "CSL",
       "CSL (AM)",
       "CSL (PM)",
