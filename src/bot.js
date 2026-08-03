@@ -4399,8 +4399,8 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
         recipients.map((user) => (signal) => {
           const text = formatAnnouncementMessage(message);
           return typeof bot.telegram.callApi === "function"
-            ? bot.telegram.callApi("sendMessage", { chat_id: user.chatId, text }, { signal })
-            : bot.telegram.sendMessage(user.chatId, text);
+            ? bot.telegram.callApi("sendMessage", { chat_id: user.boundChatId, text }, { signal })
+            : bot.telegram.sendMessage(user.boundChatId, text);
         }),
         TELEGRAM_SEND_CONCURRENCY
       );

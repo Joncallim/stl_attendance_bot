@@ -114,6 +114,7 @@ test("broadcast recipients are unique registered Telegram users", () => {
   ]);
 
   assert.deepEqual(recipients.map((user) => user.appointment), ["A", "C"]);
+  assert.deepEqual(recipients.map((user) => user.boundChatId), ["10", "11"]);
   assert.equal(__testing.formatAnnouncementMessage("Latest update"), "📢 Stalwart Announcement Bot\n\nLatest update");
 });
 
