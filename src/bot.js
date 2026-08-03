@@ -7341,7 +7341,7 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      if (!groupCallbackKey) {
+      if (!groupKey) {
         await sendOrUpdateAdminMessage(
           ctx,
           "Choose a category, then select an attendance status.",
@@ -7356,11 +7356,6 @@ export async function createAttendanceBot(config) {
             }
           )
         );
-        return;
-      }
-
-      if (!groupKey) {
-        await rejectExpiredInteraction(ctx);
         return;
       }
 
@@ -7566,13 +7561,13 @@ export async function createAttendanceBot(config) {
         return;
       }
 
-      if (!groupKey) {
+      if (!groupCallbackKey) {
         await sendOrUpdateAdminMessage(
           ctx,
           "Choose a category, then select your attendance status.",
           buildAttendanceGroupMenu(
             config,
-            (nextGroupKey) => `home:attendance:groups:${promptId}:${isoDate}:${nextGroupKey}`,
+            (nextGroupKey) => `home:attendance:groups:${promptId}:${isoDate}:${attendanceGroupCallbackToken(nextGroupKey)}`,
             "home:main",
             [],
             {
@@ -7581,6 +7576,11 @@ export async function createAttendanceBot(config) {
             }
           )
         );
+        return;
+      }
+
+      if (!groupKey) {
+        await rejectExpiredInteraction(ctx);
         return;
       }
 
