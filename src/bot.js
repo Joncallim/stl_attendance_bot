@@ -1103,7 +1103,11 @@ function buildDatedAttendanceMenu(
       config,
       (groupKey) => menuOptions.groupCallbackBuilder(groupKey, isoDate, menuOptions.promptId ?? "legacy"),
       backTarget,
-      extraRows
+      extraRows,
+      {
+        directOptionCallbackBuilder: (option) =>
+          menuOptions.directOptionCallbackBuilder?.(option, isoDate, menuOptions.promptId ?? "legacy")
+      }
     );
   }
 
@@ -2946,7 +2950,9 @@ async function askAttendance(ctx, config, user = null, cache = null) {
       {
         promptId,
         groupCallbackBuilder: (groupKey, isoDate, prompt) =>
-          `home:attendance:groups:${prompt}:${isoDate}:${groupKey}`
+          `home:attendance:groups:${prompt}:${isoDate}:${groupKey}`,
+        directOptionCallbackBuilder: (option, isoDate, prompt) =>
+          `home:pick:attendance:${prompt}:${isoDate}:${attendanceOptionToken(config, option)}`
       }
     )
   );
@@ -3096,7 +3102,9 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
       [[Markup.button.callback(WEEK_SKIP_LABEL, `home:pick:week:${weeklyState.flowId}:${isoDate}:skip`)]],
       {
         groupCallbackBuilder: (groupKey, requestedDate) =>
-          `home:week:groups:${weeklyState.flowId}:${requestedDate}:${groupKey}`
+          `home:week:groups:${weeklyState.flowId}:${requestedDate}:${groupKey}`,
+        directOptionCallbackBuilder: (option, requestedDate) =>
+          `home:pick:week:${weeklyState.flowId}:${requestedDate}:${attendanceOptionToken(config, option)}`
       }
     )
   );

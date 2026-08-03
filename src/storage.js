@@ -1261,17 +1261,26 @@ export async function deregisterRequestorByChatId(chatId, options = {}) {
       (entry) => entry.active && String(entry.boundChatId) === String(chatId)
     );
 
+    let staleAppointment = null;
     if (!target && options.force) {
       const users = await readUsers();
       const staleUser = users.find((user) => String(user.chatId) === String(chatId));
+      staleAppointment = staleUser?.appointment ?? null;
       target = staleUser?.appointment
         ? registry.appointments.find((entry) =>
             entry.active && normalizeAppointmentName(entry.appointment) === normalizeAppointmentName(staleUser.appointment)
           )
         : null;
+      if (target?.boundChatId && String(target.boundChatId) !== String(chatId)) {
+        target = null;
+      }
     }
 
     if (!target && !options.force) {
+      return { ok: false, reason: "not_bound" };
+    }
+
+    if (!target && options.force && !staleAppointment) {
       return { ok: false, reason: "not_bound" };
     }
 
@@ -1302,7 +1311,7 @@ export async function deregisterRequestorByChatId(chatId, options = {}) {
       String(user.chatId) === String(chatId) ? clearUserBindingFields(user) : user
     );
     await commitRegistryAndUsers(registry, nextUsers, "hard_reset_identity");
-    return { ok: true, appointment: target?.appointment ?? null, previousChatId: chatId, hardReset: true };
+    return { ok: true, appointment: target?.appointment ?? staleAppointment, previousChatId: chatId, hardReset: true };
   });
 }
 
