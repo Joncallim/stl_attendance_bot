@@ -381,7 +381,6 @@ async function loadSettingsDocument() {
 export const defaultAttendanceOptions = [];
 const ATTENDANCE_OPTION_SCHEMA_VERSION = 3;
 const RETIRED_ATTENDANCE_OPTIONS = new Set(["PCL"]);
-const MIGRATED_ATTENDANCE_OPTIONS = ["FCL"];
 
 const privateKey = requireEnv("GOOGLE_PRIVATE_KEY").replace(/\\n/g, "\n");
 const runtimeConfig = {
@@ -446,24 +445,29 @@ export async function applyStoredConfigOverrides() {
   applyUnitSettings(config, unitSettings);
 
   const settings = await getSettings();
+  const storedVersion = Number(settings.attendanceOptionsVersion);
+  if (storedVersion > ATTENDANCE_OPTION_SCHEMA_VERSION) {
+    throw new Error(
+      `Stored attendance option schema version ${storedVersion} is newer than supported version ${ATTENDANCE_OPTION_SCHEMA_VERSION}.`
+    );
+  }
 
-  const storedOptions = Array.isArray(settings.attendanceOptions)
-    ? [...new Set(settings.attendanceOptions.map((option) => String(option).trim().toUpperCase()).filter(Boolean))]
-      .filter((option) => !RETIRED_ATTENDANCE_OPTIONS.has(option))
+  const rawStoredOptions = Array.isArray(settings.attendanceOptions)
+    ? settings.attendanceOptions.map((option) => String(option).trim().toUpperCase()).filter(Boolean)
     : [];
-  const isLegacyVersion = settings.attendanceOptionsVersion === 2;
-  const isFutureVersion = Number(settings.attendanceOptionsVersion) > ATTENDANCE_OPTION_SCHEMA_VERSION;
+  const storedOptions = [...new Set(
+    rawStoredOptions.map((option) => option === "PCL" || option === "PARENT CARE LEAVE" ? "FCL" : option)
+  )].filter((option) => !RETIRED_ATTENDANCE_OPTIONS.has(option));
+  const isLegacyVersion = storedVersion === 2;
   const needsMigration = isLegacyVersion && Array.isArray(settings.attendanceOptions);
 
   if (storedOptions.length > 0) {
-    config.attendanceOptions = needsMigration
-      ? [...new Set([...storedOptions, ...MIGRATED_ATTENDANCE_OPTIONS])]
-      : storedOptions;
+    config.attendanceOptions = storedOptions;
   } else {
     config.attendanceOptions = [...config.onboardingAttendanceOptions];
   }
 
-  if (!isFutureVersion && (needsMigration || storedOptions.length !== (settings.attendanceOptions?.length ?? 0))) {
+  if (needsMigration || storedOptions.length !== (settings.attendanceOptions?.length ?? 0)) {
     await setAttendanceOptions(config.attendanceOptions);
   }
 
