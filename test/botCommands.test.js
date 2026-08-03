@@ -106,10 +106,11 @@ test("missing attendance contact buttons cascade at three per row", () => {
 
 test("broadcast recipients are unique registered Telegram users", () => {
   const recipients = __testing.getBroadcastRecipients([
-    { appointment: "A", chatId: "10" },
-    { appointment: "B", chatId: 10 },
-    { appointment: "C", chatId: "11" },
-    { appointment: null, chatId: "12" }
+    { active: true, appointment: "A", boundChatId: "10" },
+    { active: true, appointment: "B", boundChatId: 10 },
+    { active: true, appointment: "C", boundChatId: "11" },
+    { active: false, appointment: "D", boundChatId: "12" },
+    { active: true, appointment: "E", boundChatId: null }
   ]);
 
   assert.deepEqual(recipients.map((user) => user.appointment), ["A", "C"]);

@@ -628,8 +628,8 @@ function formatAnnouncementMessage(message) {
 function getBroadcastRecipients(users) {
   const seen = new Set();
   return users.filter((user) => {
-    const chatId = user?.chatId;
-    if (!user?.appointment || chatId == null || seen.has(String(chatId))) {
+    const chatId = user?.boundChatId;
+    if (!user?.active || !user?.appointment || chatId == null || seen.has(String(chatId))) {
       return false;
     }
     seen.add(String(chatId));
@@ -4387,7 +4387,8 @@ async function runAdminAction(action, ctx, bot, sheets, config, cache) {
       return;
     }
     ctx.session.broadcastInteractionId = null;
-    const recipients = getBroadcastRecipients(await listUsers());
+    const registry = await getAppointmentRegistry();
+    const recipients = getBroadcastRecipients(registry.appointments);
     if (recipients.length === 0) {
       await sendOrUpdateAdminMessage(ctx, "No registered users found.", buildAdminMenu());
       return;
