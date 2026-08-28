@@ -28,7 +28,12 @@ This repository contains a Telegram attendance bot that treats Google Sheets as 
 ## Validation
 
 - Syntax: `npm run check`.
-- Regression suite: `npm test`.
-- Container parity when Docker behavior changes: `docker compose run --rm attendance-bot npm test`.
+- Regression suite: run `npm test` on the host, where `test/` is present. The
+  production image intentionally omits the test suite.
+- Container build/syntax parity when Docker behavior changes: run
+  `docker build -t attendance-bot:check .`, then
+  `docker run --rm --entrypoint npm attendance-bot:check run check`. This proves
+  the production image builds and its copied sources parse under the image's
+  Node runtime; it does not replace the host regression suite or start the bot.
 
 Use Node.js 20 or newer. State any live Telegram/Sheets behavior that remains unverified; unit tests are not authorization to deploy or to alter a production sheet.
