@@ -1,347 +1,366 @@
-# System Logic
+# System Logic and Reimplementation Specification
 
-This document explains how the attendance bot fits together, what owns each piece of state, and how it recovers from interrupted work.
+This document defines the behaviour of the attendance system independently of JavaScript, Telegraf and the Google client library. A replacement implementation in another language should preserve the contracts here even if its internal structure is different.
 
-## 1. System shape
+## 1. External boundaries
 
-The bot has three main stores:
+The system has three persistent boundaries:
 
-1. **Telegram** is the user interface.
-2. **Google Sheets** is the shared attendance record used by the unit.
-3. **Local files under `data/`** provide durable queueing, bindings, recovery journals and caches.
+1. **Telegram** — commands, callbacks, prompts and notifications.
+2. **Google Sheets** — the human-visible attendance workbook.
+3. **Local durable storage** — accepted-but-not-yet-synchronised attendance, roster/binding state, recovery journals and cached sheet snapshots.
 
-The local files are not disposable scratch space. Some of them are part of the consistency model and allow the bot to survive restarts or temporary Google Sheets failures without losing acknowledged user actions.
+Local durable storage is part of the correctness model. It cannot be replaced with process memory unless the replacement provides equivalent crash durability.
 
-The main modules are:
+## 2. Domain model
 
-- `src/index.js` — process startup and shutdown
-- `src/bot.js` — Telegram commands, menus and workflows
-- `src/googleSheets.js` — sheet reads, writes, reconciliation and structural maintenance
-- `src/attendanceQueue.js` — durable attendance event queue
-- `src/storage.js` — users, appointment registry and runtime settings
-- `src/syncManager.js` — scheduling and coalescing of background sync work
-- `src/attendanceTransferJournal.js` — crash recovery for appointment transfers
-- `src/concurrency.js` — bounded Telegram broadcast dispatch
-- `src/workPriority.js` / `src/broadcastActivity.js` — interactive work takes priority over background work
-- `src/weeklyFlow.js` / `src/holidays.js` — weekly attendance and public-holiday handling
-- `src/messageCleanup.js` — restart-safe expiry of temporary Telegram controls
+### Appointment
 
-## 2. Sources of truth
+An appointment is the stable operational identity used by the attendance system. Attendance belongs to an appointment, not to a Telegram user or spreadsheet row.
 
-There is intentionally no single source of truth for every field.
+Required properties are the appointment name, active/removed state, onboarding code, optional Telegram binding, hierarchy assignment and admin status where applicable.
 
-### Roster order
+Appointment-name comparison is normalised consistently before identity checks. A port must choose one normalisation rule and apply it at every storage boundary.
 
-The visible appointment order in `ONBOARDING` is canonical. Month sheets should follow this order in the bot-managed area.
+### Telegram user
 
-### Active roster membership
+A Telegram user record identifies a chat/account and may be bound to one appointment. Conversation state and pending interactions are user state, not roster identity.
 
-Active membership is reconciled from both:
+### Attendance entry
 
-- `ONBOARDING`
-- `data/appointment-registry.json`
-
-This prevents an interrupted write on one side from silently deleting an appointment. If an appointment exists on only one side, reconciliation normally restores the missing copy.
-
-A deliberate removal is different: the bot records enough intent to distinguish an explicit removal from an accidental one-sided disappearance.
-
-### Telegram bindings
-
-Bindings are represented in local user and appointment state. Reconciliation can repair a missing copy from the surviving side when the identity is unambiguous.
-
-The bot must not assign an appointment to a second Telegram account while it is already bound.
-
-### Attendance
-
-Google Sheets is the shared record, but newly submitted attendance first exists as a durable local queue event. The queue is therefore authoritative for acknowledged writes that have not yet reached Sheets.
-
-## 3. Startup
-
-`src/index.js` performs startup in a fixed order:
-
-1. secure runtime file permissions
-2. configure the network stack
-3. configure logging
-4. load stored configuration overrides
-5. create the bot and its Sheets dependencies
-6. start Telegram long polling
-7. register Telegram commands
-8. install graceful shutdown handlers
-
-Startup and reconciliation code may also create missing sheet structures and recover durable local state.
-
-The process should fail visibly if required configuration or a safety-critical state cannot be resolved. Silent fallback is appropriate only where the fallback is explicitly part of the design.
-
-## 4. Onboarding
-
-Each active appointment has a secret onboarding code.
-
-A new user runs `/start` or `/onboard`, supplies the code and is bound to that appointment. The binding is stored locally and used for all later attendance actions.
-
-Important rules:
-
-- a code identifies an appointment, not a person
-- a currently bound appointment cannot be claimed by another Telegram account
-- deregistration clears the current binding and rotates the code
-- binding repair must use stable appointment identity, not sheet row position
-
-## 5. Daily attendance write path
-
-The critical contract is: **the bot does not tell the user that attendance was accepted until it has been persisted locally.**
-
-The normal flow is:
+The logical key is:
 
 ```text
-Telegram callback
-    |
-    v
-validate user, appointment, date and status
-    |
-    v
-enqueue durable attendance event
-    |
-    v
-append event to attendance-queue.ndjson
-    |
-    v
-update in-memory queue state
-    |
-    v
-acknowledge user
-    |
-    v
-background queue flush
-    |
-    v
-resolve appointment/date against live sheet layout
-    |
-    v
-batch write to Google Sheets
-    |
-    v
-append queue result record
-    |
-    v
-refresh local/cache state
+(appointment, calendar date)
 ```
 
-The queue is append-only between compactions. State is reconstructed by replaying queue records. This means a crash during a flush leaves enough history to determine whether an event is still pending, retryable, conflicted, skipped or complete.
+The value is one configured attendance status. Spreadsheet row and column numbers are locations discovered at write time; they are not part of attendance identity.
 
-### Idempotency
+### Attendance event
 
-Attendance replay must be safe. Re-running a pending event must not create a second logical attendance submission.
+A submitted attendance change becomes a durable event before acknowledgement. At minimum an event needs a unique ID, idempotency key, appointment, date, status, creation time and enough metadata to detect unsafe layout changes during flush.
 
-The queue tracks event identity and idempotency information, and flush processing coalesces compatible writes where appropriate. The latest valid value for the same appointment/date can supersede an older queued value.
+### Roster
 
-### Retry behaviour
+Roster order and roster membership have different recovery rules. Visible order comes from `ONBOARDING`; membership is reconciled with the local appointment registry so an interrupted one-sided write is not mistaken for deletion.
 
-Temporary failures are retried with backoff. Repeated failures are bounded so a permanently failing event does not retry forever.
+## 3. Sources of truth
 
-A layout conflict is not treated like a transient network error. If the sheet structure is unsafe or ambiguous, the event is marked conflicted and requires reconciliation rather than blind retries.
+| Data | Authority / reconciliation rule |
+| --- | --- |
+| Roster display order | Visible managed order in `ONBOARDING` |
+| Active roster membership | Safe reconciliation of `ONBOARDING` and local appointment registry |
+| Deliberate removal | Explicit recorded removal intent; absence on one side is insufficient |
+| Telegram binding | Mirrored local user/registry state; repair only when identity is unambiguous |
+| Acknowledged attendance not yet flushed | Durable attendance queue |
+| Synchronised attendance | Google Sheets, subject to unresolved newer queued events |
+| Unit hierarchy/default statuses | `settings.yaml` |
+| Runtime attendance-option overrides | local settings state |
 
-## 6. Weekly attendance
+This distinction is essential. A port that declares either the spreadsheet or local files universally authoritative will change failure behaviour.
 
-The weekly workflow stages selections for the current Monday-to-Friday workweek, then resolves them into normal per-day attendance entries.
-
-The weekly flow must handle:
-
-- weeks crossing month boundaries
-- weeks crossing year boundaries
-- Singapore public holidays
-- skipped days
-- repeated edits before final submission
-
-Public holidays are auto-filled as `PH`.
-
-Weekly submission ultimately enters the same durable attendance pipeline as daily submission; it should not bypass the queue simply because several dates are being submitted together.
-
-## 7. Google Sheets layout
+## 4. Spreadsheet contract
 
 ### `ONBOARDING`
 
 Managed fields:
 
-- column A — appointment name
-- column B — onboarding code
+- column A: appointment name
+- column B: onboarding code
 
-The bot should make no assumption that unrelated cells elsewhere on the sheet belong to it.
+The visible managed appointment order is canonical. Other cells are not implicitly owned by the application.
 
-### Month sheets
+### Monthly worksheets
 
-Each month uses a worksheet such as `Sep 26`.
+A worksheet represents one calendar month, for example `Sep 26`.
 
-Managed layout:
+Managed coordinates are discovered from:
 
-- column A — appointments
-- row 1 — date headings
-- body — attendance values
+- appointment names in column A
+- date headings in row 1
 
-Writes are resolved from appointment name and date against the current sheet. The bot must not keep using a row number captured before a user manually reorders the sheet.
+The application manages only the intersection of known appointments and recognised date columns. It must not overwrite unrelated rows or columns.
 
-## 8. Reconciliation
+Before a write, resolve the current row from appointment identity and the current column from the date heading. Never persist a row number for later use as identity.
 
-Reconciliation exists to repair expected drift without destroying uncertain human changes.
+Duplicate or otherwise ambiguous managed rows are an error. Do not choose one heuristically.
 
-The safe bias is conservative:
+## 5. Startup sequence
 
-- recover a one-sided roster record instead of deleting it
-- repair a binding from a surviving unambiguous copy
-- preserve cells outside the managed area
-- prefer current sheet structure over stale cached row assumptions
-- stop when duplicate or missing rows make identity ambiguous
+Startup order is semantically significant where later components depend on earlier configuration:
 
-A reconciliation failure should be diagnosable. It is preferable to leave an obvious unresolved state than to make a destructive guess.
+1. create/secure the local data directory and files
+2. configure networking
+3. initialise logging
+4. load deploy-time configuration and stored runtime overrides
+5. recover incomplete local storage transactions
+6. construct Sheets and Telegram clients
+7. initialise/reconcile required sheet structures and caches
+8. recover durable queue, transfer and message-cleanup state
+9. register handlers and scheduled work
+10. start Telegram long polling
 
-## 9. Background sync
+Required configuration and corrupt safety-critical state should fail visibly. Do not silently manufacture replacement state unless the fallback is explicitly defined.
 
-`src/syncManager.js` coalesces overlapping sync requests so background work does not start duplicate cycles.
+## 6. Onboarding and binding
 
-A cycle can include:
+Each active appointment has a secret code. The code identifies the appointment; it is not a user password.
 
-1. queue flush
-2. onboarding/roster refresh
-3. admin cache refresh
-4. month-slice refresh
+Binding sequence:
 
-There are several reasons a cycle may be requested: routine background refresh, foreground user work, reminder preparation, forced reconciliation or an explicit flush threshold.
+1. user begins onboarding
+2. supplied code is normalised and resolved to one active appointment
+3. verify that the appointment is not bound to another Telegram identity
+4. persist the binding consistently in local state
+5. only then report successful onboarding
 
-If a stronger request arrives while a weaker cycle is already running, the manager records a follow-up rather than dropping the stronger requirement.
+Deregistration clears the binding and rotates the code so the previous code cannot reclaim the appointment.
 
-During structural maintenance, foreground or durability-critical work is deferred and replayed afterward instead of being discarded.
+Binding reconciliation may repair a missing mirrored record only when the surviving record identifies one unambiguous appointment/user pair.
 
-## 10. Interactive priority
+## 7. Daily attendance transaction
 
-Telegram user interactions take priority over broadcasts and nonessential Sheets refreshes.
+This is the principal durability contract.
 
-The process-wide Telegram dispatcher limits both launch rate and concurrency. Broadcast work checks whether interactive work has started before consuming a send slot.
+```text
+receive Telegram action
+        |
+validate actor, binding, date and status
+        |
+construct attendance event
+        |
+append + fsync durable queue record
+        |
+update process cache
+        |
+acknowledge user
+        |
+background flush
+        |
+resolve live sheet coordinates
+        |
+batch write to Sheets
+        |
+record durable queue outcome
+        |
+update cached sheet state
+```
 
-Rate-limit responses and temporary Telegram server errors are retried within bounded limits. A global pause is shared across concurrent broadcast callers so two broadcasts cannot independently exceed the intended send rate.
+The acknowledgement boundary is after durable local persistence and before remote Sheets completion. Moving it earlier permits acknowledged data loss; moving it after Sheets makes Telegram responsiveness depend on Sheets availability.
 
-The same principle is used around background Sheets work: routine refreshes may yield when the bot is actively serving users.
+### Queue state machine
 
-## 11. Reminders
+An implementation may encode this differently, but it must represent these outcomes:
 
-Two reminder passes are scheduled by default:
+- `pending` — accepted locally, not yet resolved remotely
+- `failed_retryable` — transient flush failure with retry schedule
+- `conflicted` — cannot safely resolve against current sheet structure
+- `flushed` — remote write completed
+- `skipped_noop` — remote state already represents the requested logical value
+- `failed_permanent` — bounded retry policy exhausted
 
-- 07:00 — all bound users
-- 08:00 — users who are still blank
+Queue history is append-oriented so a crash cannot rewrite the only copy of an accepted event. Compaction is allowed only when malformed/incomplete records have been ruled out and the logical state of retained events is preserved.
 
-Before sending reminders the bot refreshes enough state to avoid prompting from obviously stale attendance data.
+### Idempotency and coalescing
 
-Reminders are not sent on weekends or Singapore public holidays.
+Replaying the same logical event must be safe. A retry must not create a second attendance fact.
 
-A Telegram user must previously have started the bot in private chat, and Telegram can still prevent delivery if the user blocks the bot.
+For multiple unresolved values targeting the same `(appointment, date)`, the newest valid submission may supersede older queued values. Supersession must be explicit and deterministic.
 
-## 12. Appointment transfers
+### Retry policy
 
-Moving attendance/binding ownership between appointments is a multi-step operation and cannot safely be treated as one in-memory transaction.
+Network/time-out failures use bounded backoff. Structural ambiguity is not a retryable network failure and must enter a conflict path instead of repeatedly writing against uncertain coordinates.
 
-`attendance-transfer-journal.json` records progress through the transfer. The journal is written before the dangerous steps begin and is only removed when the operation is known to be complete.
+## 8. Weekly attendance
 
-This prevents a restart between:
+Weekly entry is a user-interface transaction over Monday through Friday. It stages choices and then emits ordinary per-date attendance events through the same durable queue.
 
-- copying attendance
-- changing the binding
-- clearing the source appointment
+Required behaviour:
 
-from leaving an invisible half-completed transfer.
+- support month and year boundaries
+- use calendar dates rather than weekday indexes as stored identity
+- preserve an existing value when the user skips a day
+- allow a staged value to replace an earlier staged value for the same date
+- mark Singapore public holidays as `PH`
+- submit final changed dates through the normal attendance durability path
 
-If a journal already exists, a second transfer must not begin until the previous transfer is recovered or deliberately resolved.
+A port must not create a separate, weaker persistence path for weekly attendance.
 
-## 13. Local files
+## 9. Queue-to-Sheets flush
 
-Key runtime files:
+A flush performs the following logical work:
 
-### `attendance-queue.ndjson`
+1. load eligible unresolved events
+2. apply retry timing and terminal-state rules
+3. coalesce superseded values by `(appointment, date)`
+4. obtain sufficiently fresh sheet structure
+5. resolve each appointment/date to current coordinates
+6. reject ambiguous/missing managed structure as conflict
+7. compare with current remote value where needed to identify no-op writes
+8. batch compatible writes
+9. record each event outcome durably
+10. update local sheet snapshots
 
-Append-only attendance queue and outcome log. Replayed to reconstruct current queue state. Periodically compacted after resolved records no longer need to be retained.
+If the process dies after the Sheets request but before local outcome recording, replay must converge safely. This is why idempotent logical writes are required.
 
-### `appointment-registry.json`
+## 10. Roster reconciliation
 
-Local roster copy, onboarding codes, appointment bindings and admin appointments.
+Reconciliation repairs expected drift without interpreting uncertainty as intent.
 
-### `users.json`
+Rules:
 
-Telegram user state and interaction state.
+- `ONBOARDING` controls visible order
+- membership is recovered from both `ONBOARDING` and the local registry
+- a one-sided missing appointment is normally restored
+- automatic deletion requires explicit removal evidence
+- bindings are repaired only from an unambiguous surviving copy
+- managed month rows are aligned by appointment identity
+- unmanaged spreadsheet content is preserved
+- duplicate/malformed managed structure stops automatic repair
 
-### `sheet-cache.json`
+The desired failure mode is an explicit unresolved condition, not a plausible-looking destructive guess.
 
-Cached onboarding and month slices plus sync metadata. Used to avoid unnecessary Sheets calls and keep menus responsive.
+## 11. Synchronisation scheduler
 
-### `settings.json`
+Only one logical sync cycle should own the Sheets reconciliation path at a time.
 
-Runtime attendance-option changes made by admins. `settings.yaml` remains the deploy-time default.
+A cycle may include queue flush, onboarding refresh, admin/cache refresh and month-snapshot refresh. Requests can differ in strength: routine refresh, explicit flush, foreground read, reminder preparation or forced reconciliation.
 
-### `attendance-transfer-journal.json`
+If a stronger request arrives during an existing weaker cycle, retain the stronger requirements and run a follow-up cycle. Do not silently drop them.
 
-Present only while an appointment transfer is in progress or awaiting recovery.
+Structural maintenance may temporarily exclude ordinary sync work. Durability-critical or foreground requests arriving during that window must be retained and replayed afterward.
 
-### `attendance-button-cleanup.json`
+## 12. Interactive priority and rate control
 
-Tracks temporary Telegram controls that still need to be removed or disabled after their expiry time, including across restarts.
+User interactions take priority over broadcasts and nonessential background reads.
 
-## 14. Configuration model
+Telegram sends use a process-wide dispatcher with:
 
-`settings.yaml` defines unit-specific structure:
+- bounded concurrency
+- minimum launch spacing
+- bounded retry for rate limits/transient server failures
+- a shared pause after Telegram requests a retry delay
+- checks immediately before launch so a newly arrived user interaction can pre-empt queued broadcast work
 
-- unit identity
-- hierarchy
-- known appointments
-- default admins
-- attendance groups and statuses
+Sheets requests are serialised/rate-limited and background requests yield at safe request boundaries while interactive work is active. An in-flight remote request is allowed to finish rather than being cancelled mid-operation.
 
-Environment variables configure deployment and runtime behaviour, including credentials, reminder times, queue thresholds and rate limits.
+The exact concurrency primitives are language-specific; the observable ordering and fairness rules are not.
 
-Do not add a second configuration path for the same setting unless migration compatibility requires it. Where runtime admin overrides are supported, make the precedence explicit.
+## 13. Scheduled work
 
-## 15. Failure modes
+Default scheduled behaviour includes:
 
-### Telegram unavailable
+- regular background sync/cache refresh
+- forced reconciliation every five minutes
+- 07:00 reminder to all bound users
+- 08:00 reminder only to users still blank
+- daily structural/queue maintenance
+- restart-safe cleanup of temporary Telegram controls
 
-Attendance cannot be submitted through the bot, but existing local and Sheets state remains intact.
+Reminder jobs run only on working weekdays and skip Singapore public holidays. They refresh sufficient attendance state before deciding who is blank.
 
-### Google Sheets temporarily unavailable
+## 14. Appointment transfer transaction
 
-Already accepted attendance stays in the local queue and is retried. The user-facing write contract therefore does not depend on immediate Sheets availability.
+Transferring an appointment can touch attendance, bindings and source/destination state. It is a multi-step transaction across systems that do not share a database transaction.
 
-### Process restarts
+Before the first irreversible step, persist a transfer journal containing source, destination, expected source binding identity and phase.
 
-Durable local files are replayed. Pending queue events, transfer journals and cleanup jobs survive.
+Advance the journal after each durable phase. Clear it only when the complete transfer is known to have finished. On startup, an existing journal means recovery is required before another transfer can begin.
 
-### Manual sheet reorder
+The journal prevents a crash between attendance copy, binding change and source cleanup from becoming an invisible half-transfer.
 
-Attendance is resolved again by appointment identity and date, avoiding stale row-number writes.
+## 15. Local durability requirements
 
-### Duplicate or malformed managed rows
+Local state containing bindings, queue records or recovery journals should be private to the service account/process user.
 
-Automatic repair stops rather than guessing which row represents the appointment.
+Whole-file JSON writes use atomic replacement: write a temporary file, flush it, rename it over the destination, then synchronise the parent directory where supported.
 
-### Partial roster update
+Append-only queue records are flushed before acknowledgement. Record checksums detect corruption. A truncated final append may be ignored for non-destructive recovery while its bytes remain on disk; destructive compaction must refuse to proceed when malformed records exist.
 
-Membership is reconstructed from the sheet/registry union unless there is explicit evidence of a deliberate deletion.
+Serialise writes that target the same logical file/state domain. A language port may use mutexes, actors, a transactional embedded database or another mechanism, but must preserve atomicity and ordering.
 
-## 16. Changing the system safely
+## 16. Telegram interaction state
 
-Changes to any of the following are high risk:
+Callback payloads should contain opaque interaction/choice identifiers rather than full privileged operation parameters.
 
-- attendance acknowledgement timing
-- queue record schema or replay
-- roster deletion
-- appointment identity
-- Telegram bindings
-- appointment transfer
-- admin authorization
-- sheet structural maintenance
-- reconciliation ambiguity handling
-- credential handling
+Server-side pending interaction state records:
 
-For these changes, tests should cover both the happy path and interruption/restart cases. A test that merely makes the final state look right is insufficient if the implementation can lose an acknowledged action in the middle.
+- interaction ID and kind
+- actor chat/user identity
+- allowed choices
+- operation payload
+- creation/expiry time
+- pending/consumed state
 
-The most important invariants are repeated here because they should remain obvious during maintenance:
+On callback, verify actor, kind, expiry and allowed choice before executing. Consumed or expired interactions cannot be replayed. Text-input workflows use the same ownership and expiry model.
 
-1. Never acknowledge attendance before durable local persistence.
-2. Never use a stale row number as appointment identity.
-3. Never turn uncertain roster loss into automatic deletion.
-4. Never overwrite spreadsheet content the bot does not own.
-5. Never guess through ambiguous roster or binding state.
-6. Keep retries and replay idempotent.
+## 17. Caching
+
+Caches exist for latency and quota control; they do not replace identity checks at dangerous write boundaries.
+
+Typical cached data includes users, spreadsheet metadata, onboarding slices and monthly attendance slices. A foreground display may use cached state, but a structural write or reconciliation that depends on current layout must obtain the freshness required by that operation.
+
+A port may choose different TTLs or cache technology if it preserves correctness, quota limits and interactive responsiveness.
+
+## 18. Configuration precedence
+
+`settings.yaml` defines deploy-time unit structure and default attendance groups. Environment variables define credentials and operational tuning. Supported runtime admin overrides are stored locally.
+
+For any setting with more than one source, define and document deterministic precedence. Do not introduce parallel configuration mechanisms for the same concept without a migration reason.
+
+## 19. Failure matrix
+
+| Failure | Required behaviour |
+| --- | --- |
+| Telegram unavailable | No new Telegram actions; persisted state remains intact |
+| Sheets unavailable | Already acknowledged attendance remains queued and retryable |
+| Process crash/restart | Replay durable queue, journals and cleanup jobs |
+| Crash after Sheets write before queue completion record | Replay converges idempotently to the same remote value |
+| Manual row reorder | Re-resolve by appointment name/date before writing |
+| Duplicate managed appointment rows | Stop automatic write/repair for ambiguous target |
+| One-sided roster disappearance | Restore surviving membership unless explicit removal exists |
+| Conflicting binding copies | Stop and surface conflict; do not guess owner |
+| Corrupt/truncated queue tail | Preserve bytes; recover complete records; block destructive compaction if malformed data remains |
+| Rate limiting | Respect bounded retry/backoff without starving interactive work |
+
+## 20. Module map in the current implementation
+
+The module boundaries are useful when reading the JavaScript implementation but are not required in a port:
+
+- `index.js` — process lifecycle
+- `bot.js` — Telegram presentation and workflow orchestration
+- `googleSheets.js` — workbook adapter, reconciliation and structural maintenance
+- `attendanceQueue.js` — attendance event log/state machine and flush coordination
+- `storage.js` — users, registry, settings and local transactions
+- `fileStore.js` — atomic/private file primitives
+- `syncManager.js` — sync coalescing and scheduling state
+- `concurrency.js` — Telegram dispatch/rate limiting
+- `workPriority.js` / `broadcastActivity.js` — foreground/background arbitration
+- `attendanceTransferJournal.js` — transfer recovery journal
+- `telegramInteractions.js` — callback/text interaction capability state
+- `weeklyFlow.js` / `holidays.js` — weekly-domain logic
+- `messageCleanup.js` — durable Telegram-control expiry
+- `config.js` — configuration loading/validation
+
+## 21. Reimplementation checklist
+
+Before replacing the current implementation, demonstrate all of the following against the new version:
+
+1. An acknowledged attendance submission survives immediate process termination.
+2. Replaying a write after an uncertain remote result does not duplicate or corrupt attendance.
+3. A manually reordered month sheet still receives attendance in the correct appointment row.
+4. A one-sided roster loss is repaired rather than deleted.
+5. An explicit roster removal remains removed after reconciliation.
+6. Duplicate managed rows stop unsafe automatic writes.
+7. A bound appointment cannot be claimed by another Telegram identity.
+8. Deregistration rotates the onboarding code.
+9. Weekly submission uses the same durable attendance path as daily submission.
+10. Month/year boundary weeks resolve the correct worksheet/date columns.
+11. Public holidays suppress reminders and resolve as `PH` in weekly attendance.
+12. Background broadcasts and Sheets work yield to interactive Telegram work.
+13. Rate-limit retry is bounded and globally coordinated.
+14. Transfer recovery resumes or reports an interrupted transfer without silently starting a second one.
+15. Queue compaction cannot erase malformed/unrecovered records.
+16. Human-owned spreadsheet cells outside the managed region remain unchanged.
+
+These are behavioural acceptance criteria. Passing them matters more than reproducing the current class, function or file structure.
