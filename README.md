@@ -1,38 +1,25 @@
 # Telegram Attendance Bot
 
-Telegram attendance bot backed by Google Sheets. It supports daily and weekly attendance, onboarding, reminders, roster administration and recovery after restarts or interrupted Sheets writes.
+Telegram attendance bot backed by Google Sheets. It handles daily and weekly attendance, onboarding, reminders, roster administration and recovery after interrupted writes.
 
-## Run it
+## Setup
 
-Requirements: Node.js 20+ or Docker, a Telegram bot token, a Google Sheet, and a Google service account with access to that sheet.
+Requires Node.js 20+ or Docker, a Telegram bot token, a Google Sheet, and a Google service account with access to the sheet.
 
 ```bash
 cp .env.example .env
 ```
 
-Set:
+Set `TELEGRAM_BOT_TOKEN`, `GOOGLE_SHEETS_SPREADSHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_EMAIL` and `GOOGLE_PRIVATE_KEY`. Edit `settings.yaml` for the unit.
 
-```text
-TELEGRAM_BOT_TOKEN
-GOOGLE_SHEETS_SPREADSHEET_ID
-GOOGLE_SERVICE_ACCOUNT_EMAIL
-GOOGLE_PRIVATE_KEY
-```
-
-Edit `settings.yaml` for the unit, then start:
+Docker:
 
 ```bash
 docker compose up -d --build
-```
-
-Logs and shutdown:
-
-```bash
 docker compose logs -f
-docker compose down
 ```
 
-Without Docker:
+Local:
 
 ```bash
 npm install
@@ -41,74 +28,44 @@ npm start
 
 The bot uses Telegram long polling; no inbound HTTP port is required.
 
-## Main commands
+## Spreadsheet
 
-Users: `/start`, `/attendance`, `/week`, `/summary`, `/me`, `/help`, `/deregister`.
+`ONBOARDING` contains appointments in column A and onboarding codes in column B. Its visible appointment order is canonical.
 
-Admins: `/admin`, `/promptall`, `/pending`, `/invite`, `/syncroster`, `/admins`, `/addadmin`, `/removeadmin`, `/addappointment`, `/removeappointment`, `/lastupdate`.
-
-Most admin actions are also available from the inline admin menu.
-
-## Spreadsheet layout
-
-`ONBOARDING` contains the active appointments and onboarding codes:
-
-- column A: appointment
-- column B: secret code
-- visible row order is the canonical roster order
-
-Each month has its own sheet (for example `Sep 26`):
-
-- column A: appointment
-- row 1: dates
-- attendance is matched by appointment name, not a stored row number
-
-The bot preserves sheet content outside its managed area and refuses to guess when the managed roster is ambiguous.
+Monthly sheets use column A for appointments and row 1 for dates. Attendance is resolved by appointment name and date, never by a remembered row number. Content outside the bot-managed area is preserved.
 
 ## Runtime state
 
-Local state lives in `data/` and must not be committed. Important files include:
+Runtime files live in `data/` and are not disposable cache files. In particular:
 
-- `appointment-registry.json` — roster, codes and bindings
-- `users.json` — Telegram users and interaction state
-- `attendance-queue.ndjson` — durable attendance queue
-- `sheet-cache.json` — cached sheet state
-- `settings.json` — runtime attendance-option overrides
+- `attendance-queue.ndjson` holds acknowledged attendance waiting for Sheets
+- `appointment-registry.json` holds the local roster, codes and bindings
+- `users.json` holds Telegram user and interaction state
+- `sheet-cache.json` holds cached sheet state
+- `settings.json` holds runtime attendance-option overrides
 
-Attendance is written locally before the bot acknowledges it, then flushed to Sheets in the background. This is a deliberate durability guarantee.
+Attendance is persisted locally before the user is told it was accepted. Queue replay and reconciliation make those writes safe across restarts and temporary Sheets failures.
 
 ## Configuration
 
-Unit structure and default attendance options live in `settings.yaml`. Runtime tuning is in `.env.example`.
+Unit structure and default attendance options are in `settings.yaml`. Deployment and runtime settings are documented in `.env.example`.
 
-Defaults include:
-
-- attendance queue flush: 2 minutes, or earlier at 25 queued entries
-- reminders: 07:00 to all bound users, 08:00 to users still blank
-- timezone: `Asia/Singapore`
-- forced reconciliation: every 5 minutes
-
-Singapore public holidays are skipped for reminders and are filled as `PH` in the weekly flow.
+Defaults include a two-minute attendance flush interval, earlier flush at 25 queued entries, reminders at 07:00 and 08:00, `Asia/Singapore` timezone, and a forced reconciliation every five minutes.
 
 ## Development
 
 ```bash
 npm run check
 npm test
-find src -type f -name '*.js' -print0 | xargs -0 -n 1 node --check
 ```
 
-Do not let tests contact live Telegram, Google Sheets or GitHub unless an integration test is explicitly intended.
+The core invariants are:
 
-The important implementation rules are:
+1. Persist attendance before acknowledgement.
+2. Resolve attendance by appointment identity and date.
+3. Do not interpret uncertain roster loss as deletion.
+4. Preserve spreadsheet content outside the managed area.
+5. Stop on ambiguous roster or binding state rather than guessing.
+6. Keep retries and replay idempotent.
 
-- persist attendance before acknowledgement
-- keep queue replay idempotent
-- reconcile roster membership conservatively
-- resolve attendance by appointment identity
-- preserve human-owned spreadsheet content
-- fail closed on ambiguous roster or binding state
-
-For the full system design, data flows, recovery behaviour and module responsibilities, see [`docs/SYSTEM_LOGIC.md`](docs/SYSTEM_LOGIC.md).
-
-Repository-specific instructions for coding agents are in [`AGENTS.md`](AGENTS.md).
+See [`docs/SYSTEM_LOGIC.md`](docs/SYSTEM_LOGIC.md) for the complete behavioural specification, state model, failure handling and a language-neutral reimplementation guide.
