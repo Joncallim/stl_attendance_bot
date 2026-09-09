@@ -1,3 +1,23 @@
+/*
+ * Durable local-file primitives used by the queue, registry, caches and recovery
+ * journals.
+ *
+ * These helpers are deliberately stricter than ordinary JSON file utilities:
+ *
+ * - replacement writes go to a fresh temporary file, fsync the file, rename it,
+ *   then fsync the parent directory;
+ * - append-only JSONL records are fsynced before the caller continues;
+ * - JSONL records carry checksums so silent corruption is not replayed as valid
+ *   state;
+ * - writes to the same logical key are serialized in-process;
+ * - runtime directories/files are forced to private permissions.
+ *
+ * Do not replace these helpers with bare `writeFile()` calls in code that forms
+ * part of an acknowledgement or recovery boundary. A successful return from a
+ * durable write is what allows higher layers to safely tell the user an action
+ * has been accepted.
+ */
+
 import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
@@ -6,12 +26,15 @@ const serializedOperations = new Map();
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 
+/** Ensure the parent exists and remains private even if it pre-dated the bot. */
 async function ensureParentDir(filePath) {
   const directoryPath = path.dirname(filePath);
   await mkdir(directoryPath, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
   await chmod(directoryPath, PRIVATE_DIRECTORY_MODE);
 }
 
+// fsyncing the file is not enough to guarantee a rename/unlink survives a host
+// crash. Sync the containing directory after changing its directory entry.
 async function syncDirectory(filePath) {
   const handle = await open(path.dirname(filePath), "r");
 
@@ -22,6 +45,13 @@ async function syncDirectory(filePath) {
   }
 }
 
+/**
+ * Atomically replace a private text file.
+ *
+ * The temporary file is created with `wx` so an unexpected name collision is a
+ * hard failure. The old path remains untouched until the new bytes are fully
+ * written and synced.
+ */
 async function writePrivateFile(filePath, content) {
   const temporaryFilePath =
     `${filePath}.${process.pid}.${randomUUID()}.tmp`;
@@ -39,6 +69,7 @@ async function writePrivateFile(filePath, content) {
   await syncDirectory(filePath);
 }
 
+/** Append durable text without rewriting earlier queue/journal history. */
 async function appendPrivateFile(filePath, content) {
   const handle = await open(filePath, "a+", PRIVATE_FILE_MODE);
 
@@ -50,8 +81,9 @@ async function appendPrivateFile(filePath, content) {
       const trailingByte = Buffer.alloc(1);
       await handle.read(trailingByte, 0, 1, stats.size - 1);
 
-      // Preserve an incomplete final record after a crash, but put subsequent
-      // records on a fresh line so the valid queue remains recoverable.
+      // A crash may leave the final JSONL record incomplete. Do not overwrite or
+      // join onto those bytes; put the next valid append on a fresh line so the
+      // rest of the file remains recoverable.
       if (trailingByte[0] !== 0x0a) {
         prefix = "\n";
       }
@@ -66,6 +98,9 @@ async function appendPrivateFile(filePath, content) {
   await chmod(filePath, PRIVATE_FILE_MODE);
 }
 
+// Checksums catch complete-looking JSON that was corrupted on disk. They are
+// record-level rather than file-level so valid history can still be recovered
+// around a truncated final append.
 function addRecordChecksum(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return value;
@@ -100,6 +135,7 @@ function verifyRecordChecksum(record) {
   return record;
 }
 
+/** Read JSON, returning the supplied fallback only when the file is absent. */
 export async function readJsonFile(filePath, fallbackValue) {
   await ensureParentDir(filePath);
 
@@ -111,10 +147,13 @@ export async function readJsonFile(filePath, fallbackValue) {
       return fallbackValue;
     }
 
+    // Malformed existing JSON is not equivalent to an absent file; callers need
+    // to see the error rather than silently resetting durable state.
     throw error;
   }
 }
 
+/** Atomically replace a JSON state file. */
 export async function writeJsonFile(filePath, value) {
   return runSerialized(`file:${filePath}`, async () => {
     await ensureParentDir(filePath);
@@ -129,6 +168,7 @@ export async function writePrivateTextFile(filePath, content) {
   });
 }
 
+/** Remove a private state file and make the deletion crash-durable. */
 export async function removePrivateFile(filePath) {
   return runSerialized(`file:${filePath}`, async () => {
     await ensureParentDir(filePath);
@@ -143,13 +183,12 @@ export async function removePrivateFile(filePath) {
       throw error;
     }
 
-    // unlink() can return before the directory entry is durable. Sync the
-    // parent so a deleted transaction journal cannot reappear after a crash.
     await syncDirectory(filePath);
     return true;
   });
 }
 
+/** Append one checksummed JSONL event. */
 export async function appendJsonLine(filePath, value) {
   return runSerialized(`file:${filePath}`, async () => {
     await ensureParentDir(filePath);
@@ -157,6 +196,7 @@ export async function appendJsonLine(filePath, value) {
   });
 }
 
+/** Append several checksummed JSONL events under one serialized file operation. */
 export async function appendJsonLines(filePath, values) {
   if (values.length === 0) return;
   return runSerialized(`file:${filePath}`, async () => {
@@ -168,6 +208,11 @@ export async function appendJsonLines(filePath, values) {
   });
 }
 
+/**
+ * Rewrite a JSONL file, normally for compaction. Callers should only compact
+ * state they have read with `rejectMalformed: true`; otherwise a damaged tail
+ * could be silently discarded and converted into apparent success.
+ */
 export async function writeJsonLines(filePath, values) {
   return runSerialized(`file:${filePath}`, async () => {
     await ensureParentDir(filePath);
@@ -178,6 +223,11 @@ export async function writeJsonLines(filePath, values) {
   });
 }
 
+/**
+ * Replay a JSONL log. A truncated JSON record can be ignored for non-destructive
+ * recovery because surrounding complete records remain usable; destructive
+ * callers request `rejectMalformed` so the damaged bytes cannot be erased.
+ */
 export async function readJsonLines(filePath, { rejectMalformed = false } = {}) {
   await ensureParentDir(filePath);
 
@@ -192,10 +242,6 @@ export async function readJsonLines(filePath, { rejectMalformed = false } = {}) 
         try {
           return [verifyRecordChecksum(JSON.parse(line))];
         } catch (error) {
-          // A process or host crash can leave only the last append truncated.
-          // Keep the damaged bytes on disk for recovery and load every complete
-          // record around them. Destructive callers such as compaction must use
-          // rejectMalformed so these retained bytes cannot be rewritten away.
           if (error instanceof SyntaxError) {
             if (rejectMalformed) {
               throw new Error(
@@ -221,6 +267,11 @@ export async function readJsonLines(filePath, { rejectMalformed = false } = {}) 
   }
 }
 
+/**
+ * Serialize operations sharing a logical key. A failed operation does not poison
+ * the chain: the following operation still gets a turn, while the original
+ * caller receives the original rejection.
+ */
 export function runSerialized(key, operation) {
   const previous = serializedOperations.get(key) ?? Promise.resolve();
   const next = previous.catch(() => {}).then(operation);
