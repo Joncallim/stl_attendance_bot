@@ -1,9 +1,32 @@
+# Unit configuration.
+#
+# This file describes the organisation and the default attendance vocabulary.
+# It is read and validated at startup by src/config.js. Deployment credentials,
+# reminder times and rate limits belong in .env instead.
+#
+# Names shown here are configuration defaults. The live ONBOARDING worksheet is
+# still involved in roster reconciliation; see docs/SYSTEM_LOGIC.md before
+# changing roster semantics.
+
+# Parser/schema version. Startup fails if this does not match the version the
+# application understands. Incrementing it requires a corresponding code change.
 schemaVersion: 1
 
+# Human/unit identity. `id` is a stable machine identifier; `name` is display
+# text. Keep `id` stable when merely renaming the unit.
 unit:
   id: default-unit
   name: Default Unit
 
+# Organisational tree used to classify appointments in menus and summaries.
+#
+# id: stable identifier referenced by appointments via hierarchyNodeId.
+# name: display label.
+# type: `department` or `section`.
+# parentId: optional parent node id for nested sections.
+# order: display/sort order among sibling nodes; lower values appear first.
+#
+# The current unit uses only top-level departments, so parentId is omitted.
 hierarchy:
   - id: officers
     name: Officers
@@ -54,8 +77,12 @@ hierarchy:
     type: department
     order: 11
 
-# Officer role prefixes may also appear with a numeric suffix in ONBOARDING,
-# e.g. OPS, OPS 1 or OPS 2. Matching is case-insensitive.
+# Officer role families accepted from ONBOARDING even when a numbered instance
+# is not explicitly listed below. Each prefix matches either exactly PREFIX or
+# PREFIX <number>, case-insensitively; e.g. OPS, OPS 1 and OPS 2.
+#
+# This prevents a legitimate dynamically numbered officer appointment from being
+# treated as unknown simply because settings.yaml does not enumerate that number.
 officerAppointmentTypes:
   - OPS
   - AOPS
@@ -66,6 +93,13 @@ officerAppointmentTypes:
   - ANO
   - YO
 
+# Known appointment metadata.
+#
+# name: appointment identity/display name. Matching is normalized by the code.
+# hierarchyNodeId: id from `hierarchy` used for department classification.
+# defaultAdmin: grants the appointment admin status when defaults are seeded.
+# order: configured ordering hint. The visible ONBOARDING order remains the
+#        canonical live roster order used by reconciliation.
 appointments:
   - name: CO
     hierarchyNodeId: officers
@@ -128,6 +162,21 @@ appointments:
     defaultAdmin: false
     order: 14
 
+# Attendance vocabulary and Telegram menu grouping.
+#
+# Each group has:
+#   id: stable configuration identifier.
+#   label: label shown in the attendance picker.
+#   summaryLabel: heading used when attendance is summarised.
+#   order: group display order; lower values appear first.
+#   options: actual status values written to Google Sheets.
+#
+# A status may intentionally appear in more than one group for discoverability.
+# The application de-duplicates the resulting Sheets validation list, so values
+# such as OL or OC still remain a single attendance status in the spreadsheet.
+#
+# Admin changes made at runtime are stored in data/settings.json. Resetting
+# attendance options discards that override and restores these YAML defaults.
 attendance:
   groups:
     - id: present
@@ -136,18 +185,21 @@ attendance:
       order: 0
       options:
         - PRESENT
+
     - id: duty
       label: DUTY
       summaryLabel: DUTY
       order: 1
       options:
         - DUTY
+
     - id: fishing
       label: FISHING
       summaryLabel: FISHING
       order: 2
       options:
         - FISHING
+
     - id: outstation
       label: Outstation
       summaryLabel: Outstation
@@ -159,6 +211,18 @@ attendance:
         - ORCA
         - WFH
         - YARD
+
+    - id: in_base
+      label: In Base
+      summaryLabel: In Base
+      order: 4
+      options:
+        - IPPT
+        - FMSS
+        - CST
+        - DCTC
+        - CNB
+
     - id: off_leave
       label: OFF / LEAVE
       summaryLabel: OFF / LEAVE
@@ -178,14 +242,7 @@ attendance:
         - DISEMBARK OFF
         - COMPASSIONATE
         - PTL
-    - id: overseas
-      label: OVERSEAS
-      summaryLabel: OVERSEAS
-      order: 7
-      options:
-        - OSD
-        - OC
-        - OL
+
     - id: attached_posted
       label: Attached / Posted
       summaryLabel: Attached / Posted
@@ -200,6 +257,16 @@ attendance:
         - 73
         - POST OUT
         - ORD
+
+    - id: overseas
+      label: OVERSEAS
+      summaryLabel: OVERSEAS
+      order: 7
+      options:
+        - OSD
+        - OC
+        - OL
+
     - id: report_sick
       label: Report Sick
       summaryLabel: Report Sick
@@ -211,13 +278,3 @@ attendance:
         - MA
         - HL
         - RSI
-    - id: in_base
-      label: In Base
-      summaryLabel: In Base
-      order: 4
-      options:
-        - IPPT
-        - FMSS
-        - CST
-        - DCTC
-        - CNB
