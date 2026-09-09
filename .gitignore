@@ -5,7 +5,6 @@ data/*.ndjson
 credentials/
 *.log
 logs/
-.codex/
-.claude/worktrees/festive-einstein/
+.DS_Store
 package-lock.json
 settings.yaml.server-backup
