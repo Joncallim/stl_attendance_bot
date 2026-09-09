@@ -54,11 +54,8 @@ hierarchy:
     type: department
     order: 11
 
-# Officer appointment types define flexible role prefixes that may appear in ONBOARDING
-# with or without a numeric suffix (e.g. "OPS", "OPS 1", "OPS 2").  Any appointment
-# in ONBOARDING whose name matches one of these prefixes is treated as a valid configured
-# appointment even if it is not explicitly listed in the appointments section below.
-# Supported patterns: PREFIX  or  PREFIX <number>  (case-insensitive).
+# Officer role prefixes may also appear with a numeric suffix in ONBOARDING,
+# e.g. OPS, OPS 1 or OPS 2. Matching is case-insensitive.
 officerAppointmentTypes:
   - OPS
   - AOPS
