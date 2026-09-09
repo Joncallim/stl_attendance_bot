@@ -1,3 +1,15 @@
+/*
+ * Weekly attendance is kept as a small, pure state machine so Telegram UI code
+ * does not own the business rules. Nothing in this module performs I/O.
+ *
+ * `weeklyAttendanceEntries` contains only choices made during the current flow.
+ * Existing sheet values are consulted later by `resolveWeeklyAttendanceEntries`.
+ * A staged choice always wins over an existing value for the same date.
+ *
+ * Keeping dates as YYYY-MM-DD strings is important: a workweek may cross a
+ * month or year boundary, and row/column positions in Sheets are not identities.
+ */
+
 function normalizeWeeklyDate(date, toIsoDateString) {
   if (typeof date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return date;
@@ -6,12 +18,18 @@ function normalizeWeeklyDate(date, toIsoDateString) {
   return toIsoDateString(date instanceof Date ? date : new Date(date));
 }
 
+/** Return the most recent staged value for a date, if the user changed it. */
 export function getStagedAttendanceStatus(entries, date, toIsoDateString) {
   const isoDate = normalizeWeeklyDate(date, toIsoDateString);
   const entry = [...entries].reverse().find((value) => value.date === isoDate);
   return entry?.status ?? "";
 }
 
+/**
+ * Replace the staged value for one date without mutating the caller's array.
+ * There should be only one effective staged value per date when the flow is
+ * finally resolved.
+ */
 export function upsertWeeklyAttendanceEntry(entries, date, status, toIsoDateString) {
   const isoDate = normalizeWeeklyDate(date, toIsoDateString);
   const nextEntries = entries.filter((entry) => entry.date !== isoDate);
@@ -19,6 +37,12 @@ export function upsertWeeklyAttendanceEntry(entries, date, status, toIsoDateStri
   return nextEntries;
 }
 
+/**
+ * Produce the final per-day values shown/submitted by the weekly flow.
+ * A freshly staged value takes precedence; otherwise the existing attendance
+ * value is retained. This prevents merely opening the weekly editor from
+ * clearing days that already have attendance recorded.
+ */
 export function resolveWeeklyAttendanceEntries(
   weeklyDates,
   stagedEntries,
@@ -44,6 +68,7 @@ export function resolveWeeklyAttendanceEntries(
   });
 }
 
+/** Create the Telegram-session state used when a weekly flow begins. */
 export function createWeeklyFlowState(weeklyAttendanceDates) {
   return {
     awaitingWeeklyAttendance: true,
@@ -54,6 +79,11 @@ export function createWeeklyFlowState(weeklyAttendanceDates) {
   };
 }
 
+/**
+ * Advance the weekly UI by one day. `skip` means "leave this day unchanged",
+ * not "write an empty attendance value". The returned state is a new object so
+ * callers can safely persist/replace session state without hidden mutation.
+ */
 export function applyWeeklyAttendanceSelection(
   state,
   {
