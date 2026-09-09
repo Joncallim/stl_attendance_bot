@@ -1,42 +1,62 @@
-# Attendance Bot Agent Guide
+# Agent Notes
 
-This repository contains a Telegram attendance bot that treats Google Sheets as the shared record and durable local files as its restart-safe queue, registry, cache, and interaction state.
+This repo is a Telegram attendance bot with Google Sheets as the shared record. Local files under `data/` provide restart-safe queueing, bindings and cache state.
 
-## Invariants
+## Rules that should not change accidentally
 
-- Preserve the reconciliation model in `README.md`: visible `ONBOARDING` order is canonical, active membership is the safe union of sheet and local registry, and automatic deletion requires explicit evidence. Fail safely on ambiguous rows or bindings.
-- Record attendance durably before acknowledging it, keep queue replay idempotent, and preserve appointment-identity resolution across row moves, month boundaries, restarts, and partial writes.
-- Treat `settings.yaml` as deploy-time unit structure and preserve human-owned spreadsheet rows/columns outside the bot-managed area.
-- Never commit Telegram tokens, Google credentials/private keys, spreadsheet IDs, GitHub tokens, user bindings, attendance data, logs, or files from `data/`.
-- Do not contact Telegram, Google Sheets, GitHub, or a live deployment during tests unless the user explicitly requests a controlled integration check.
+- `ONBOARDING` controls visible roster order.
+- Active roster membership is reconciled from both `ONBOARDING` and the local appointment registry. Do not turn a one-sided disappearance into an automatic deletion.
+- Attendance must be persisted locally before the user is told it was accepted.
+- Queue replay must stay idempotent across retries, restarts and partial Sheets writes.
+- Resolve attendance by appointment identity, not a remembered row number.
+- Preserve spreadsheet content outside the bot-managed area.
+- Treat ambiguous roster or binding state as an error rather than guessing.
+- `settings.yaml` is the deploy-time source for unit structure and default attendance options.
 
-## Repository Map
+Do not commit credentials, spreadsheet IDs, Telegram bindings, attendance data, logs or other runtime files from `data/`.
 
-- `src/index.js`, `src/bot.js`: startup and Telegram behavior.
-- `src/googleSheets.js`, `src/syncManager.js`: sheet access and reconciliation.
-- `src/attendanceQueue.js`, `src/attendanceTransferJournal.js`, `src/storage.js`, `src/fileStore.js`: durable state and recovery.
-- `src/weeklyFlow.js`, `src/holidays.js`: attendance rules and date/roster validation.
-- `settings.yaml`: unit-specific structure and default attendance options.
-- `test/`: Node test suite with mocked clients and per-test temporary data.
+Tests must not contact live Telegram, Google Sheets, GitHub or a deployed bot unless an integration check was explicitly requested.
 
-## Focused Workflow
+## Where things live
 
-- Keep a single writer per source or test file. Route Telegram UX, sheet reconciliation, and local durability as separate scopes when parallel work is useful; follow implementation with an independent read-only regression review.
-- Changes to onboarding codes, bindings, admins, deletion/tombstones, queue replay, spreadsheet writes, credentials, or issue-submission tokens require a security/data-integrity review.
-- Add focused behavioral tests beside every changed recovery or reconciliation contract. Do not weaken ambiguity guards to make a fixture pass.
+- `src/index.js` — startup
+- `src/bot.js` — Telegram commands and UI
+- `src/googleSheets.js` — Sheets access and reconciliation
+- `src/syncManager.js` — sync scheduling
+- `src/attendanceQueue.js` / `src/attendanceTransferJournal.js` — queued attendance writes
+- `src/storage.js` / `src/fileStore.js` — local persistence
+- `src/weeklyFlow.js` / `src/holidays.js` — weekly attendance and date rules
+- `settings.yaml` — unit configuration
+- `test/` — Node test suite
 
-## Validation
+## Working on the repo
 
-- Syntax: check every production module, including files outside the current
-  `npm run check` list, with
-  `find src -type f -name '*.js' -print0 | xargs -0 -n 1 node --check`.
-- Regression suite: run `npm test` on the host, where `test/` is present. The
-  production image intentionally omits the test suite.
-- Container build/syntax parity when Docker behavior changes: run
-  `docker build -t attendance-bot:check .`, then
-  `docker run --rm --entrypoint sh attendance-bot:check -c 'find src -type f -name "*.js" -print0 | xargs -0 -n 1 node --check'`.
-  This proves the production image builds and every copied JavaScript source
-  parses under the image's Node runtime; it does not replace the host regression
-  suite or start the bot.
+Keep changes scoped where practical. Changes involving onboarding codes, user bindings, admin access, roster deletion, queue replay, spreadsheet writes or credentials need an explicit security/data-integrity review.
 
-Use Node.js 20 or newer. State any live Telegram/Sheets behavior that remains unverified; unit tests are not authorization to deploy or to alter a production sheet.
+Add regression tests when changing recovery or reconciliation behaviour. Do not relax an ambiguity guard simply to make a fixture pass.
+
+Use Node.js 20 or newer.
+
+Run:
+
+```bash
+npm run check
+npm test
+```
+
+`npm run check` does not currently cover every production source file, so also run:
+
+```bash
+find src -type f -name '*.js' -print0 | xargs -0 -n 1 node --check
+```
+
+If Docker behaviour changed, also verify that the production image builds and its copied JavaScript parses:
+
+```bash
+docker build -t attendance-bot:check .
+docker run --rm --entrypoint sh attendance-bot:check -c 'find src -type f -name "*.js" -print0 | xargs -0 -n 1 node --check'
+```
+
+The production image does not contain `test/`, so the container check does not replace `npm test` on the host.
+
+If live Telegram or Sheets behaviour was not exercised, say so rather than treating the unit suite as deployment evidence.
