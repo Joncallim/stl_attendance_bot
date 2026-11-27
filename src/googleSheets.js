@@ -2075,16 +2075,17 @@ async function writeOnboardingRows(sheets, spreadsheetId, title, rows, stopMarke
     });
   }
 
-  await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${title}:onboardingRows`, (signal) =>
+  const writeResponse = await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${title}:onboardingRows`, (signal) =>
     sheets.spreadsheets.values.batchUpdate({
       spreadsheetId,
       requestBody: {
         valueInputOption: "RAW",
+        ...verifyWriteRequestFields(),
         data
       }
     }, { signal })
   );
-  await verifyBatchWrite(sheets, spreadsheetId, data);
+  verifyBatchWrite(writeResponse, data);
 }
 
 function buildAttendanceValidationRequest(sheetId, headerLength, options, rowLimit = DEFAULT_MAX_MANAGED_ROWS) {
@@ -3599,6 +3600,18 @@ async function refreshMonthSlice(sheets, config, input, options = {}) {
   }
   const rowLimit = managedRowLimit(onboardingSlice.appointments.length);
   const values = await readSheetValues(sheets, config.spreadsheetId, title, `A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${rowLimit}`);
+  const slice = await finalizeMonthSlice(sheets, config, cache, title, date, values, onboardingSlice, options);
+
+  if (options.persist !== false) {
+    await writeLocalSheetCache(cache);
+  }
+
+  return slice;
+}
+
+// Turns raw month-sheet values into a slice and stores it in `cache`. Shared by
+// the single-sheet and batched refresh paths so both behave identically.
+async function finalizeMonthSlice(sheets, config, cache, title, date, values, onboardingSlice, options = {}) {
   const slice = createMonthSliceFromValues(date, values, config, onboardingSlice.appointments);
 
   if (options.normalizeAliases === true && (slice.aliasCorrections?.length ?? 0) > 0) {
@@ -3620,11 +3633,109 @@ async function refreshMonthSlice(sheets, config, input, options = {}) {
   };
   cache.updatedAt = new Date().toISOString();
 
-  if (options.persist !== false) {
+  return slice;
+}
+
+/**
+ * Refreshes several month slices with ONE values.batchGet instead of one
+ * values.get per month. Every Sheets call waits for the global inter-request
+ * gap (≥1 s, 3 s when congested), so a cross-month flush previously paid that
+ * gap once per month (issue #21). Structural refreshes, clients without
+ * batchGet, and single-month requests use the per-sheet path unchanged.
+ *
+ * Returns a Map of title → slice, in the order the inputs were given.
+ */
+async function refreshMonthSlices(sheets, config, inputs, options = {}) {
+  const cache = options.cache ?? (await readLocalSheetCache());
+  const sliceOptions = { ...options, cache, persist: false };
+  const targets = [];
+  const seenTitles = new Set();
+
+  for (const input of inputs) {
+    const title = getMonthTitleFromInput(input, config.timezone);
+    if (seenTitles.has(title)) continue;
+    seenTitles.add(title);
+    targets.push({ input, title });
+  }
+
+  const results = new Map();
+  const toFetch = [];
+
+  for (const target of targets) {
+    const cachedSlice = deserializeMonthSlice(cache.monthSlices?.[target.title]);
+    if (!options.force && cachedSlice && isSliceFresh(cachedSlice.fetchedAt, MONTH_SLICE_TTL_MS)) {
+      results.set(target.title, cachedSlice);
+    } else {
+      toFetch.push(target);
+    }
+  }
+
+  const canBatch =
+    toFetch.length > 1 &&
+    options.structural !== true &&
+    typeof sheets.spreadsheets?.values?.batchGet === "function";
+
+  if (!canBatch) {
+    for (const target of toFetch) {
+      results.set(target.title, await refreshMonthSlice(sheets, config, target.input, sliceOptions));
+    }
+  } else {
+    const onboardingSlice = await refreshOnboardingSlice(sheets, config, {
+      cache,
+      force: false,
+      persist: false
+    });
+    const rowLimit = managedRowLimit(onboardingSlice.appointments.length);
+    const fetchTargets = toFetch.map((target) => {
+      const date = typeof target.input === "string"
+        ? getDateFromMonthTitle(target.title)
+        : target.input;
+      if (!date) {
+        throw new Error(`Unable to resolve month slice for ${target.title}`);
+      }
+      return {
+        ...target,
+        date,
+        range: `'${target.title}'!A1:${MAX_MONTH_SHEET_COLUMN_LABEL}${rowLimit}`
+      };
+    });
+    const response = await runGoogleSheetsRequest(
+      `spreadsheets.values.batchGet:monthSlices:${fetchTargets.map((t) => t.title).join(",")}`,
+      (signal) => sheets.spreadsheets.values.batchGet({
+        spreadsheetId: config.spreadsheetId,
+        ranges: fetchTargets.map((t) => t.range)
+      }, { signal })
+    );
+    const valueRanges = response.data?.valueRanges ?? [];
+
+    if (valueRanges.length !== fetchTargets.length) {
+      throw new Error(
+        `Month slice batchGet returned ${valueRanges.length} range(s) for ${fetchTargets.length} request(s)`
+      );
+    }
+
+    for (const [index, target] of fetchTargets.entries()) {
+      results.set(
+        target.title,
+        await finalizeMonthSlice(
+          sheets,
+          config,
+          cache,
+          target.title,
+          target.date,
+          valueRanges[index]?.values ?? [],
+          onboardingSlice,
+          sliceOptions
+        )
+      );
+    }
+  }
+
+  if (options.persist !== false && toFetch.length > 0) {
     await writeLocalSheetCache(cache);
   }
 
-  return slice;
+  return new Map(targets.map(({ title }) => [title, results.get(title)]));
 }
 
 function buildSummaryPayload(date, sheetTitle, rosterValues) {
@@ -3648,28 +3759,42 @@ function buildSummaryPayload(date, sheetTitle, rosterValues) {
 }
 
 /**
- * After a batchUpdate, reads back each written range and compares cell-by-cell.
- * Only active when GOOGLE_SHEETS_VERIFY_WRITES=true. Logs warnings on mismatch.
- * Returns { ok, discrepancies } where discrepancies is an array of { range, cell, expected, actual }.
+ * Builds the optional read-back fields for a values.batchUpdate request.
+ * When GOOGLE_SHEETS_VERIFY_WRITES=true, Google returns the post-write cell
+ * values in each response's `updatedData`, so verification costs no extra
+ * API call (previously a separate values.batchGet doubled the quota cost).
  */
-async function verifyBatchWrite(sheets, spreadsheetId, writes, options = {}) {
-  if (!GOOGLE_SHEETS_VERIFY_WRITES) {
+function verifyWriteRequestFields(enabled = GOOGLE_SHEETS_VERIFY_WRITES) {
+  return enabled
+    ? { includeValuesInResponse: true, responseValueRenderOption: "FORMATTED_VALUE" }
+    : {};
+}
+
+/**
+ * Compares the values Google reports after a values.batchUpdate against what
+ * was written. Only active when GOOGLE_SHEETS_VERIFY_WRITES=true. Logs
+ * warnings on mismatch. `response` is the batchUpdate response object
+ * (or its `data`). Returns { ok, discrepancies }.
+ */
+function verifyBatchWrite(response, writes, options = {}) {
+  const enabled = options.enabled ?? GOOGLE_SHEETS_VERIFY_WRITES;
+  if (!enabled) {
     return { ok: true, discrepancies: [] };
   }
 
   const logFn = options.logFn ?? console.warn;
   const discrepancies = [];
+  const responses = (response?.data ?? response)?.responses ?? [];
 
-  // Fetch all written ranges in a single batchGet instead of N individual reads.
-  const ranges = writes.map((w) => w.range);
-  const batchResponse = await runGoogleSheetsRequest(
-    `spreadsheets.values.batchGet:verify:${ranges.length}range(s)`,
-    (signal) => sheets.spreadsheets.values.batchGet({ spreadsheetId, ranges }, { signal })
-  );
-  const valueRanges = batchResponse.data.valueRanges ?? [];
+  if (responses.length !== writes.length) {
+    logFn(
+      `[${new Date().toISOString()}] [Sheets] VERIFY SKIPPED — expected ${writes.length} response(s), got ${responses.length}`
+    );
+    return { ok: false, discrepancies: [], skipped: true };
+  }
 
   for (let i = 0; i < writes.length; i++) {
-    const actual = valueRanges[i]?.values ?? [];
+    const actual = responses[i]?.updatedData?.values ?? [];
     const expected = writes[i].values ?? [];
 
     for (let r = 0; r < expected.length; r++) {
@@ -4683,16 +4808,17 @@ export async function writeAttendanceStatuses(sheets, config, entries) {
         config.spreadsheetId,
         writeTargets
       );
-      await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${sheetTitle}:attendanceWrite`, (signal) =>
+      const writeResponse = await runGoogleSheetsRequest(`spreadsheets.values.batchUpdate:${sheetTitle}:attendanceWrite`, (signal) =>
         sheets.spreadsheets.values.batchUpdate({
           spreadsheetId: config.spreadsheetId,
           requestBody: {
             valueInputOption: "RAW",
+            ...verifyWriteRequestFields(),
             data
           }
         }, { signal })
       );
-      await verifyBatchWrite(sheets, config.spreadsheetId, data);
+      verifyBatchWrite(writeResponse, data);
     }
   }
 
@@ -4739,18 +4865,13 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
     persist: false
   });
 
-  const remoteSlices = new Map();
-
-  for (const title of monthTitles) {
-    remoteSlices.set(
-      title,
-      await refreshMonthSlice(sheets, config, title, {
-        cache: localCache,
-        force: true,
-        persist: false
-      })
-    );
-  }
+  // One batched read for every month this flush touches (issue #21): a
+  // cross-month weekly submission no longer pays the inter-request gap twice.
+  const remoteSlices = await refreshMonthSlices(sheets, config, monthTitles, {
+    cache: localCache,
+    force: true,
+    persist: false
+  });
 
   const data = [];
   const writeTargets = [];
@@ -4909,16 +5030,17 @@ export async function reconcilePendingAttendanceWithSheets(sheets, config, entri
       config.spreadsheetId,
       writeTargets
     );
-    await runGoogleSheetsRequest("spreadsheets.values.batchUpdate:reconcilePending", (signal) =>
+    const writeResponse = await runGoogleSheetsRequest("spreadsheets.values.batchUpdate:reconcilePending", (signal) =>
       sheets.spreadsheets.values.batchUpdate({
         spreadsheetId: config.spreadsheetId,
         requestBody: {
           valueInputOption: "RAW",
+          ...verifyWriteRequestFields(),
           data
         }
       }, { signal })
     );
-    await verifyBatchWrite(sheets, config.spreadsheetId, data);
+    verifyBatchWrite(writeResponse, data);
   }
 
   for (const [title, slice] of mergedSlices.entries()) {
@@ -4965,15 +5087,15 @@ export async function preloadAttendanceSnapshots(sheets, config, options = {}) {
     persist: false
   });
 
-  for (const date of targetDates) {
-    await refreshMonthSlice(sheets, config, date, {
-      cache: localCache,
-      force: options.force === true,
-      normalizeAliases: options.normalizeAliases === true,
-      structural,
-      persist: false
-    });
-  }
+  // Non-structural refreshes read all target months in one batchGet;
+  // structural ones keep the per-sheet path (refreshMonthSlices falls back).
+  await refreshMonthSlices(sheets, config, targetDates, {
+    cache: localCache,
+    force: options.force === true,
+    normalizeAliases: options.normalizeAliases === true,
+    structural,
+    persist: false
+  });
 
   localCache.updatedAt = new Date().toISOString();
   await writeLocalSheetCache(localCache);
@@ -5324,7 +5446,10 @@ export const __testing = {
   getExpectedDateHeaderLabel,
   getMonthParts,
   shiftMonth,
+  refreshMonthSlices,
   validateAttendanceWriteTargets,
+  verifyBatchWrite,
+  verifyWriteRequestFields,
   writeMonthlySheetRows,
   writeAppointmentColumn,
   reconcileOnboardingWithConfig

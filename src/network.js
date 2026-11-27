@@ -6,7 +6,8 @@ import https from "node:https";
  * Google requests. The exported HTTPS name is retained because the API clients
  * import it directly; it does not force IPv4 by itself.
  */
-const httpAgent = new http.Agent({ keepAlive: true });
+export const ipv4HttpAgent = new http.Agent({ keepAlive: true });
+const httpAgent = ipv4HttpAgent;
 export const ipv4HttpsAgent = new https.Agent({ keepAlive: true });
 
 let networkStackConfigured = false;

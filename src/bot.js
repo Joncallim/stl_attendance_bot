@@ -2900,39 +2900,110 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
   return true;
 }
 
-async function submitGitHubIssue(title, body) {
-  const token = process.env.GITHUB_TOKEN;
+const GITHUB_ISSUE_TIMEOUT_MS = 15_000;
+const DEFAULT_GITHUB_ISSUE_REPO = "Joncallim/stl_attendance_bot";
+
+// Maps GitHub's status codes to a cause an operator can act on. Fine-grained
+// tokens without "Issues: Read and write" on the repo return 403 or 404, which
+// previously surfaced only as a bare status code (issue #17).
+function describeGitHubIssueFailure(status) {
+  switch (status) {
+    case 401:
+      return "token_invalid_or_expired";
+    case 403:
+      return "token_lacks_issue_write_permission_or_rate_limited";
+    case 404:
+      return "repo_not_found_or_token_lacks_access";
+    case 410:
+      return "issues_disabled_on_repo";
+    case 422:
+      return "github_rejected_issue_content";
+    default:
+      return status >= 500 ? "github_unavailable" : "github_api_error";
+  }
+}
+
+async function submitGitHubIssue(title, body, options = {}) {
+  const token = options.token ?? process.env.GITHUB_TOKEN;
+  const repo = options.repo ?? process.env.GITHUB_ISSUE_REPO ?? DEFAULT_GITHUB_ISSUE_REPO;
+  const fetchFn = options.fetchFn ?? fetch;
+  const timeoutMs = options.timeoutMs ?? GITHUB_ISSUE_TIMEOUT_MS;
 
   if (!token) {
     return { ok: false, reason: "no_token" };
   }
 
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+    logBotError("[GitHub] GITHUB_ISSUE_REPO is not in owner/repo form.", { repo });
+    return { ok: false, reason: "invalid_repo_config" };
+  }
+
   let response;
+  // Without a timeout a stalled connection left the user with no reply at all.
+  const controller = new AbortController();
+  const timer = setTimeout(
+    () => controller.abort(new DOMException("GitHub issue request timed out", "TimeoutError")),
+    timeoutMs
+  );
 
   try {
-    response = await fetch("https://api.github.com/repos/Joncallim/stl_attendance_bot/issues", {
+    response = await fetchFn(`https://api.github.com/repos/${repo}/issues`, {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
         "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28"
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "stl-attendance-bot"
       },
-      body: JSON.stringify({ title, body })
+      body: JSON.stringify({ title, body }),
+      signal: controller.signal
     });
   } catch (error) {
-    logBotError("[GitHub] fetch failed.", { error: error.message });
-    return { ok: false, reason: `network_error:${error.message}` };
+    const timedOut = error?.name === "TimeoutError" || error?.name === "AbortError";
+    logBotError("[GitHub] Issue submission request failed.", {
+      repo,
+      timedOut,
+      error: error?.message
+    });
+    return { ok: false, reason: timedOut ? "timeout" : "network_error" };
+  } finally {
+    clearTimeout(timer);
   }
 
   if (!response.ok) {
     const responseText = await response.text().catch(() => "");
-    logBotError("[GitHub] API error.", { status: response.status, body: responseText });
-    return { ok: false, reason: `github_api_error:${response.status}` };
+    const reason = describeGitHubIssueFailure(response.status);
+    logBotError("[GitHub] Issue submission rejected.", {
+      repo,
+      status: response.status,
+      reason,
+      body: responseText.slice(0, 500)
+    });
+    return { ok: false, reason, status: response.status };
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (error) {
+    logBotError("[GitHub] Issue created but response was unreadable.", { error: error.message });
+    return { ok: true, issueNumber: null, issueUrl: null };
+  }
+
+  logBot("[GitHub] Issue submitted.", { repo, issueNumber: data.number });
   return { ok: true, issueNumber: data.number, issueUrl: data.html_url };
+}
+
+// User-facing text for a failed submission. Detailed causes stay in the logs.
+function formatIssueSubmissionFailure(result) {
+  if (result.reason === "no_token" || result.reason === "invalid_repo_config") {
+    return "GitHub reporting is not configured on this bot. Please contact the administrator.";
+  }
+  if (result.reason === "timeout" || result.reason === "network_error" || result.reason === "github_unavailable") {
+    return "GitHub could not be reached. Please try again in a few minutes.";
+  }
+  return "The bot is not authorised to file issues right now. The administrator has been notified in the logs.";
 }
 
 /**
@@ -6747,9 +6818,7 @@ export async function createAttendanceBot(config) {
       }
 
       if (!result.ok) {
-        const reason = result.reason === "no_token"
-          ? "GitHub reporting is not configured on this bot. Please contact the administrator."
-          : `Failed to submit the issue (${result.reason}). Please try again later.`;
+        const reason = formatIssueSubmissionFailure(result);
         await ctx.reply(
           `❌ ${reason}`,
           Markup.inlineKeyboard([[
@@ -6762,7 +6831,9 @@ export async function createAttendanceBot(config) {
 
       await ctx.reply(
         [
-          `✅ Issue #${result.issueNumber} submitted successfully.`,
+          result.issueNumber
+            ? `✅ Issue #${result.issueNumber} submitted successfully.`
+            : "✅ Issue submitted successfully.",
           "",
           "Thank you for your report! The development team will review it shortly."
         ].join("\n"),
@@ -9122,6 +9193,9 @@ export async function createAttendanceBot(config) {
 }
 
 export const __testing = {
+  submitGitHubIssue,
+  describeGitHubIssueFailure,
+  formatIssueSubmissionFailure,
   buildAdminMenuDescription,
   buildAdminMenu,
   buildAdminMessagingMenu,

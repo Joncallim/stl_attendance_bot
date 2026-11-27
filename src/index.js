@@ -41,8 +41,8 @@ async function main() {
   // 4. Bot instance and Telegram long-polling.
   if (process.env.GOOGLE_SHEETS_VERIFY_WRITES === "true") {
     logStartup(
-      "WARNING: GOOGLE_SHEETS_VERIFY_WRITES is enabled — each write costs 2 API quota slots. " +
-      "Disable in production to stay within the 60 req/min limit."
+      "GOOGLE_SHEETS_VERIFY_WRITES is enabled — attendance and onboarding writes are " +
+      "verified from Google's write response (no extra API call)."
     );
   }
 
