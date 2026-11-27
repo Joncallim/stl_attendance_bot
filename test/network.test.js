@@ -4,7 +4,7 @@ import http from "node:http";
 import https from "node:https";
 import { configureNetworkStack, ipv4HttpAgent, ipv4HttpsAgent } from "../src/network.js";
 
-test("configureNetworkStack installs IPv4-first global agents", () => {
+test("configureNetworkStack installs the shared keep-alive global agents", () => {
   configureNetworkStack();
 
   assert.equal(http.globalAgent, ipv4HttpAgent);

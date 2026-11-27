@@ -41,8 +41,15 @@ async function main() {
   // 4. Bot instance and Telegram long-polling.
   if (process.env.GOOGLE_SHEETS_VERIFY_WRITES === "true") {
     logStartup(
-      "WARNING: GOOGLE_SHEETS_VERIFY_WRITES is enabled — each write costs 2 API quota slots. " +
-      "Disable in production to stay within the 60 req/min limit."
+      "GOOGLE_SHEETS_VERIFY_WRITES is enabled — attendance and onboarding writes are " +
+      "verified from Google's write response (no extra API call)."
+    );
+  }
+
+  if (!process.env.GITHUB_TOKEN) {
+    logStartup(
+      "GITHUB_TOKEN is not set — the 🐛 Report Issue button is hidden from the home menu. " +
+      "Add it to .env and recreate the container (docker compose up -d) to enable reporting."
     );
   }
 
