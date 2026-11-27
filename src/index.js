@@ -46,6 +46,13 @@ async function main() {
     );
   }
 
+  if (!process.env.GITHUB_TOKEN) {
+    logStartup(
+      "GITHUB_TOKEN is not set — the 🐛 Report Issue button is hidden from the home menu. " +
+      "Add it to .env and recreate the container (docker compose up -d) to enable reporting."
+    );
+  }
+
   logStartup(`Creating bot instance (${BOT_VERSION})…`);
   const bot = await createAttendanceBot(config);
 
