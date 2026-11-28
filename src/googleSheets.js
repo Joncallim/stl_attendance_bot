@@ -46,6 +46,10 @@ const GOOGLE_SHEETS_REQUEST_TIMEOUT_MS = 15000;
 // Row insertions/deletions (batchUpdate:rows) are processed server-side by Google and can
 // take >15 s under load regardless of payload size. Targeted increase for this operation only.
 const GOOGLE_SHEETS_ROW_STRUCTURE_TIMEOUT_MS = 30000;
+// The first layout run after the conditional-format fix may read and delete
+// thousands of stacked duplicate rules on a sheet. Give those two calls more
+// room than the 15 s default so the clean-up can't time out night after night.
+const GOOGLE_SHEETS_FORMATTING_TIMEOUT_MS = 60000;
 const GOOGLE_SHEETS_SLOW_REQUEST_THRESHOLD_MS = 5000;
 // Minimum gap between consecutive Sheets API calls.
 // Google Sheets enforces a quota of 60 read/write requests per minute per user
@@ -1525,7 +1529,8 @@ async function getSheetFormattingState(sheets, spreadsheetId, title, sheetId) {
       ranges: [`'${escapedTitle}'!A1`],
       includeGridData: false,
       fields: "sheets(properties(sheetId,title),conditionalFormats(ranges),protectedRanges(protectedRangeId,description))"
-    }, { signal })
+    }, { signal }),
+    { timeoutMs: GOOGLE_SHEETS_FORMATTING_TIMEOUT_MS }
   );
   const match = (response.data?.sheets ?? []).find((entry) =>
     (Number.isInteger(sheetId) && entry.properties?.sheetId === sheetId) ||
@@ -2323,7 +2328,8 @@ async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, hea
       requestBody: {
         requests
       }
-    }, { signal })
+    }, { signal }),
+    deleteConditionalFormatRequests.length > 0 ? { timeoutMs: GOOGLE_SHEETS_FORMATTING_TIMEOUT_MS } : undefined
   );
 }
 
