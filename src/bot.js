@@ -543,7 +543,15 @@ const USER_MANUAL_SECTIONS = {
     lines: [
       "This bot records attendance into the shared monthly Google Sheet.",
       "If you are new, send /start and enter the secret code assigned to your appointment.",
-      "Once onboarding is complete, /start opens the main menu any time."
+      "Once onboarding is complete, /start opens the main menu any time.",
+      "",
+      "Home menu buttons:",
+      "📝 Today's Attendance: submit or update today's attendance.",
+      "📅 This Week / 🗓️ Next Week: review and submit a whole workweek.",
+      "🏢 My Department: view and edit your department's workweek.",
+      "📊 Summary: attendance counts for a selected day.",
+      "🛠️ Admin Menu (admins): roster, invitations, prompts, queue and settings.",
+      "⚠️ Deregister: remove this Telegram binding (asks to confirm)."
     ]
   },
   attendance: {
@@ -552,13 +560,16 @@ const USER_MANUAL_SECTIONS = {
       "Use Today's Attendance to submit or update your status for today.",
       "On a working day with nothing recorded yet, the home menu also shows ✅ Today: PRESENT for one-tap submission.",
       "The bot writes your selection into your appointment row and today's date column in the current month sheet.",
-      "After you submit, the bot confirms the recorded status and shows a quote or joke."
+      "After you submit, the bot confirms the recorded status and shows a quote or joke.",
+      "Picked the wrong one? Tap ✏️ Change on the confirmation."
     ]
   },
   weekly: {
     title: "📅 Weekly Attendance",
     lines: [
-      "Use This Week or Next Week to submit Monday-to-Friday attendance in one guided flow.",
+      "Use This Week or Next Week to submit Monday-to-Friday attendance in one guided flow. Both are available every day, including weekends.",
+      "Days marked ✏️ are picked but not submitted yet. Your picks are kept if you leave and come back to the same week.",
+      "You can submit with some days blank and fill them in later.",
       "Public holidays are prefilled as PH.",
       "⚡ fills every blank day with the default status (PRESENT) in one tap.",
       "🔁 Copy last week fills blank days with what you recorded last week.",
@@ -1642,43 +1653,15 @@ function getWeekdayIndex(timezone, date = new Date()) {
   return weekdayOrder[weekday] ?? 0;
 }
 
-function getHomeWeekButtons(timezone = "Asia/Singapore", date = new Date()) {
-  const weekdayIndex = getWeekdayIndex(timezone, date);
-
-  if (weekdayIndex === 0) {
-    return [
-      Markup.button.callback("📅 This Week", "home:week:this"),
-      Markup.button.callback("🗓️ Next Week", "home:week:next")
-    ];
-  }
-
-  if (weekdayIndex >= 5) {
-    return [Markup.button.callback("🗓️ Next Week", "home:week:next")];
-  }
-
-  return [Markup.button.callback("📅 This Week", "home:week:this")];
-}
-
-function getHomeWeekDescriptions(timezone = "Asia/Singapore", date = new Date()) {
-  const weekdayIndex = getWeekdayIndex(timezone, date);
-
-  if (weekdayIndex === 0) {
-    return [
-      "📅 This Week: Review and submit attendance for this workweek.",
-      "🗓️ Next Week: Prepare your attendance for the coming workweek."
-    ];
-  }
-
-  if (weekdayIndex >= 5) {
-    return [
-      "🗓️ Next Week: Prepare your attendance for the coming workweek."
-    ];
-  }
-
+function getHomeWeekButtons() {
+  // Both are always offered: Friday is when most people plan next week, and
+  // at the weekend This Week is the only way to fill in a missed weekday.
   return [
-    "📅 This Week: Review and submit attendance for this workweek."
+    Markup.button.callback("📅 This Week", "home:week:this"),
+    Markup.button.callback("🗓️ Next Week", "home:week:next")
   ];
 }
+
 
 function formatAttendanceDateLabel(date, timezone) {
   const formatted = new Intl.DateTimeFormat("en-GB", {
@@ -2093,32 +2076,22 @@ function formatHomeSynchronizationTimestamp(timestamp, timezone) {
   return `${time} ${day} ${month} ${year}`;
 }
 
-function buildHomeMenuText({ greeting, name, isAdminUser, timezone, syncStatus }) {
+// Kept short so the buttons stay on screen on a phone. Button descriptions
+// live in ❓ Help; the useful fact here is whether today is done.
+function buildHomeMenuText({ greeting, name, isAdminUser, timezone, syncStatus, todayStatus }) {
   const todayLabel = formatAttendanceDateLabel(new Date(), timezone);
-  const lines = [
-    `${greeting}, ${name}. Today is ${todayLabel}.`,
-    "",
-    "Choose an action:",
-    "",
-    "📝 Today's Attendance: Submit or update today's attendance.",
-    ...getHomeWeekDescriptions(timezone),
-    "🏢 My Department: View and edit your department's workweek.",
-    "📊 Summary: View attendance counts for a selected day.",
-    "❓ Help: Open the short user guide."
-  ];
+  const lines = [`${greeting}, ${name}. Today is ${todayLabel}.`];
 
-  if (isAdminUser) {
-    lines.push(
-      "",
-      "🛠️ Admin Menu: Roster, invitations, prompts, queue, and settings."
-    );
+  if (todayStatus === null || todayStatus === undefined) {
+    // Status unknown (not onboarded, or snapshots not loaded yet): say nothing
+    // rather than risk telling someone they haven't submitted when they have.
+  } else if (todayStatus) {
+    lines.push(`Today: ${todayStatus} ✅`);
+  } else {
+    lines.push("Today: not submitted yet");
   }
 
-  lines.push(
-    "",
-    "⚠️ Deregister: Remove this Telegram binding.",
-    "❌ Close: Close this menu."
-  );
+  lines.push("", "Tap ❓ Help for what each button does.");
 
   if (isAdminUser) {
     const latestSynchronizationAt = getLatestHomeSynchronizationTimestamp(syncStatus);
@@ -2825,15 +2798,13 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
     (date) => getCachedAttendanceStatus(cache, config, appointment, date),
     (value) => toIsoDateString(value, config.timezone)
   );
-  const missingEntries = resolvedEntries.filter((entry) => !entry.status);
+  // Days with no value are simply left out: a user who doesn't know Thursday
+  // yet can still save Monday to Wednesday.
+  const filledEntries = resolvedEntries.filter((entry) => entry.status);
+  const blankEntries = resolvedEntries.filter((entry) => !entry.status);
 
-  if (missingEntries.length > 0) {
-    // Restore persisted state into the in-memory session after a restart so
-    // the user can complete the missing days without beginning again.
+  if (filledEntries.length === 0) {
     restoreWeeklyAttendanceSession(ctx, weeklyState);
-    const missingLabels = missingEntries.map((entry) =>
-      formatWeekDateLabel(new Date(`${entry.date}T12:00:00.000Z`), config.timezone)
-    );
     const { message, keyboard } = buildWeeklyAttendanceOverview(
       dates,
       stagedEntries,
@@ -2842,20 +2813,15 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
       user,
       weeklyState.flowId
     );
-
     await sendOrUpdateAdminMessage(
       ctx,
-      [
-        `Select attendance for every weekday before submitting. Missing: ${missingLabels.join(", ")}.`,
-        "",
-        message
-      ].join("\n"),
+      ["Nothing to submit yet. Pick a status for at least one day.", "", message].join("\n"),
       keyboard
     );
     return false;
   }
 
-  const queuedEntries = resolvedEntries.map((entry) => {
+  const queuedEntries = filledEntries.map((entry) => {
     const date = new Date(`${entry.date}T12:00:00.000Z`);
     return {
       appointment,
@@ -2894,10 +2860,11 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
 
   const results = resolvedEntries.map((entry) => {
     const date = new Date(`${entry.date}T12:00:00.000Z`);
-    return `${formatWeekDateLabel(date, config.timezone)}: ${entry.status}`;
+    return `${formatWeekDateLabel(date, config.timezone)}: ${entry.status || "— (left blank)"}`;
   });
 
   await clearWeeklyAttendanceState(ctx);
+  await updateUserByChatId(ctx.chat.id, { weeklyDraft: null });
   // A completed weekly flow can reuse an earlier confirmation message. Wait
   // for any old cleanup edit to finish before installing the new keyboard.
   await cancelAttendanceButtonCleanup(
@@ -2912,11 +2879,20 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
   const confirmationMessage = await sendOrUpdateAdminMessage(
     ctx,
     [
-      `Weekly attendance recorded for all ${resolvedEntries.length} weekdays and queued for Google Sheets sync:`,
+      blankEntries.length === 0
+        ? `Saved ✅ All ${filledEntries.length} weekdays recorded. They'll show on the sheet shortly.`
+        : `Saved ✅ ${filledEntries.length} of ${resolvedEntries.length} weekdays recorded. They'll show on the sheet shortly. Blank days can be filled in later.`,
       "",
       ...results
     ].join("\n"),
     Markup.inlineKeyboard([
+      [Markup.button.callback(
+        "✏️ Change",
+        toIsoDateString(new Date(getWorkweekDates(config.timezone, 0)[0]), config.timezone) ===
+          toIsoDateString(new Date(dates[0]), config.timezone)
+          ? "home:week:this"
+          : "home:week:next"
+      )],
       [
         Markup.button.callback("🔙 Back", "home:main"),
         Markup.button.callback("❌ Close", "home:close")
@@ -3293,37 +3269,46 @@ function buildWeeklyShortcutRow(weeklyDates, weeklyEntries, cache, config, user,
 
 function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config, user, flowId = "expired") {
   const appointment = user?.appointment;
-  const dayLines = weeklyDates.map((dateValue) => {
+  const toIso = (value) => toIsoDateString(value, config.timezone);
+  const days = weeklyDates.map((dateValue) => {
     const date = new Date(dateValue);
-    const label = formatAttendanceDateLabel(date, config.timezone);
-    const staged = getStagedAttendanceStatus(weeklyEntries, dateValue, (v) => toIsoDateString(v, config.timezone));
+    const staged = getStagedAttendanceStatus(weeklyEntries, dateValue, toIso);
     const cached = appointment ? getCachedAttendanceStatus(cache, config, appointment, date) : "";
-    const status = staged || cached || "—";
-    return `${label}: ${status}`;
+    // ✏️ marks a pick made in this flow that is not saved yet, so users can
+    // tell "already on the sheet" from "still needs Submit".
+    const unsaved = Boolean(staged) && staged !== cached;
+    return {
+      date,
+      isoDate: toIso(date),
+      status: staged || cached || "—",
+      unsaved,
+      blank: !staged && !cached
+    };
   });
+  const unsavedCount = days.filter((day) => day.unsaved).length;
+  const blankCount = days.filter((day) => day.blank).length;
 
   const message = [
-    "Weekly attendance update",
-    "Public holidays are prefilled as PH.",
-    "Every weekday must have a status before submission.",
+    "Weekly attendance",
+    "Public holidays are prefilled as PH. ✏️ = not submitted yet.",
     "",
-    ...dayLines,
+    ...days.map((day) =>
+      `${formatAttendanceDateLabel(day.date, config.timezone)}: ${day.status}${day.unsaved ? " ✏️" : ""}`
+    ),
     "",
-    "Tap a day to change it, or use ⚡ / 🔁 to fill every blank day at once. Then press Submit."
+    "Tap a day to change it, or use ⚡ / 🔁 to fill blank days at once. Blank days can be left for later."
   ].join("\n");
 
-  const dayButtons = weeklyDates.map((dateValue) => {
-    const date = new Date(dateValue);
-    const isoDate = toIsoDateString(date, config.timezone);
+  const dayButtons = days.map((day) => {
     const shortLabel = new Intl.DateTimeFormat("en-GB", {
       timeZone: config.timezone,
       weekday: "short",
       day: "numeric"
-    }).format(date);
-    const staged = getStagedAttendanceStatus(weeklyEntries, dateValue, (v) => toIsoDateString(v, config.timezone));
-    const cached = appointment ? getCachedAttendanceStatus(cache, config, appointment, date) : "";
-    const status = staged || cached || "—";
-    return Markup.button.callback(`${shortLabel}: ${status}`, `home:week:day:${flowId}:${isoDate}`);
+    }).format(day.date);
+    return Markup.button.callback(
+      `${shortLabel}: ${day.status}${day.unsaved ? " ✏️" : ""}`,
+      `home:week:day:${flowId}:${day.isoDate}`
+    );
   });
 
   const rows = [];
@@ -3336,13 +3321,23 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
     ? toIsoDateString(new Date(weeklyDates[0]), config.timezone)
     : "expired";
   rows.push(...buildWeeklyShortcutRow(weeklyDates, weeklyEntries, cache, config, user, flowId));
-  rows.push([Markup.button.callback("✅ Submit", `home:week:submit:${flowId}:${weekId}`)]);
+  rows.push([Markup.button.callback(
+    formatWeeklySubmitLabel(unsavedCount, blankCount),
+    `home:week:submit:${flowId}:${weekId}`
+  )]);
   rows.push([
     Markup.button.callback("🔙 Back", "home:main"),
     Markup.button.callback("❌ Close", "home:close")
   ]);
 
   return { message, keyboard: Markup.inlineKeyboard(rows) };
+}
+
+function formatWeeklySubmitLabel(unsavedCount, blankCount) {
+  const details = [];
+  if (unsavedCount > 0) details.push(`${unsavedCount} unsaved`);
+  if (blankCount > 0) details.push(`${blankCount} blank`);
+  return details.length > 0 ? `✅ Submit (${details.join(", ")})` : "✅ Submit";
 }
 
 async function showWeeklyAttendanceOverview(ctx, config, user, cache) {
@@ -3442,6 +3437,30 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
   });
 }
 
+// Unsubmitted weekly picks survive Back, Close, /start and the daily flow, all
+// of which reset the live weekly session. Keyed by the week's Monday so a draft
+// is only ever restored into the same week; cleared on a successful submit.
+function buildWeeklyDraft(weeklyDates, weeklyEntries, timezone) {
+  if (!weeklyDates?.[0]) {
+    return null;
+  }
+  return {
+    weekStart: toIsoDateString(new Date(weeklyDates[0]), timezone),
+    entries: Array.isArray(weeklyEntries) ? weeklyEntries : []
+  };
+}
+
+function restoreWeeklyDraftEntries(draft, weeklyDates, timezone) {
+  if (!draft || !weeklyDates?.[0] || !Array.isArray(draft.entries)) {
+    return [];
+  }
+  if (draft.weekStart !== toIsoDateString(new Date(weeklyDates[0]), timezone)) {
+    return [];
+  }
+  const weekIsoDates = new Set(weeklyDates.map((value) => toIsoDateString(new Date(value), timezone)));
+  return draft.entries.filter((entry) => weekIsoDates.has(entry?.date) && entry?.status);
+}
+
 async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
   const weeklyDates = ctx.session.weeklyAttendanceDates ?? [];
   const weeklyEntries = Array.isArray(ctx.session.weeklyAttendanceEntries)
@@ -3471,6 +3490,7 @@ async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
 
   await updateUserByChatId(ctx.chat.id, {
     weeklyAttendanceEntries: weeklyEntries,
+    weeklyDraft: buildWeeklyDraft(weeklyDates, weeklyEntries, config.timezone),
     lastSubmittedAt: weeklyEntries.length > 0 ? new Date().toISOString() : undefined
   });
 }
@@ -3478,6 +3498,15 @@ async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
 async function startWeeklyAttendanceFlow(ctx, config, sheets, user, cache, weekOffset = 0) {
   cancelInteractions(ctx);
   const weeklyState = createWeeklyFlowState(getWorkweekDates(config.timezone, weekOffset));
+  const storedUser = await getUserByChatId(ctx.chat.id);
+  const resumedEntries = restoreWeeklyDraftEntries(
+    storedUser?.weeklyDraft,
+    weeklyState.weeklyAttendanceDates,
+    config.timezone
+  );
+  if (resumedEntries.length > 0) {
+    weeklyState.weeklyAttendanceEntries = resumedEntries;
+  }
 
   ctx.session.awaitingAttendance = false;
   ctx.session.awaitingWeeklyAttendance = weeklyState.awaitingWeeklyAttendance;
@@ -3591,12 +3620,16 @@ async function renderHomeMenu(ctx, config, options = {}) {
   const greeting = getGreetingForTime(config.timezone);
   const name = user?.appointment || "there";
   const syncStatus = options.syncStatus ?? options.cache?.syncManager?.getStatus() ?? null;
+  const todayStatus = user?.appointment && options.cache?.sheetSnapshots
+    ? getCachedAttendanceStatus(options.cache, config, user.appointment, new Date())
+    : null;
   const text = buildHomeMenuText({
     greeting,
     name,
     isAdminUser,
     timezone: config.timezone,
-    syncStatus
+    syncStatus,
+    todayStatus
   });
 
   const quickAttendance = user?.appointment
@@ -7958,8 +7991,8 @@ export async function createAttendanceBot(config) {
       await ctx.answerCbQuery("Attendance saved");
       const submittedAt = new Date();
       const confirmationLines = [
-        `Attendance recorded as "${picked}" for ${user.appointment} for ${formatAttendanceDateLabel(recordedAt, config.timezone)} at ${formatMilitaryTime(submittedAt, config.timezone)} hrs.`,
-        "Queued for Google Sheets sync.",
+        `Saved ✅ ${user.appointment}: "${picked}" for ${formatAttendanceDateLabel(recordedAt, config.timezone)} at ${formatMilitaryTime(submittedAt, config.timezone)} hrs.`,
+        "It'll show on the sheet shortly.",
         "",
         `"${pickQuoteOrJoke()}"`
       ];
@@ -8006,6 +8039,7 @@ export async function createAttendanceBot(config) {
           ctx,
           confirmationLines.join("\n"),
           Markup.inlineKeyboard([
+            [Markup.button.callback("✏️ Change", "home:attendance")],
             [
               Markup.button.callback("🔙 Back", "home:main"),
               Markup.button.callback("❌ Close", "home:close")
@@ -8316,6 +8350,7 @@ export async function createAttendanceBot(config) {
       await updateUserByChatId(ctx.chat.id, {
         weeklyAttendanceIndex: nextBlankIndex >= 0 ? nextBlankIndex : weeklyIndex,
         weeklyAttendanceEntries: nextEntries,
+        weeklyDraft: buildWeeklyDraft(weeklyDates, nextEntries, config.timezone),
         lastSubmittedAt: new Date().toISOString()
       });
 
@@ -8376,6 +8411,7 @@ export async function createAttendanceBot(config) {
       restoreWeeklyAttendanceSession(ctx, { ...weeklyState, entries: result.entries });
       await updateUserByChatId(ctx.chat.id, {
         weeklyAttendanceEntries: result.entries,
+        weeklyDraft: buildWeeklyDraft(weeklyState.dates, result.entries, config.timezone),
         lastSubmittedAt: new Date().toISOString()
       });
       await showWeeklyAttendanceOverview(ctx, config, user, adminCache);
@@ -9442,6 +9478,11 @@ export async function createAttendanceBot(config) {
 }
 
 export const __testing = {
+  finalizeWeeklyAttendanceFlow,
+  formatWeeklySubmitLabel,
+  buildWeeklyAttendanceOverview,
+  buildWeeklyDraft,
+  restoreWeeklyDraftEntries,
   buildQuickAttendanceButton,
   buildWeeklyShortcutRow,
   getDefaultFillStatus,

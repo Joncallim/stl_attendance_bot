@@ -22,8 +22,7 @@ test("admin home menu includes admin action and synchronization footer", () => {
     }
   });
 
-  assert.match(text, /🛠️ Admin Menu:/);
-  assert.match(text, /🏢 My Department:/);
+  assert.match(text, /Tap ❓ Help/);
   assert.match(text, /\n---\n/);
   assert.match(text, /Last Synchronisation: 184200 24 Mar 26/);
 });
@@ -67,11 +66,24 @@ test("non-admin home menu has no admin section or footer", () => {
     }
   });
 
-  assert.doesNotMatch(text, /🛠️ Admin Menu:/);
   assert.doesNotMatch(text, /---/);
   assert.doesNotMatch(text, /Last Synchronisation:/);
-  assert.match(text, /🏢 My Department:/);
-  assert.match(text, /❌ Close: Close this menu\.$/);
+  assert.match(text, /Tap ❓ Help for what each button does\.$/);
+});
+
+test("home menu text shows today's status only when it is known", () => {
+  const base = { greeting: "Good Morning", name: "SCSE", isAdminUser: false, timezone: "Asia/Singapore" };
+  assert.match(__testing.buildHomeMenuText({ ...base, todayStatus: "PRESENT" }), /\nToday: PRESENT ✅\n/);
+  assert.match(__testing.buildHomeMenuText({ ...base, todayStatus: "" }), /\nToday: not submitted yet\n/);
+  assert.doesNotMatch(__testing.buildHomeMenuText({ ...base, todayStatus: null }), /Today:/);
+});
+
+test("home menu always offers both This Week and Next Week", () => {
+  const callbacks = __testing.buildHomeMenu(false, "Asia/Singapore").reply_markup.inline_keyboard
+    .flat()
+    .map((button) => button.callback_data);
+  assert.ok(callbacks.includes("home:week:this"));
+  assert.ok(callbacks.includes("home:week:next"));
 });
 
 test("home inline menu includes My Department button for non-admins", () => {
