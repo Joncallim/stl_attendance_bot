@@ -103,9 +103,9 @@ export function clearUserBindingFields(user, options = {}) {
     onboardingCompletedAt: null,
     awaitingSecretCode: false,
     awaitingAttendance: false,
-    // An unsubmitted weekly draft belongs to the old appointment; never let it
+    // Unsubmitted weekly drafts belong to the old appointment; never let them
     // resurface after this chat binds to a different one.
-    weeklyDraft: null,
+    weeklyDrafts: null,
     ...(options.hardReset ? {
       userId: null,
       username: null,

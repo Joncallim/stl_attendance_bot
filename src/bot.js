@@ -2866,8 +2866,11 @@ async function finalizeWeeklyAttendanceFlow(ctx, config, user, cache) {
     return `${formatWeekDateLabel(date, config.timezone)}: ${entry.status || "— (left blank)"}`;
   });
 
+  const draftOwner = await getUserByChatId(ctx.chat.id);
   await clearWeeklyAttendanceState(ctx);
-  await updateUserByChatId(ctx.chat.id, { weeklyDraft: null });
+  await updateUserByChatId(ctx.chat.id, {
+    weeklyDrafts: updateWeeklyDrafts(draftOwner?.weeklyDrafts, dates, [], config.timezone)
+  });
   // A completed weekly flow can reuse an earlier confirmation message. Wait
   // for any old cleanup edit to finish before installing the new keyboard.
   await cancelAttendanceButtonCleanup(
@@ -3441,30 +3444,58 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
 }
 
 // Unsubmitted weekly picks survive Back, Close, /start and the daily flow, all
-// of which reset the live weekly session. Keyed by the week's Monday so a draft
-// is only ever restored into the same week; cleared on a successful submit.
-function buildWeeklyDraft(weeklyDates, weeklyEntries, timezone) {
-  if (!weeklyDates?.[0]) {
-    return null;
-  }
-  return {
-    weekStart: toIsoDateString(new Date(weeklyDates[0]), timezone),
-    entries: Array.isArray(weeklyEntries) ? weeklyEntries : []
-  };
+// of which reset the live weekly session. Drafts are stored per week (keyed by
+// the week's Monday), so working on Next Week never discards This Week's
+// picks. A week's draft is removed on a successful submit; weeks before the
+// current one are pruned whenever drafts are written.
+const MAX_WEEKLY_DRAFTS = 3;
+
+function getWeekStartIso(weeklyDates, timezone) {
+  return weeklyDates?.[0] ? toIsoDateString(new Date(weeklyDates[0]), timezone) : null;
 }
 
-function restoreWeeklyDraftEntries(draft, weeklyDates, timezone) {
-  if (!draft || !weeklyDates?.[0] || !Array.isArray(draft.entries)) {
-    return [];
+function updateWeeklyDrafts(existingDrafts, weeklyDates, weeklyEntries, timezone, now = new Date()) {
+  const weekStart = getWeekStartIso(weeklyDates, timezone);
+  const currentWeekStart = getWeekStartIso(getWorkweekDates(timezone, 0, now), timezone);
+  const drafts = {};
+
+  for (const [key, entries] of Object.entries(existingDrafts && typeof existingDrafts === "object" ? existingDrafts : {})) {
+    if (key >= currentWeekStart && Array.isArray(entries) && entries.length > 0) {
+      drafts[key] = entries;
+    }
   }
-  if (draft.weekStart !== toIsoDateString(new Date(weeklyDates[0]), timezone)) {
+
+  if (weekStart) {
+    const entries = Array.isArray(weeklyEntries) ? weeklyEntries.filter((entry) => entry?.status) : [];
+    if (entries.length > 0) {
+      drafts[weekStart] = entries;
+    } else {
+      delete drafts[weekStart];
+    }
+  }
+
+  const keys = Object.keys(drafts).sort();
+  for (const key of keys.slice(0, Math.max(0, keys.length - MAX_WEEKLY_DRAFTS))) {
+    delete drafts[key];
+  }
+
+  return Object.keys(drafts).length > 0 ? drafts : null;
+}
+
+function restoreWeeklyDraftEntries(drafts, weeklyDates, timezone) {
+  const weekStart = getWeekStartIso(weeklyDates, timezone);
+  const entries = weekStart && drafts && typeof drafts === "object" ? drafts[weekStart] : null;
+  if (!Array.isArray(entries)) {
     return [];
   }
   const weekIsoDates = new Set(weeklyDates.map((value) => toIsoDateString(new Date(value), timezone)));
-  return draft.entries.filter((entry) => weekIsoDates.has(entry?.date) && entry?.status);
+  return entries.filter((entry) => weekIsoDates.has(entry?.date) && entry?.status);
 }
 
 async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
+  // Captured up front: ctx.session can be the live session object, so by the
+  // time the holiday lookup returns it may describe a different week.
+  const startFlowId = ctx.session.weeklyAttendanceFlowId ?? null;
   const weeklyDates = ctx.session.weeklyAttendanceDates ?? [];
   const weeklyEntries = Array.isArray(ctx.session.weeklyAttendanceEntries)
     ? [...ctx.session.weeklyAttendanceEntries]
@@ -3499,7 +3530,10 @@ async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
   }
   const latestUser = await getUserByChatId(ctx.chat.id);
   const toIso = (value) => toIsoDateString(value, config.timezone);
-  if (latestUser?.weeklyAttendanceFlowId && latestUser.weeklyAttendanceFlowId !== ctx.session.weeklyAttendanceFlowId) {
+  if (
+    startFlowId !== ctx.session.weeklyAttendanceFlowId ||
+    (latestUser?.weeklyAttendanceFlowId && latestUser.weeklyAttendanceFlowId !== startFlowId)
+  ) {
     return;
   }
   let mergedEntries = Array.isArray(latestUser?.weeklyAttendanceEntries)
@@ -3515,7 +3549,7 @@ async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
 
   await updateUserByChatId(ctx.chat.id, {
     weeklyAttendanceEntries: mergedEntries,
-    weeklyDraft: buildWeeklyDraft(weeklyDates, mergedEntries, config.timezone),
+    weeklyDrafts: updateWeeklyDrafts(latestUser?.weeklyDrafts, weeklyDates, mergedEntries, config.timezone),
     lastSubmittedAt: new Date().toISOString()
   });
 }
@@ -3525,7 +3559,7 @@ async function startWeeklyAttendanceFlow(ctx, config, sheets, user, cache, weekO
   const weeklyState = createWeeklyFlowState(getWorkweekDates(config.timezone, weekOffset));
   const storedUser = await getUserByChatId(ctx.chat.id);
   const resumedEntries = restoreWeeklyDraftEntries(
-    storedUser?.weeklyDraft,
+    storedUser?.weeklyDrafts,
     weeklyState.weeklyAttendanceDates,
     config.timezone
   );
@@ -8380,7 +8414,12 @@ export async function createAttendanceBot(config) {
       await updateUserByChatId(ctx.chat.id, {
         weeklyAttendanceIndex: nextBlankIndex >= 0 ? nextBlankIndex : weeklyIndex,
         weeklyAttendanceEntries: nextEntries,
-        weeklyDraft: buildWeeklyDraft(weeklyDates, nextEntries, config.timezone),
+        weeklyDrafts: updateWeeklyDrafts(
+          (await getUserByChatId(ctx.chat.id))?.weeklyDrafts,
+          weeklyDates,
+          nextEntries,
+          config.timezone
+        ),
         lastSubmittedAt: new Date().toISOString()
       });
 
@@ -8441,7 +8480,7 @@ export async function createAttendanceBot(config) {
       restoreWeeklyAttendanceSession(ctx, { ...weeklyState, entries: result.entries });
       await updateUserByChatId(ctx.chat.id, {
         weeklyAttendanceEntries: result.entries,
-        weeklyDraft: buildWeeklyDraft(weeklyState.dates, result.entries, config.timezone),
+        weeklyDrafts: updateWeeklyDrafts(storedUser?.weeklyDrafts, weeklyState.dates, result.entries, config.timezone),
         lastSubmittedAt: new Date().toISOString()
       });
       await showWeeklyAttendanceOverview(ctx, config, user, adminCache);
@@ -9512,7 +9551,7 @@ export const __testing = {
   finalizeWeeklyAttendanceFlow,
   formatWeeklySubmitLabel,
   buildWeeklyAttendanceOverview,
-  buildWeeklyDraft,
+  updateWeeklyDrafts,
   restoreWeeklyDraftEntries,
   buildQuickAttendanceButton,
   buildWeeklyShortcutRow,

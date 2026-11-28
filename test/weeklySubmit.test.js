@@ -84,13 +84,25 @@ test("submit label variants", () => {
   assert.equal(__testing.formatWeeklySubmitLabel(0, 2), "✅ Submit (2 blank)");
 });
 
-test("weekly drafts restore only into the same week", () => {
-  const draft = __testing.buildWeeklyDraft(week, [{ date: "2026-11-25", status: "OS" }, { date: "2026-12-01", status: "OS" }], TZ);
-  assert.equal(draft.weekStart, "2026-11-23");
-  assert.deepEqual(__testing.restoreWeeklyDraftEntries(draft, week, TZ), [{ date: "2026-11-25", status: "OS" }]);
+test("weekly drafts are kept per week and restore only into their own week", () => {
+  const now = new Date("2026-11-25T02:00:00.000Z"); // Wed of the 23 Nov week
   const nextWeek = week.map((iso) => new Date(new Date(iso).getTime() + 7 * 86400000).toISOString());
-  assert.deepEqual(__testing.restoreWeeklyDraftEntries(draft, nextWeek, TZ), []);
+  let drafts = __testing.updateWeeklyDrafts(null, week, [{ date: "2026-11-25", status: "OS" }, { date: "2026-12-01", status: "OS" }], TZ, now);
+  drafts = __testing.updateWeeklyDrafts(drafts, nextWeek, [{ date: "2026-12-01", status: "PRESENT" }], TZ, now);
+
+  assert.deepEqual(Object.keys(drafts).sort(), ["2026-11-23", "2026-11-30"]);
+  assert.deepEqual(__testing.restoreWeeklyDraftEntries(drafts, week, TZ), [{ date: "2026-11-25", status: "OS" }]);
+  assert.deepEqual(__testing.restoreWeeklyDraftEntries(drafts, nextWeek, TZ), [{ date: "2026-12-01", status: "PRESENT" }]);
   assert.deepEqual(__testing.restoreWeeklyDraftEntries(null, week, TZ), []);
+
+  // Submitting a week removes only that week's draft.
+  const afterSubmit = __testing.updateWeeklyDrafts(drafts, week, [], TZ, now);
+  assert.deepEqual(Object.keys(afterSubmit), ["2026-11-30"]);
+  assert.equal(__testing.updateWeeklyDrafts(afterSubmit, nextWeek, [], TZ, now), null);
+
+  // Weeks before the current one are pruned.
+  const later = new Date("2026-12-02T02:00:00.000Z");
+  assert.deepEqual(Object.keys(__testing.updateWeeklyDrafts(drafts, nextWeek, [{ date: "2026-12-02", status: "OS" }], TZ, later)), ["2026-11-30"]);
 });
 
 test("a week with blank days submits only the filled days and clears the draft", async () => {
@@ -98,7 +110,10 @@ test("a week with blank days submits only the filled days and clears the draft",
     chatId: "700",
     userId: "700",
     appointment: "ALPHA",
-    weeklyDraft: { weekStart: "2026-11-23", entries: [{ date: "2026-11-23", status: "OS" }] }
+    weeklyDrafts: {
+      "2026-11-23": [{ date: "2026-11-23", status: "OS" }],
+      "2026-11-30": [{ date: "2026-12-01", status: "OS" }]
+    }
   });
   const ctx = fakeCtx([{ date: "2026-11-23", status: "OS" }]);
   const ok = await __testing.finalizeWeeklyAttendanceFlow(
@@ -117,7 +132,9 @@ test("a week with blank days submits only the filled days and clears the draft",
   const confirmation = ctx.sent.at(-1).text;
   assert.match(confirmation, /^Saved ✅ 2 of 5 weekdays recorded/);
   assert.match(confirmation, /— \(left blank\)/);
-  assert.equal((await getUserByChatId("700")).weeklyDraft, null);
+  // The submitted week's draft is cleared. (Other weeks are covered with a
+  // fixed clock in the draft test; here the real clock decides pruning.)
+  assert.equal(((await getUserByChatId("700")).weeklyDrafts ?? {})["2026-11-23"], undefined);
 });
 
 test("a week with nothing picked is not submitted", async () => {
@@ -155,7 +172,6 @@ test("background PH prefill merges into picks made meanwhile instead of undoing 
       [...stored.weeklyAttendanceEntries].sort((a, b) => a.date.localeCompare(b.date)),
       [{ date: "2026-11-23", status: "OS" }, { date: "2026-11-25", status: "PH" }]
     );
-    assert.equal(stored.weeklyDraft.weekStart, "2026-11-23");
   } finally {
     globalThis.fetch = originalFetch;
     __resetPublicHolidayCacheForTesting();
@@ -164,7 +180,7 @@ test("background PH prefill merges into picks made meanwhile instead of undoing 
 
 test("deregistering clears any unsubmitted weekly draft", async () => {
   const { clearUserBindingFields } = await import("../src/storage.js");
-  const cleared = clearUserBindingFields({ chatId: "1", appointment: "ALPHA", weeklyDraft: { weekStart: "x", entries: [] } });
-  assert.equal(cleared.weeklyDraft, null);
+  const cleared = clearUserBindingFields({ chatId: "1", appointment: "ALPHA", weeklyDrafts: { "2026-11-23": [{ date: "2026-11-23", status: "OS" }] } });
+  assert.equal(cleared.weeklyDrafts, null);
   assert.equal(cleared.appointment, null);
 });
