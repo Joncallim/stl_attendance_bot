@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { getDataFile } from "./dataDir.js";
 import {
@@ -312,6 +313,19 @@ export async function recoverStorageTransactions() {
   return runSerialized(STORAGE_MUTEX_KEY, recoverStorageTransaction);
 }
 
+// True when applying `patch` would change anything other than the bookkeeping
+// `updatedAt` stamp. /start and every command re-register the user and reset
+// conversation flags, which are almost always already in that state; skipping
+// those no-op rewrites saves a full users.json rewrite + two fsyncs each time.
+function userPatchChangesRecord(current, patch) {
+  if (!current) {
+    return true;
+  }
+  return Object.entries(patch).some(([key, value]) =>
+    key !== "updatedAt" && !isDeepStrictEqual(current[key], value)
+  );
+}
+
 let pendingUserUpdateBatch = null;
 
 function createUserUpdateBatch() {
@@ -329,6 +343,7 @@ function createUserUpdateBatch() {
 
     const users = await readUsers();
     const results = [];
+    let changed = false;
 
     for (const { chatId, patch } of requests) {
       const index = usersByIdIndex?.get(String(chatId)) ?? -1;
@@ -338,11 +353,14 @@ function createUserUpdateBatch() {
         continue;
       }
 
-      users[index] = { ...users[index], ...patch };
+      if (userPatchChangesRecord(users[index], patch)) {
+        users[index] = { ...users[index], ...patch };
+        changed = true;
+      }
       results.push(users[index]);
     }
 
-    if (requests.length > 0) {
+    if (changed) {
       await writeUsers(users);
     }
 
@@ -359,6 +377,9 @@ export async function upsertUser(user) {
     const index = usersByIdIndex?.get(String(user.chatId)) ?? -1;
 
     if (index >= 0) {
+      if (!userPatchChangesRecord(users[index], user)) {
+        return users[index];
+      }
       users[index] = { ...users[index], ...user };
     } else {
       users.push(user);

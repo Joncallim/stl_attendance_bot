@@ -3086,6 +3086,50 @@ async function resetConversationState(ctx) {
   });
 }
 
+// Onboarding codes are 32-bit random hex, so guessing is already impractical;
+// this per-account limiter makes it pointless and keeps a scripted client from
+// spinning the registry scan. In memory only: a restart clears it, which is
+// acceptable for a throttle. Entries are pruned as they expire.
+const SECRET_CODE_MAX_FAILURES = 5;
+const SECRET_CODE_FAILURE_WINDOW_MS = 10 * 60 * 1000;
+const secretCodeFailures = new Map();
+
+function pruneSecretCodeFailures(now = Date.now()) {
+  for (const [userId, entry] of secretCodeFailures) {
+    if (now - entry.firstFailureAt >= SECRET_CODE_FAILURE_WINDOW_MS) {
+      secretCodeFailures.delete(userId);
+    }
+  }
+}
+
+function getSecretCodeLockout(userId, now = Date.now()) {
+  pruneSecretCodeFailures(now);
+  const entry = secretCodeFailures.get(String(userId));
+  if (!entry || entry.count < SECRET_CODE_MAX_FAILURES) {
+    return { locked: false };
+  }
+  const remainingMs = SECRET_CODE_FAILURE_WINDOW_MS - (now - entry.firstFailureAt);
+  return { locked: true, retryAfterMinutes: Math.max(1, Math.ceil(remainingMs / 60_000)) };
+}
+
+function recordSecretCodeFailure(userId, now = Date.now()) {
+  pruneSecretCodeFailures(now);
+  const key = String(userId);
+  const entry = secretCodeFailures.get(key) ?? { count: 0, firstFailureAt: now };
+  entry.count += 1;
+  secretCodeFailures.set(key, entry);
+  if (entry.count === SECRET_CODE_MAX_FAILURES) {
+    logBotWarn("Onboarding code attempts throttled for a Telegram account.", {
+      windowMinutes: SECRET_CODE_FAILURE_WINDOW_MS / 60_000
+    });
+  }
+  return entry.count;
+}
+
+function clearSecretCodeFailures(userId) {
+  secretCodeFailures.delete(String(userId));
+}
+
 async function askForSecretCode(ctx, config) {
   cancelInteractions(ctx);
   await clearWeeklyAttendanceState(ctx);
@@ -7070,6 +7114,15 @@ export async function createAttendanceBot(config) {
     }
 
     if (awaitingSecretCode) {
+      const lockout = getSecretCodeLockout(ctx.from.id);
+      if (lockout.locked) {
+        await ctx.reply(
+          `Too many incorrect codes. Please wait ${lockout.retryAfterMinutes} minute(s) and try again, or contact the admin.`,
+          Markup.removeKeyboard()
+        );
+        return;
+      }
+
       await ensureSheetReadiness(sheets, config, adminCache);
 
       const binding = await bindAppointmentCode(normalizeSecretCode(message), {
@@ -7080,6 +7133,9 @@ export async function createAttendanceBot(config) {
       });
 
       if (!binding.ok) {
+        if (binding.reason === "invalid_code") {
+          recordSecretCodeFailure(ctx.from.id);
+        }
         const errorMessages = {
           invalid_code: "That secret code does not match any active appointment.",
           inactive_code:
@@ -7095,14 +7151,11 @@ export async function createAttendanceBot(config) {
         return;
       }
 
+      clearSecretCodeFailures(ctx.from.id);
       ctx.session.awaitingSecretCode = false;
-      await updateUserByChatId(ctx.chat.id, {
-        appointment: binding.appointment,
-        onboardingSecretCode: binding.secretCode,
-        awaitingSecretCode: false,
-        onboardingCompletedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString()
-      });
+      // bindAppointmentCode already committed the user record (appointment,
+      // code, onboardingCompletedAt, awaitingSecretCode=false) atomically with
+      // the registry, so no second users.json rewrite is needed here.
       await refreshAdminCache(adminCache, config);
 
       await ctx.reply(
@@ -9204,6 +9257,9 @@ export async function createAttendanceBot(config) {
 }
 
 export const __testing = {
+  getSecretCodeLockout,
+  recordSecretCodeFailure,
+  clearSecretCodeFailures,
   addSelfHealAppointmentsToRegistry,
   submitGitHubIssue,
   describeGitHubIssueFailure,
