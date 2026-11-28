@@ -79,7 +79,19 @@ async function main() {
   logStartup(`  node        : ${process.version}`);
   logStartup("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-  // 7. Graceful shutdown hooks.
+  // 7. Hourly memory line so growth shows up in `docker logs` long before it
+  //    becomes a problem. unref() keeps it from holding the process open.
+  const logMemory = () => {
+    const { rss, heapUsed, heapTotal, external } = process.memoryUsage();
+    const mb = (bytes) => Math.round(bytes / 1024 / 1024);
+    console.log(
+      `[Bot] [Memory] rss=${mb(rss)}MB heapUsed=${mb(heapUsed)}MB heapTotal=${mb(heapTotal)}MB external=${mb(external)}MB uptime=${Math.round(process.uptime() / 3600)}h`
+    );
+  };
+  logMemory();
+  setInterval(logMemory, 60 * 60 * 1000).unref();
+
+  // 8. Graceful shutdown hooks.
   process.once("SIGINT",  () => {
     logStartup("SIGINT received — shutting down.");
     bot.stop("SIGINT");

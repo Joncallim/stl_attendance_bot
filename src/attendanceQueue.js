@@ -644,13 +644,18 @@ export async function resetConflictedQueueEntries() {
 // Rewrites the queue file keeping every unresolved event. Conflicted and
 // permanently-failed events are deliberately retained until an administrator
 // repairs or explicitly resolves them; compaction must never destroy attendance.
+const COMPACTABLE_QUEUE_STATUSES = new Set(["flushed", "skipped_noop"]);
+
 export async function compactAttendanceQueue() {
   return runSerialized(QUEUE_MUTEX_KEY, async () => {
     const state = await loadAttendanceQueueState();
     const queueFilePath = ATTENDANCE_QUEUE_FILE();
     const activeIds = new Set(
       [...state.events.values()]
-        .filter((event) => !["flushed", "skipped"].includes(event.queueStatus))
+        // "skipped_noop" is the status the state machine actually records for a
+        // write that was already in place; the old "skipped" literal matched
+        // nothing, so those events (and their records) were never compacted.
+        .filter((event) => !COMPACTABLE_QUEUE_STATUSES.has(event.queueStatus))
         .map((event) => event.id)
     );
 

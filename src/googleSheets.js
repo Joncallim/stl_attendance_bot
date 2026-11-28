@@ -1482,7 +1482,12 @@ async function getSpreadsheet(sheets, spreadsheetId, options = {}) {
     sheets.spreadsheets.get({
       spreadsheetId,
       includeGridData: false,
-      fields: "spreadsheetId,sheets(properties,protectedRanges,conditionalFormats)"
+      // Properties only. Protections and conditional-format rules are fetched
+      // per sheet, fresh, by the structural code that needs them
+      // (getSheetFormattingState / clearAllSheetProtections). Pulling every
+      // sheet's rules here made this call slow and handed structural code
+      // rule indexes up to 45 minutes stale.
+      fields: "spreadsheetId,sheets(properties(sheetId,title,index,gridProperties))"
     }, { signal })
   , { timeoutMs: 20000 });
   const spreadsheet = response.data;
@@ -1499,6 +1504,38 @@ async function getSpreadsheet(sheets, spreadsheetId, options = {}) {
 async function getSheetByTitle(sheets, spreadsheetId, title, options = {}) {
   const spreadsheet = await getSpreadsheet(sheets, spreadsheetId, options);
   return spreadsheet.sheets?.find((entry) => entry.properties?.title === title) ?? null;
+}
+
+/**
+ * Live protections and conditional-format rules for ONE sheet.
+ *
+ * applyMonthlySheetLayout deletes the sheet's existing rules by index and then
+ * re-adds the configured set. It previously received the sheet from the
+ * metadata cache, which carries no rules, so it deleted nothing and every
+ * layout run (nightly maintenance, each appointment add/remove) stacked a
+ * duplicate copy of every rule on top. Reading the rules fresh here keeps the
+ * delete-then-add idempotent.
+ */
+async function getSheetFormattingState(sheets, spreadsheetId, title, sheetId) {
+  const escapedTitle = String(title).replace(/'/g, "''");
+  const response = await runGoogleSheetsRequest(
+    `spreadsheets.get:formatting:${title}`,
+    (signal) => sheets.spreadsheets.get({
+      spreadsheetId,
+      ranges: [`'${escapedTitle}'!A1`],
+      includeGridData: false,
+      fields: "sheets(properties(sheetId,title),conditionalFormats(ranges),protectedRanges(protectedRangeId,description))"
+    }, { signal })
+  );
+  const match = (response.data?.sheets ?? []).find((entry) =>
+    (Number.isInteger(sheetId) && entry.properties?.sheetId === sheetId) ||
+    entry.properties?.title === title
+  );
+
+  return {
+    protectedRanges: match?.protectedRanges ?? [],
+    conditionalFormats: match?.conditionalFormats ?? []
+  };
 }
 
 async function addSheet(sheets, spreadsheetId, title) {
@@ -2185,6 +2222,17 @@ async function loadConditionalFormattingRules() {
   return cachedConditionalRules;
 }
 
+function isBotManagedConditionalFormat(rule, sheetId) {
+  const ranges = rule?.ranges ?? [];
+  if (ranges.length !== 1) {
+    return false;
+  }
+  const [range] = ranges;
+  return (range.sheetId ?? sheetId) === sheetId &&
+    (range.startRowIndex ?? 0) === 1 &&
+    (range.startColumnIndex ?? 0) === 1;
+}
+
 async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, header, options, timezone, rowCount = 0, existingProtections = [], existingConditionalFormats = []) {
   const rowLimit = managedRowLimit(rowCount);
 
@@ -2198,10 +2246,15 @@ async function applyMonthlySheetLayout(sheets, spreadsheetId, sheetId, date, hea
   // and cached in conditional-format-rules.json).  Null means no rules saved yet.
   const conditionalRules = await loadConditionalFormattingRules();
 
-  // Delete all existing conditional format rules on this sheet before re-adding.
+  // Delete the bot's own conditional format rules before re-adding them.
+  // Bot rules always cover a single range starting at B2 (see attendanceRange
+  // below); rules a person added elsewhere on the sheet are left alone.
   // Rules are indexed from 0; delete in reverse order so earlier indices stay valid.
   const deleteConditionalFormatRequests = existingConditionalFormats
-    .map((_, index) => existingConditionalFormats.length - 1 - index)
+    .map((rule, index) => ({ rule, index }))
+    .filter(({ rule }) => isBotManagedConditionalFormat(rule, sheetId))
+    .map(({ index }) => index)
+    .sort((left, right) => right - left)
     .map((index) => ({ deleteConditionalFormatRule: { sheetId, index } }));
 
   // Apply each saved rule to the full attendance data range (column B onwards,
@@ -2358,11 +2411,9 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
   const defaultHeader = getDefaultHeaderRow(date, config.timezone);
   let monthlySheetValues = null;
 
-  // Existing protections and conditional formats on the sheet — passed to
-  // applyMonthlySheetLayout so it can issue deleteProtectedRange and
-  // deleteConditionalFormatRule requests in the same batchUpdate.
-  const existingProtections = sheet.protectedRanges ?? [];
-  const existingConditionalFormats = sheet.conditionalFormats ?? [];
+  // Existing protections and conditional formats are read live (below) only
+  // when an existing sheet's layout is re-applied, so the delete-then-add in
+  // applyMonthlySheetLayout removes exactly what is on the sheet now.
 
   if (ensuredSheet.created) {
     await applyMonthlySheetLayout(
@@ -2393,6 +2444,17 @@ async function ensureMonthlyAttendanceSheet(sheets, config, date, appointments, 
     // layoutOnly is used for the previous month where we want formatting refreshed but must
     // never touch row structure (avoids row-insert timeouts that block current/next months).
     if (mode === "replace" || options.applyLayout === true || options.layoutOnly === true) {
+      const formatting = await getSheetFormattingState(
+        sheets,
+        config.spreadsheetId,
+        title,
+        sheet.properties.sheetId
+      );
+      const existingProtections = formatting.protectedRanges;
+      const existingConditionalFormats = formatting.conditionalFormats;
+      if (existingConditionalFormats.length > 0) {
+        logSheetsSuccess(`[${title}] Replacing ${existingConditionalFormats.length} existing conditional format rule(s).`);
+      }
       // Always use the computed defaultHeader for layout so that the column count,
       // validation range, and bold-date-header requests are never truncated by a
       // sheet whose last column happens to be empty/sparse.
@@ -3178,7 +3240,37 @@ async function updateSpreadsheetMetadataCache(sheets, config, cache, force = fal
   return cache.spreadsheetMetadata;
 }
 
+// Months kept in sheet-cache.json (and therefore in the in-memory snapshot
+// bundle built from it): the attendance-option usage window plus a margin
+// behind, and next month ahead. Older slices were never evicted, so the file
+// and every snapshot bundle built from it grew by a month, every month.
+const SHEET_CACHE_MONTHS_BEHIND = Math.max(ATTENDANCE_OPTION_USAGE_MONTH_WINDOW, 3);
+const SHEET_CACHE_MONTHS_AHEAD = 1;
+const DEFAULT_CACHE_TIMEZONE = process.env.BOT_TIMEZONE || "Asia/Singapore";
+
+function pruneLocalSheetCacheMonths(cache, now = new Date(), timezone = DEFAULT_CACHE_TIMEZONE) {
+  const keep = new Set();
+  for (let offset = -SHEET_CACHE_MONTHS_BEHIND; offset <= SHEET_CACHE_MONTHS_AHEAD; offset += 1) {
+    keep.add(getMonthParts(shiftMonth(now, timezone, offset), timezone).title);
+  }
+
+  let removed = 0;
+  for (const key of ["monthSlices", "snapshots"]) {
+    if (!cache[key] || typeof cache[key] !== "object") continue;
+    for (const title of Object.keys(cache[key])) {
+      // Only month-titled entries are pruned; anything else is left untouched.
+      if (parseMonthSheetTitle(title) && !keep.has(title)) {
+        delete cache[key][title];
+        removed += 1;
+      }
+    }
+  }
+
+  return removed;
+}
+
 async function writeLocalSheetCache(cache) {
+  pruneLocalSheetCacheMonths(cache);
   await writeJsonFile(SHEET_CACHE_FILE(), cache);
 }
 
@@ -5254,33 +5346,20 @@ export async function summarizeAttendanceOptionUsage(sheets, config) {
  * Useful as a one-shot admin action to clear any lingering bot-managed or
  * manually-added protections after the protection-tracking code was removed.
  *
- * Uses the process-level metadata cache (populated by the background sync cycle)
- * rather than making a fresh spreadsheets.get call — that call can take 30–120 s
- * under API congestion and would reliably time out.  If the cache is empty (very
- * first bot run before the first successful sync), it falls back to a live call.
+ * Reads protections with a protections-only field mask. The routine metadata
+ * cache deliberately carries sheet properties only.
  */
 export async function clearAllSheetProtections(sheets, spreadsheetId) {
-  // Prefer cached spreadsheet metadata so we don't need a live spreadsheets.get.
-  // The metadata TTL is 45 min; protections change far less often than that.
-  let sheetsMeta;
-  const processEntry = processSpreadsheetCache.get(sheets);
-
-  if (processEntry?.data?.sheets) {
-    logSheetsSuccess("clearAllSheetProtections: reading protections from cached metadata.");
-    sheetsMeta = processEntry.data.sheets;
-  } else {
-    logSheetsSuccess("clearAllSheetProtections: cache empty — fetching live metadata.");
-    const result = await runGoogleSheetsRequest(
-      "spreadsheets.get:clearProtections",
-      (signal) => sheets.spreadsheets.get({
-        spreadsheetId,
-        fields: "sheets(properties(sheetId,title),protectedRanges(protectedRangeId,description))"
-      }, { signal })
-    );
-    sheetsMeta = result.data.sheets ?? [];
-    // Update the process cache so subsequent calls (e.g. ensureSheet) benefit too.
-    processSpreadsheetCache.set(sheets, { data: result.data, fetchedAt: new Date().toISOString() });
-  }
+  // Routine metadata no longer carries protections, so read them directly.
+  // The field mask keeps this call small.
+  const result = await runGoogleSheetsRequest(
+    "spreadsheets.get:clearProtections",
+    (signal) => sheets.spreadsheets.get({
+      spreadsheetId,
+      fields: "sheets(properties(sheetId,title),protectedRanges(protectedRangeId,description))"
+    }, { signal })
+  );
+  const sheetsMeta = result.data.sheets ?? [];
 
   const allProtections = (sheetsMeta ?? [])
     .flatMap((sheet) => (sheet.protectedRanges ?? []).map((p) => ({
@@ -5447,6 +5526,9 @@ export const __testing = {
   getMonthParts,
   shiftMonth,
   refreshMonthSlices,
+  getSheetFormattingState,
+  isBotManagedConditionalFormat,
+  pruneLocalSheetCacheMonths,
   validateAttendanceWriteTargets,
   verifyBatchWrite,
   verifyWriteRequestFields,

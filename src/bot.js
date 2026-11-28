@@ -5178,6 +5178,24 @@ function buildSelfHealLogsMenu(page) {
  * Throttled by SELF_HEAL_COOLDOWN_MS so it cannot fire more than once per hour.
  * Skips when a roster sync is already in progress.
  */
+async function addSelfHealAppointmentsToRegistry(appointments, deps = {}) {
+  const addFn = deps.addAppointmentToRegistry ?? addAppointmentToRegistry;
+  const results = [];
+
+  for (const appointment of appointments) {
+    try {
+      const result = await addFn(appointment);
+      results.push({ appointment, ok: result.ok, reason: result.reason });
+      logBot(`[SelfHeal] Registered appointment for structural sync: ${appointment}`, { ok: result.ok });
+    } catch (error) {
+      results.push({ appointment, ok: false, reason: error.message });
+      logBotError(`[SelfHeal] Failed to register appointment: ${appointment}`, { error: error.message });
+    }
+  }
+
+  return results;
+}
+
 async function runSelfHealingCycle(sheets, config, adminCache) {
   const now = Date.now();
 
@@ -5234,18 +5252,11 @@ async function runSelfHealingCycle(sheets, config, adminCache) {
   const toAdd = [
     ...new Set(divergences.flatMap((d) => d.unexpectedWithData))
   ];
-  const addResults = [];
-
-  for (const apt of toAdd) {
-    try {
-      const result = await addManagedAppointment(sheets, config, adminCache, apt);
-      addResults.push({ appointment: apt, ok: result.ok, reason: result.reason });
-      logBot(`[SelfHeal] addManagedAppointment: ${apt}`, { ok: result.ok });
-    } catch (error) {
-      addResults.push({ appointment: apt, ok: false, reason: error.message });
-      logBotError(`[SelfHeal] Failed to add appointment: ${apt}`, { error: error.message });
-    }
-  }
+  // Registry only: the structural sync in step 2 unions the registry into
+  // ONBOARDING and the month sheets in one pass. Calling addManagedAppointment
+  // per appointment repeated that whole sheet round-trip (~20+ Sheets calls)
+  // once for every missing appointment.
+  const addResults = await addSelfHealAppointmentsToRegistry(toAdd);
 
   // Step 2: Structural sync — repairs ONBOARDING, current month, and next month.
   let syncFailed = false;
@@ -9193,6 +9204,7 @@ export async function createAttendanceBot(config) {
 }
 
 export const __testing = {
+  addSelfHealAppointmentsToRegistry,
   submitGitHubIssue,
   describeGitHubIssueFailure,
   formatIssueSubmissionFailure,

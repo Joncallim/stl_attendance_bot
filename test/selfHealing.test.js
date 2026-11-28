@@ -133,3 +133,23 @@ test("rename scenario: missing ALPHA, unexpected BRAVO with data", () => {
   assert.deepEqual(div.unexpectedInSheet, ["BRAVO"]);
   assert.deepEqual(div.unexpectedWithData, ["BRAVO"]);
 });
+
+test("addSelfHealAppointmentsToRegistry registers every appointment locally without touching Sheets", async () => {
+  const registered = [];
+  const results = await __testing.addSelfHealAppointmentsToRegistry(["ALPHA", "BRAVO", "CHARLIE"], {
+    addAppointmentToRegistry: async (appointment) => {
+      registered.push(appointment);
+      if (appointment === "BRAVO") throw new Error("disk full");
+      return appointment === "CHARLIE"
+        ? { ok: false, reason: "appointment_exists" }
+        : { ok: true };
+    }
+  });
+
+  assert.deepEqual(registered, ["ALPHA", "BRAVO", "CHARLIE"]);
+  assert.deepEqual(results, [
+    { appointment: "ALPHA", ok: true, reason: undefined },
+    { appointment: "BRAVO", ok: false, reason: "disk full" },
+    { appointment: "CHARLIE", ok: false, reason: "appointment_exists" }
+  ]);
+});
