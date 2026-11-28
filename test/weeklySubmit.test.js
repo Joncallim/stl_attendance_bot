@@ -126,3 +126,45 @@ test("a week with nothing picked is not submitted", async () => {
   assert.equal(ok, false);
   assert.match(ctx.sent.at(-1).text, /^Nothing to submit yet/);
 });
+
+test("background PH prefill merges into picks made meanwhile instead of undoing them", async () => {
+  const { __resetPublicHolidayCacheForTesting } = await import("../src/holidays.js");
+  __resetPublicHolidayCacheForTesting();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => ({
+    ok: true,
+    json: async () => (String(url).includes("/metadata")
+      ? { data: { collectionMetadata: { childDatasets: ["ds1"] } } }
+      : { result: { records: [{ date: "2026-11-25", holiday: "Test Day" }] } })
+  });
+
+  try {
+    await upsertUser({ chatId: "701", userId: "701", appointment: "ALPHA", weeklyAttendanceFlowId: "flowB", weeklyAttendanceEntries: [] });
+    const ctx = fakeCtx([]);
+    ctx.chat.id = "701";
+    ctx.session.weeklyAttendanceFlowId = "flowB";
+
+    // The user picks Monday while the holiday lookup is still in flight.
+    const { updateUserByChatId } = await import("../src/storage.js");
+    await updateUserByChatId("701", { weeklyAttendanceEntries: [{ date: "2026-11-23", status: "OS" }] });
+
+    await __testing.autoFillWeeklyPublicHolidays(ctx, config, null, { appointment: "ALPHA" }, cacheWith({}));
+
+    const stored = await getUserByChatId("701");
+    assert.deepEqual(
+      [...stored.weeklyAttendanceEntries].sort((a, b) => a.date.localeCompare(b.date)),
+      [{ date: "2026-11-23", status: "OS" }, { date: "2026-11-25", status: "PH" }]
+    );
+    assert.equal(stored.weeklyDraft.weekStart, "2026-11-23");
+  } finally {
+    globalThis.fetch = originalFetch;
+    __resetPublicHolidayCacheForTesting();
+  }
+});
+
+test("deregistering clears any unsubmitted weekly draft", async () => {
+  const { clearUserBindingFields } = await import("../src/storage.js");
+  const cleared = clearUserBindingFields({ chatId: "1", appointment: "ALPHA", weeklyDraft: { weekStart: "x", entries: [] } });
+  assert.equal(cleared.weeklyDraft, null);
+  assert.equal(cleared.appointment, null);
+});

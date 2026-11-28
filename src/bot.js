@@ -749,6 +749,22 @@ function buildHomeMenu(isAdminUser, timezone, options = {}) {
   return Markup.inlineKeyboard(rows);
 }
 
+// Holiday data is normally cached; never let a cold holiday fetch delay the
+// home menu. Resolves true/false, or null if it can't answer within 750 ms.
+async function isWorkingDayWithinBudget(now, timezone, budgetMs = 750) {
+  let timer;
+  try {
+    return await Promise.race([
+      isReminderWorkingDay(now, timezone).then(Boolean),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), budgetMs); })
+    ]);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // One-tap "today" button on the home menu: offered only on a working weekday
 // when nothing is recorded for today yet. It reuses the normal daily
 // pick:attendance callback, so it goes through the same durable queue path.
@@ -761,21 +777,8 @@ async function buildQuickAttendanceButton(config, user, cache, now = new Date())
   if (getCachedAttendanceStatus(cache, config, user.appointment, now)) {
     return null;
   }
-  // Holiday data is normally cached; never let a cold holiday fetch delay the
-  // home menu. If it is not answered quickly, just omit the shortcut.
-  let timer;
-  try {
-    const workingDay = await Promise.race([
-      isReminderWorkingDay(now, config.timezone),
-      new Promise((resolve) => { timer = setTimeout(() => resolve(null), 750); })
-    ]);
-    if (workingDay !== true) {
-      return null;
-    }
-  } catch {
+  if ((await isWorkingDayWithinBudget(now, config.timezone)) !== true) {
     return null;
-  } finally {
-    clearTimeout(timer);
   }
   const isoDate = toIsoDateString(now, config.timezone);
   return {
@@ -3486,12 +3489,34 @@ async function autoFillWeeklyPublicHolidays(ctx, config, sheets, user, cache) {
     }
   }
 
-  ctx.session.weeklyAttendanceEntries = weeklyEntries;
+  // This runs in the background after the overview is shown, so the user may
+  // already have picked a day. Merge the PH additions into the latest stored
+  // entries instead of writing back the copy taken at the start, which would
+  // silently undo those picks.
+  const phAdditions = weeklyEntries.filter((entry) => entry.status === "PH");
+  if (phAdditions.length === 0) {
+    return;
+  }
+  const latestUser = await getUserByChatId(ctx.chat.id);
+  const toIso = (value) => toIsoDateString(value, config.timezone);
+  if (latestUser?.weeklyAttendanceFlowId && latestUser.weeklyAttendanceFlowId !== ctx.session.weeklyAttendanceFlowId) {
+    return;
+  }
+  let mergedEntries = Array.isArray(latestUser?.weeklyAttendanceEntries)
+    ? [...latestUser.weeklyAttendanceEntries]
+    : [...(ctx.session.weeklyAttendanceEntries ?? [])];
+  for (const entry of phAdditions) {
+    if (!getStagedAttendanceStatus(mergedEntries, entry.date, toIso)) {
+      mergedEntries = upsertWeeklyAttendanceEntry(mergedEntries, entry.date, "PH", toIso);
+    }
+  }
+
+  ctx.session.weeklyAttendanceEntries = mergedEntries;
 
   await updateUserByChatId(ctx.chat.id, {
-    weeklyAttendanceEntries: weeklyEntries,
-    weeklyDraft: buildWeeklyDraft(weeklyDates, weeklyEntries, config.timezone),
-    lastSubmittedAt: weeklyEntries.length > 0 ? new Date().toISOString() : undefined
+    weeklyAttendanceEntries: mergedEntries,
+    weeklyDraft: buildWeeklyDraft(weeklyDates, mergedEntries, config.timezone),
+    lastSubmittedAt: new Date().toISOString()
   });
 }
 
@@ -3620,9 +3645,14 @@ async function renderHomeMenu(ctx, config, options = {}) {
   const greeting = getGreetingForTime(config.timezone);
   const name = user?.appointment || "there";
   const syncStatus = options.syncStatus ?? options.cache?.syncManager?.getStatus() ?? null;
-  const todayStatus = user?.appointment && options.cache?.sheetSnapshots
+  let todayStatus = user?.appointment && options.cache?.sheetSnapshots
     ? getCachedAttendanceStatus(options.cache, config, user.appointment, new Date())
     : null;
+  // "Not submitted yet" is only true on a working day; at weekends and on
+  // public holidays a blank day is expected, so say nothing.
+  if (todayStatus === "" && (await isWorkingDayWithinBudget(new Date(), config.timezone)) !== true) {
+    todayStatus = null;
+  }
   const text = buildHomeMenuText({
     greeting,
     name,
@@ -9478,6 +9508,7 @@ export async function createAttendanceBot(config) {
 }
 
 export const __testing = {
+  autoFillWeeklyPublicHolidays,
   finalizeWeeklyAttendanceFlow,
   formatWeeklySubmitLabel,
   buildWeeklyAttendanceOverview,

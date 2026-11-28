@@ -95,7 +95,7 @@ function logStorageSuccess(message, details = null) {
   console.log(message);
 }
 
-function clearUserBindingFields(user, options = {}) {
+export function clearUserBindingFields(user, options = {}) {
   return {
     ...user,
     appointment: null,
@@ -103,6 +103,9 @@ function clearUserBindingFields(user, options = {}) {
     onboardingCompletedAt: null,
     awaitingSecretCode: false,
     awaitingAttendance: false,
+    // An unsubmitted weekly draft belongs to the old appointment; never let it
+    // resurface after this chat binds to a different one.
+    weeklyDraft: null,
     ...(options.hardReset ? {
       userId: null,
       username: null,
