@@ -113,3 +113,81 @@ export function applyWeeklyAttendanceSelection(
     weeklyAttendanceEntries: nextEntries
   };
 }
+
+function weeklyDateStatus(dateValue, stagedEntries, getExistingStatus, toIsoDateString) {
+  const date = dateValue instanceof Date ? dateValue : new Date(dateValue);
+  const isoDate = normalizeWeeklyDate(date, toIsoDateString);
+  const staged = getStagedAttendanceStatus(stagedEntries, isoDate, toIsoDateString);
+  return {
+    date,
+    isoDate,
+    status: staged || String(getExistingStatus(date, isoDate) ?? "").trim()
+  };
+}
+
+/** ISO dates in the flow that have neither a staged nor an existing value. */
+export function listBlankWeeklyDates(weeklyDates, stagedEntries, getExistingStatus, toIsoDateString) {
+  return weeklyDates
+    .map((dateValue) => weeklyDateStatus(dateValue, stagedEntries, getExistingStatus, toIsoDateString))
+    .filter(({ status }) => !status)
+    .map(({ isoDate }) => isoDate);
+}
+
+/**
+ * Stage `status` on every blank day. Days that already have a value (staged in
+ * this flow, already on the sheet, or prefilled PH) are never overwritten, so
+ * "fill blanks" is always safe to tap.
+ */
+export function fillBlankWeeklyEntries(weeklyDates, stagedEntries, getExistingStatus, status, toIsoDateString) {
+  const blanks = listBlankWeeklyDates(weeklyDates, stagedEntries, getExistingStatus, toIsoDateString);
+  let entries = stagedEntries;
+  for (const isoDate of blanks) {
+    entries = upsertWeeklyAttendanceEntry(entries, isoDate, status, toIsoDateString);
+  }
+  return { entries, filledDates: blanks };
+}
+
+/**
+ * Stage last week's value for each blank day. `getSourceStatus(date)` returns
+ * the value recorded seven days earlier. Blank sources and PH are not copied:
+ * a holiday last week says nothing about this week.
+ */
+export function copyWeeklyEntriesFromPreviousWeek(
+  weeklyDates,
+  stagedEntries,
+  getExistingStatus,
+  getSourceStatus,
+  toIsoDateString,
+  options = {}
+) {
+  const skipStatuses = new Set(options.skipStatuses ?? ["PH"]);
+  const blanks = new Set(listBlankWeeklyDates(weeklyDates, stagedEntries, getExistingStatus, toIsoDateString));
+  let entries = stagedEntries;
+  const copiedDates = [];
+
+  for (const dateValue of weeklyDates) {
+    const { date, isoDate } = weeklyDateStatus(dateValue, stagedEntries, getExistingStatus, toIsoDateString);
+    if (!blanks.has(isoDate)) continue;
+    const sourceStatus = String(getSourceStatus(date) ?? "").trim();
+    if (!sourceStatus || skipStatuses.has(sourceStatus)) continue;
+    entries = upsertWeeklyAttendanceEntry(entries, isoDate, sourceStatus, toIsoDateString);
+    copiedDates.push(isoDate);
+  }
+
+  return { entries, copiedDates };
+}
+
+/**
+ * Index of the next blank day after `afterIndex`, wrapping to earlier blank
+ * days, or -1 when every day has a value. Used to move straight on to the next
+ * day that still needs an answer instead of returning to the overview.
+ */
+export function findNextBlankWeeklyIndex(weeklyDates, stagedEntries, getExistingStatus, afterIndex, toIsoDateString) {
+  const count = weeklyDates.length;
+  for (let step = 1; step <= count; step += 1) {
+    const index = (afterIndex + step) % count;
+    const { status } = weeklyDateStatus(weeklyDates[index], stagedEntries, getExistingStatus, toIsoDateString);
+    if (!status) return index;
+  }
+  return -1;
+}

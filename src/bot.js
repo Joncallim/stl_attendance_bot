@@ -101,8 +101,12 @@ import {
 } from "./messageCleanup.js";
 import {
   applyWeeklyAttendanceSelection,
+  copyWeeklyEntriesFromPreviousWeek,
   createWeeklyFlowState,
+  fillBlankWeeklyEntries,
+  findNextBlankWeeklyIndex,
   getStagedAttendanceStatus,
+  listBlankWeeklyDates,
   resolveWeeklyAttendanceEntries,
   upsertWeeklyAttendanceEntry
 } from "./weeklyFlow.js";
@@ -546,6 +550,7 @@ const USER_MANUAL_SECTIONS = {
     title: "📝 Today's Attendance",
     lines: [
       "Use Today's Attendance to submit or update your status for today.",
+      "On a working day with nothing recorded yet, the home menu also shows ✅ Today: PRESENT for one-tap submission.",
       "The bot writes your selection into your appointment row and today's date column in the current month sheet.",
       "After you submit, the bot confirms the recorded status and shows a quote or joke."
     ]
@@ -555,6 +560,9 @@ const USER_MANUAL_SECTIONS = {
     lines: [
       "Use This Week or Next Week to submit Monday-to-Friday attendance in one guided flow.",
       "Public holidays are prefilled as PH.",
+      "⚡ fills every blank day with the default status (PRESENT) in one tap.",
+      "🔁 Copy last week fills blank days with what you recorded last week.",
+      "After you pick a status, the next blank day opens automatically.",
       "Use Skip Day to keep the current value for that date unchanged."
     ]
   },
@@ -695,7 +703,10 @@ function buildAdminRosterMenu() {
   ]);
 }
 
-function buildHomeMenu(isAdminUser, timezone) {
+function buildHomeMenu(isAdminUser, timezone, options = {}) {
+  const quickRow = options.quickAttendance
+    ? [[Markup.button.callback(options.quickAttendance.label, options.quickAttendance.callback)]]
+    : [];
   const buttons = [
     Markup.button.callback("📝 Today's Attendance", "home:attendance"),
     ...getHomeWeekButtons(timezone),
@@ -718,13 +729,48 @@ function buildHomeMenu(isAdminUser, timezone) {
 
   buttons.push(Markup.button.callback("❌ Close", "home:close"));
 
-  const rows = [];
+  const rows = [...quickRow];
 
   for (let index = 0; index < buttons.length; index += 2) {
     rows.push(buttons.slice(index, index + 2));
   }
 
   return Markup.inlineKeyboard(rows);
+}
+
+// One-tap "today" button on the home menu: offered only on a working weekday
+// when nothing is recorded for today yet. It reuses the normal daily
+// pick:attendance callback, so it goes through the same durable queue path.
+async function buildQuickAttendanceButton(config, user, cache, now = new Date()) {
+  const status = getDefaultFillStatus(config);
+  // Without loaded snapshots we cannot tell whether today is already filled.
+  if (!status || !user?.appointment || !cache?.sheetSnapshots) {
+    return null;
+  }
+  if (getCachedAttendanceStatus(cache, config, user.appointment, now)) {
+    return null;
+  }
+  // Holiday data is normally cached; never let a cold holiday fetch delay the
+  // home menu. If it is not answered quickly, just omit the shortcut.
+  let timer;
+  try {
+    const workingDay = await Promise.race([
+      isReminderWorkingDay(now, config.timezone),
+      new Promise((resolve) => { timer = setTimeout(() => resolve(null), 750); })
+    ]);
+    if (workingDay !== true) {
+      return null;
+    }
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+  const isoDate = toIsoDateString(now, config.timezone);
+  return {
+    label: `✅ Today: ${status}`,
+    callback: `home:pick:attendance:${newAttendancePromptId()}:${isoDate}:${attendanceOptionToken(config, status)}`
+  };
 }
 
 function buildSelfDeregisterMenu(interactionId) {
@@ -3193,6 +3239,58 @@ async function askAttendance(ctx, config, user = null, cache = null) {
   });
 }
 
+// The one-tap fill value: the first option of the first attendance group
+// (PRESENT in the default settings.yaml), so it follows admin reordering.
+function getDefaultFillStatus(config) {
+  return getAttendanceOptionGroups(config)[0]?.options?.[0] ?? config.attendanceOptions?.[0] ?? null;
+}
+
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+function weeklyExistingStatusGetter(cache, config, user) {
+  return (date) => (user?.appointment ? getCachedAttendanceStatus(cache, config, user.appointment, date) : "");
+}
+
+function weeklyPreviousWeekGetter(cache, config, user) {
+  return (date) => (user?.appointment
+    ? getCachedAttendanceStatus(cache, config, user.appointment, new Date(date.getTime() - WEEK_MS))
+    : "");
+}
+
+// Shortcut buttons shown on the weekly overview and day picker. Each one only
+// fills days that are still blank, so none of them can overwrite a choice.
+function buildWeeklyShortcutRow(weeklyDates, weeklyEntries, cache, config, user, flowId) {
+  const toIso = (value) => toIsoDateString(value, config.timezone);
+  const getExisting = weeklyExistingStatusGetter(cache, config, user);
+  const blanks = listBlankWeeklyDates(weeklyDates, weeklyEntries, getExisting, toIso);
+  if (blanks.length === 0 || !weeklyDates[0]) {
+    return [];
+  }
+
+  const weekId = toIso(new Date(weeklyDates[0]));
+  const row = [];
+  const fillStatus = getDefaultFillStatus(config);
+  if (fillStatus) {
+    row.push(Markup.button.callback(
+      `⚡ ${blanks.length === weeklyDates.length ? "All" : `${blanks.length} blank`}: ${fillStatus}`,
+      `home:week:fill:${flowId}:${weekId}:${attendanceOptionToken(config, fillStatus)}`
+    ));
+  }
+
+  const { copiedDates } = copyWeeklyEntriesFromPreviousWeek(
+    weeklyDates,
+    weeklyEntries,
+    getExisting,
+    weeklyPreviousWeekGetter(cache, config, user),
+    toIso
+  );
+  if (copiedDates.length > 0) {
+    row.push(Markup.button.callback("🔁 Copy last week", `home:week:copy:${flowId}:${weekId}`));
+  }
+
+  return row.length > 0 ? [row] : [];
+}
+
 function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config, user, flowId = "expired") {
   const appointment = user?.appointment;
   const dayLines = weeklyDates.map((dateValue) => {
@@ -3211,7 +3309,7 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
     "",
     ...dayLines,
     "",
-    "Tap a day below to update it, then press Submit when done."
+    "Tap a day to change it, or use ⚡ / 🔁 to fill every blank day at once. Then press Submit."
   ].join("\n");
 
   const dayButtons = weeklyDates.map((dateValue) => {
@@ -3237,6 +3335,7 @@ function buildWeeklyAttendanceOverview(weeklyDates, weeklyEntries, cache, config
   const weekId = weeklyDates[0]
     ? toIsoDateString(new Date(weeklyDates[0]), config.timezone)
     : "expired";
+  rows.push(...buildWeeklyShortcutRow(weeklyDates, weeklyEntries, cache, config, user, flowId));
   rows.push([Markup.button.callback("✅ Submit", `home:week:submit:${flowId}:${weekId}`)]);
   rows.push([
     Markup.button.callback("🔙 Back", "home:main"),
@@ -3320,7 +3419,10 @@ async function promptWeeklyAttendanceDay(ctx, config, user, cache, page = 0) {
       `home:pick:week:${weeklyState.flowId}`,
       `home:week:page:${weeklyState.flowId}`,
       `home:week:overview:${weeklyState.flowId}:${toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)}`,
-      [[Markup.button.callback(WEEK_SKIP_LABEL, `home:pick:week:${weeklyState.flowId}:${isoDate}:skip`)]],
+      [
+        [Markup.button.callback(WEEK_SKIP_LABEL, `home:pick:week:${weeklyState.flowId}:${isoDate}:skip`)],
+        ...buildWeeklyShortcutRow(weeklyState.dates, weeklyState.entries, cache, config, user, weeklyState.flowId)
+      ],
       {
         groupCallbackBuilder: (groupKey, requestedDate) =>
           `home:week:groups:${weeklyState.flowId}:${requestedDate}:${groupKey}`,
@@ -3497,7 +3599,10 @@ async function renderHomeMenu(ctx, config, options = {}) {
     syncStatus
   });
 
-  await sendOrUpdateAdminMessage(ctx, text, buildHomeMenu(isAdminUser, config.timezone));
+  const quickAttendance = user?.appointment
+    ? await buildQuickAttendanceButton(config, user, options.cache ?? null)
+    : null;
+  await sendOrUpdateAdminMessage(ctx, text, buildHomeMenu(isAdminUser, config.timezone, { quickAttendance }));
 }
 
 async function renderDepartmentView(ctx, config, cache, viewer, options = {}) {
@@ -7224,7 +7329,9 @@ export async function createAttendanceBot(config) {
     if (
       !action.startsWith("pick:attendance:") &&
       !action.startsWith("department:pickoption:") &&
-      !action.startsWith("pick:week:")
+      !action.startsWith("pick:week:") &&
+      !action.startsWith("week:fill:") &&
+      !action.startsWith("week:copy:")
     ) {
       await ctx.answerCbQuery(isWeeklyEntryAction ? "Opening weekly attendance…" : undefined);
     }
@@ -8187,12 +8294,90 @@ export async function createAttendanceBot(config) {
         entries: nextEntries
       });
 
+      // Go straight to the next day that still needs an answer; only fall
+      // back to the overview once every day has a value (or after Skip, so
+      // skipping never traps the user in a loop of blank days).
+      const nextBlankIndex = optionIndexRaw === "skip"
+        ? -1
+        : findNextBlankWeeklyIndex(
+          weeklyDates,
+          nextEntries,
+          weeklyExistingStatusGetter(adminCache, config, user),
+          weeklyIndex,
+          (value) => toIsoDateString(value, config.timezone)
+        );
+
+      restoreWeeklyAttendanceSession(ctx, {
+        ...weeklyState,
+        index: nextBlankIndex >= 0 ? nextBlankIndex : weeklyIndex,
+        entries: nextEntries
+      });
+
       await updateUserByChatId(ctx.chat.id, {
-        weeklyAttendanceIndex: weeklyIndex,
+        weeklyAttendanceIndex: nextBlankIndex >= 0 ? nextBlankIndex : weeklyIndex,
         weeklyAttendanceEntries: nextEntries,
         lastSubmittedAt: new Date().toISOString()
       });
 
+      if (nextBlankIndex >= 0) {
+        await promptWeeklyAttendanceDay(ctx, config, { ...user, weeklyAttendanceEntries: nextEntries }, adminCache);
+      } else {
+        await showWeeklyAttendanceOverview(ctx, config, user, adminCache);
+      }
+      return;
+    }
+
+    if (action.startsWith("week:fill:") || action.startsWith("week:copy:")) {
+      triggerBackgroundSheetRefresh(adminCache, "home:week:shortcut");
+      const user = await ensureUserBound(ctx, config);
+
+      if (!user) {
+        return;
+      }
+
+      const parts = action.split(":");
+      const [, mode, flowId, weekId] = parts;
+      const storedUser = await getUserByChatId(ctx.chat.id);
+      const weeklyState = getWeeklyAttendanceState(ctx, storedUser);
+      const currentWeekId = weeklyState.dates[0]
+        ? toIsoDateString(new Date(weeklyState.dates[0]), config.timezone)
+        : "";
+
+      if (!flowId || flowId !== weeklyState.flowId || !weekId || weekId !== currentWeekId) {
+        await rejectExpiredInteraction(ctx, "This weekly prompt has expired. Nothing was changed.");
+        return;
+      }
+
+      const toIso = (value) => toIsoDateString(value, config.timezone);
+      const getExisting = weeklyExistingStatusGetter(adminCache, config, user);
+      let result;
+
+      if (mode === "fill") {
+        const [, , , , optionIndexRaw, optionFingerprint] = parts;
+        const picked = config.attendanceOptions[Number(optionIndexRaw)];
+        if (!picked || attendanceStatusFingerprint(picked) !== optionFingerprint) {
+          await rejectExpiredInteraction(ctx, "This weekly prompt has expired. Nothing was changed.");
+          return;
+        }
+        const filled = fillBlankWeeklyEntries(weeklyState.dates, weeklyState.entries, getExisting, picked, toIso);
+        result = { entries: filled.entries, count: filled.filledDates.length, label: `Filled ${filled.filledDates.length} day(s) with ${picked}` };
+      } else {
+        const copied = copyWeeklyEntriesFromPreviousWeek(
+          weeklyState.dates,
+          weeklyState.entries,
+          getExisting,
+          weeklyPreviousWeekGetter(adminCache, config, user),
+          toIso
+        );
+        result = { entries: copied.entries, count: copied.copiedDates.length, label: `Copied ${copied.copiedDates.length} day(s) from last week` };
+      }
+
+      await ctx.answerCbQuery(result.count > 0 ? result.label : "Nothing to fill");
+      restoreWeeklyAttendanceSession(ctx, { ...weeklyState, entries: result.entries });
+      await updateUserByChatId(ctx.chat.id, {
+        weeklyAttendanceEntries: result.entries,
+        lastSubmittedAt: new Date().toISOString()
+      });
       await showWeeklyAttendanceOverview(ctx, config, user, adminCache);
       return;
     }
@@ -9257,6 +9442,9 @@ export async function createAttendanceBot(config) {
 }
 
 export const __testing = {
+  buildQuickAttendanceButton,
+  buildWeeklyShortcutRow,
+  getDefaultFillStatus,
   getSecretCodeLockout,
   recordSecretCodeFailure,
   clearSecretCodeFailures,
